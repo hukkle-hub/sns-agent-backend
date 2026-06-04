@@ -5,7 +5,7 @@
 //
 // 환경변수:
 //   ANTHROPIC_API_KEY   (필수) Anthropic API 키
-//   MODEL               (선택) 기본 claude-sonnet-4-20250514
+//   MODEL               (선택) 기본 claude-sonnet-4-6
 //   ALLOWED_KAKAO_IDS   (선택) 카톡 허용 사용자 id, 콤마구분(보안)
 //   DATA_DIR            (선택) 데이터 저장 폴더, 기본 ./data
 //   PUBLIC_BASE         (선택) OAuth 콜백용 공개 주소(예: https://앱.onrender.com)
