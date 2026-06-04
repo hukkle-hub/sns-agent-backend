@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: sns-agent-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # 아래는 선택 — 필요한 기능만 채우세요 (외부연동_가이드.txt 참고)
+      # - key: KAKAO_ACCESS_TOKEN
+      #   sync: false
+      # - key: OPENAI_API_KEY
+      #   sync: false
+      # - key: CLOUDINARY_CLOUD_NAME
+      #   sync: false
+      # - key: CLOUDINARY_UPLOAD_PRESET
+      #   sync: false
+      # - key: SUPABASE_URL
+      #   sync: false
+      # - key: SUPABASE_KEY
+      #   sync: false
+      # - key: VAPID_PUBLIC
+      #   sync: false
+      # - key: VAPID_PRIVATE
+      #   sync: false
+      # - key: APP_PASSWORD
+      #   sync: false
