@@ -42,7 +42,7 @@ app.use(cors());
 app.use(express.json({ limit: "2mb" }));
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
-const MODEL = process.env.MODEL || "claude-sonnet-4-20250514";
+const MODEL = process.env.MODEL || "claude-sonnet-4-6";
 const KAKAO_TOKEN = process.env.KAKAO_ACCESS_TOKEN || "";
 const ALLOWED_KAKAO = (process.env.ALLOWED_KAKAO_IDS || "").split(",").map(s=>s.trim()).filter(Boolean);
 
