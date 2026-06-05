@@ -39,7 +39,7 @@ try {
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "40mb" }));
 
 const API_KEY = process.env.ANTHROPIC_API_KEY;
 const MODEL = process.env.MODEL || "claude-sonnet-4-6";
@@ -53,7 +53,7 @@ const SUPA_URL = process.env.SUPABASE_URL || "";
 const SUPA_KEY = process.env.SUPABASE_KEY || "";          // service_role 키 권장(서버 전용)
 const SUPA_TABLE = process.env.SUPABASE_TABLE || "agent_state";
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], deptMemory:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], deptMemory:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -95,9 +95,9 @@ let DB = emptyDB();
 
 // ===== 부서 정의 =====
 const AGENTS = {
-  strategy:    { no:"01", kr:"기획·전략",      role:"SNS 콘텐츠 기획·전략 담당. 트렌드를 읽고 콘텐츠 방향·주제·타깃을 제시한다." },
-  creation:    { no:"02", kr:"콘텐츠 제작",    role:"콘텐츠 제작 담당. 영상 스크립트·게시물 카피·썸네일 문구 등 실제 결과물을 작성한다." },
-  publishing:  { no:"03", kr:"채널 발행",      role:"채널 발행 담당. 연결된 플랫폼에 발행하고 일정·해시태그·발행 최적화를 관리한다." },
+  strategy:    { no:"01", kr:"기획·전략",      role:"SNS 콘텐츠 기획·전략 담당. 트렌드를 읽고 콘텐츠 방향·주제·타깃·구성을 제시한다." },
+  creation:    { no:"02", kr:"콘텐츠 제작",    role:"콘텐츠 제작 총괄 담당. 영상 스크립트, 영상 구성안(장면·컷·자막·나레이션), 게시물 카피, 썸네일·이미지 문구 등 모든 콘텐츠 결과물을 직접 끝까지 작성한다. '영상 제작'을 포함한 모든 제작 요청을 이 부서가 처리한다. 별도의 영상 제작 부서는 없다." },
+  publishing:  { no:"03", kr:"채널 발행",      role:"채널 발행 담당. 완성된 콘텐츠를 연결된 플랫폼에 발행하고 일정·해시태그·발행 최적화를 관리한다. (영상·콘텐츠 제작은 02 부서가 담당한다)" },
   engagement:  { no:"04", kr:"커뮤니티·CS",    role:"커뮤니티·고객응대 담당. 댓글·DM 응답 문안, 팔로워 소통 방안을 작성한다." },
   analytics:   { no:"05", kr:"데이터 분석",    role:"데이터 분석 담당. 성과 해석·개선 포인트·다음 액션을 제시한다." },
   monetization:{ no:"06", kr:"수익화",        role:"수익화 담당. 제휴·광고·상품·멤버십 등 수익 모델과 정산을 제안한다." },
@@ -108,11 +108,22 @@ const AGENTS = {
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
-async function anthropic(system, user, maxTokens = 1200){
+async function anthropic(system, user, maxTokens = 1200, images){
+  let content;
+  if (images && images.length){
+    content = [];
+    images.slice(0,5).forEach(function(img){
+      // img: { media_type, data(base64 no prefix) }
+      if (img && img.data) content.push({ type:"image", source:{ type:"base64", media_type:img.media_type||"image/jpeg", data:img.data } });
+    });
+    content.push({ type:"text", text:user });
+  } else {
+    content = user;
+  }
   const r = await fetch("https://api.anthropic.com/v1/messages", {
     method:"POST",
     headers:{ "Content-Type":"application/json", "x-api-key":API_KEY, "anthropic-version":"2023-06-01" },
-    body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system:system||"", messages:[{role:"user",content:user}] })
+    body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system:system||"", messages:[{role:"user",content:content}] })
   });
   const data = await r.json();
   if (data.error) throw new Error(data.error.message || "API 오류");
@@ -146,26 +157,79 @@ function logError(where, e){
 }
 
 // ===== 총괄 라우팅 (1개 이상 부서) =====
+const PERSONA = {
+  strategy:"침착하고 전략적인 리더형. 큰 그림을 보고 핵심을 짚는다. 차분하고 논리적인 말투.",
+  creation:"발랄하고 창의적인 아이디어뱅크. 에너지 넘치고 친근하게 말한다.",
+  publishing:"시원시원하고 추진력 있는 실행가. 빠르고 명쾌하게 말한다.",
+  engagement:"다정하고 공감 잘하는 소통가. 따뜻하고 배려 있게 말한다.",
+  analytics:"냉철하고 꼼꼼한 데이터 분석가. 객관적이고 근거 중심으로 말한다.",
+  monetization:"실리적이고 야무진 협상가. 똑부러지게 수익 관점으로 말한다.",
+  growth:"도전적이고 트렌디한 그로스 해커. 활기차고 과감하게 말한다.",
+  ops:"원칙주의에 꼼꼼한 리스크 감사관. 신중하고 단호하게 경고한다.",
+  advisory:"차분하고 정리 잘하는 서기. 단정하게 요약·구조화해 말한다.",
+  scout:"호기심 많고 톡톡 튀는 발상가. 엉뚱하면서도 창의적으로 말한다."
+};
+const MEMBERS = {
+  strategy:"한지우", creation:"이서연", publishing:"박하늘", engagement:"정유진",
+  analytics:"강민서", monetization:"윤소희", growth:"임채원", ops:"오세라",
+  advisory:"서다은", scout:"노아라"
+};
+// 지시에 부서명/번호/담당자 이름이 명시되면 총괄 라우팅을 건너뛰고 그 담당이 직접 응답
+function directDept(instruction){
+  const t = String(instruction||"");
+  const hits = [];
+  for (const id of Object.keys(AGENTS)){
+    const kr = AGENTS[id].kr;
+    const toks = kr.split(/[·\/\s]/).filter(x=>x.length>=2); toks.push(kr);
+    let hit = (MEMBERS[id] && t.includes(MEMBERS[id])) || t.indexOf(AGENTS[id].no+" ")>=0 || t.indexOf(AGENTS[id].no+"번")>=0;
+    if (!hit) hit = toks.some(tok=>t.includes(tok));
+    if (hit) hits.push(id);
+  }
+  hits.sort((a,b)=>pos(t,a)-pos(t,b));
+  return hits;
+}
+function pos(t,id){
+  const cands=[MEMBERS[id], AGENTS[id].kr].concat(AGENTS[id].kr.split(/[·\/\s]/));
+  const idxs=cands.map(c=>c?t.indexOf(c):-1).filter(x=>x>=0);
+  return idxs.length?Math.min.apply(null,idxs):1e9;
+}
 async function route(instruction){
-  const list = Object.keys(AGENTS).map(id => id+" = "+AGENTS[id].no+" "+AGENTS[id].kr).join("\n");
-  const sys = "너는 SNS 자동화 회사의 총괄 대리인이다. 지시를 처리할 부서를 1개 이상 고른다. 복합 작업이면 필요한 부서를 순서대로 모두 고른다. 부서 id(영문 키)만 콤마로 구분해 출력. 다른 말 금지.";
-  const out = await anthropic(sys, "부서:\n"+list+"\n\n지시: "+instruction, 100);
+  const list = Object.keys(AGENTS).map(id => id+" = "+AGENTS[id].no+" "+AGENTS[id].kr+" : "+AGENTS[id].role).join("\n");
+  const sys = "너는 SNS 자동화 회사의 총괄 대리인이다. 지시를 처리할 부서를 고른다. "
+    + "콘텐츠/영상 '제작' 요청은 반드시 creation(02)을 포함한다. 영상 제작 전용 부서는 없으며 creation이 처리한다. "
+    + "'기획부터 발행까지' 같은 복합 요청이면 strategy→creation→publishing 처럼 필요한 부서를 순서대로 여러 개 고른다. "
+    + "부서 id(영문 키)만 콤마로 구분해 출력. 다른 말 금지.";
+  const out = await anthropic(sys, "부서 목록:\n"+list+"\n\n지시: "+instruction, 100);
   const ids = Object.keys(AGENTS); const low = out.toLowerCase();
   let picked = ids.filter(id => low.includes(id));
   picked.sort((a,b)=> low.indexOf(a)-low.indexOf(b));
-  return picked.length ? picked : ["strategy"];
+  if (!picked.length) picked = ["creation"];
+  return picked;
 }
 
 // ===== 부서 처리 (학습 메모리 주입 + 누적) =====
-async function work(dept, instruction, context){
+async function work(dept, instruction, context, images){
   const a = AGENTS[dept];
-  let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role+" 지시를 전문 영역에서 실제로 수행해 구체적이고 실용적인 결과물을 한국어로 제공하라. 본론부터.";
+  const isQuestion = /[?？]|어때|어떨까|할까요|할까|좋을까|어떤|어떻게|추천|의견|방법|왜|뭐가|무엇|가능|괜찮/.test(instruction||"");
+  let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role;
+  if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격과 말투를 응답 톤에 자연스럽게 녹이되, 전문성과 결과물 품질은 항상 유지하라.";
+  const exp = (DB.exp && DB.exp[dept]) || 0;
+  if (exp) sys += " 너는 지금까지 "+exp+"회의 자율 학습·업무 경험을 쌓았다.";
+  if (isQuestion){
+    sys += " 이번 입력은 질문·상담 성격이다. 단정적인 결과물 생산보다, 네 경험과 수집한 자료를 근거로 유연하게 의견·선택지·추천을 제시하라. 모르면 솔직히 말하고 확인 방법을 제안하라. 대화하듯 자연스럽게.";
+  } else {
+    sys += " 너의 전문 영역 안에서 지시를 실제로 끝까지 수행해 구체적이고 완성된 결과물을 한국어로 내라.";
+  }
+  sys += " '다른 부서/영상 제작 부서에 전달하세요'처럼 작업을 떠넘기며 끝내지 마라. 존재하지 않는 부서를 지어내지 마라. 협업이 필요하면 네가 할 수 있는 부분을 최대한 마친 뒤 다음 단계 제안만 한 줄로 덧붙여라. 본론부터 쓴다.";
   const mem = DB.deptMemory[dept] || [];
-  if (mem.length) sys += "\n\n[이 부서의 과거 학습·작업 기록 — 일관성 위해 참고]\n" + mem.slice(-3).map(x=>"· "+x.note).join("\n");
+  if (mem.length) sys += "\n\n[이 부서가 쌓은 경험·학습 기록 — 제안과 답변에 적극 활용]\n" + mem.slice(-6).map(x=>"· "+x.note).join("\n");
   if (context) sys += "\n\n[앞 부서의 작업 결과 — 이어받아 협업]\n" + context;
-  const text = await anthropic(sys, instruction);
+  if (images && images.length) sys += "\n\n[운영자가 첨부한 참고 사진/영상 장면이 함께 제공된다. 반드시 그 이미지를 분석해 작업에 반영하라.]";
+  const text = await anthropic(sys, instruction, 1200, images);
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction, note: text.length>140 ? text.slice(0,140)+"…" : text });
+  if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
+  DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
   saveDB();
   return text;
 }
@@ -207,15 +271,44 @@ async function uploadMedia(base64, mime){
   // Cloudinary unsigned 업로드 (CLOUDINARY_CLOUD_NAME + CLOUDINARY_UPLOAD_PRESET)
   const cloud = process.env.CLOUDINARY_CLOUD_NAME, preset = process.env.CLOUDINARY_UPLOAD_PRESET;
   if (cloud && preset) {
+    const kind = String(mime||"").startsWith("video") ? "video" : "image";
     const form = new URLSearchParams();
     form.set("file", "data:"+(mime||"image/png")+";base64,"+base64);
     form.set("upload_preset", preset);
-    const r = await fetch("https://api.cloudinary.com/v1_1/"+cloud+"/image/upload", { method:"POST", body:form });
+    const r = await fetch("https://api.cloudinary.com/v1_1/"+cloud+"/"+kind+"/upload", { method:"POST", body:form });
     const d = await r.json();
     if (d.secure_url) return d.secure_url;
     throw new Error("Cloudinary 업로드 실패: "+JSON.stringify(d).slice(0,160));
   }
   throw new Error("미디어 저장소 미설정(CLOUDINARY_CLOUD_NAME/UPLOAD_PRESET) — 공개 URL을 얻을 수 없습니다");
+}
+async function generateVideo(prompt){
+  // Replicate text-to-video (REPLICATE_API_TOKEN + VIDEO_MODEL_VERSION)
+  const token = process.env.REPLICATE_API_TOKEN;
+  if (!token) throw new Error("REPLICATE_API_TOKEN 미설정");
+  const version = process.env.VIDEO_MODEL_VERSION;
+  if (!version) throw new Error("VIDEO_MODEL_VERSION 미설정 (Replicate 영상 모델 버전 해시)");
+  // 1) 예측 생성
+  const init = await fetch("https://api.replicate.com/v1/predictions", {
+    method:"POST",
+    headers:{ "Authorization":"Bearer "+token, "Content-Type":"application/json" },
+    body: JSON.stringify({ version, input:{ prompt } })
+  });
+  let d = await init.json();
+  if (d.error) throw new Error(typeof d.error==="string"?d.error:JSON.stringify(d.error).slice(0,160));
+  const getUrl = d.urls && d.urls.get;
+  let status = d.status;
+  // 2) 폴링 (최대 약 110초)
+  for (let i=0; i<55 && status!=="succeeded" && status!=="failed" && status!=="canceled"; i++){
+    await new Promise(r=>setTimeout(r,2000));
+    const pr = await fetch(getUrl, { headers:{ "Authorization":"Bearer "+token } });
+    d = await pr.json(); status = d.status;
+  }
+  if (status!=="succeeded") throw new Error("영상 생성 실패/시간초과 ("+status+")");
+  let out = d.output;
+  if (Array.isArray(out)) out = out[out.length-1];
+  if (typeof out!=="string") throw new Error("영상 URL을 받지 못했습니다");
+  return out;
 }
 async function generateImage(prompt){
   // OpenAI 이미지 생성 (OPENAI_API_KEY) → base64 → 저장소 업로드 → 공개 URL
@@ -392,13 +485,62 @@ async function kakaoNotify(text){
 }
 
 // ===== 통합 지시 처리 (서버 오케스트레이션) =====
-async function handleInstruction(instruction, source){
-  const depts = await route(instruction);
-  const results = []; let prev = "";
-  for (const d of depts) { const t = await work(d, instruction, prev); results.push({ dept:d, text:t }); prev = t; }
-  const job = { id:Date.now(), type:"instruct", instruction, source:source||"api", depts, results, at:Date.now() };
+// 협의 모드 1단계: 각 부서가 자기 관점의 의견·아이디어만 짧게 제시 (실행 X)
+async function opinion(dept, instruction){
+  const a = AGENTS[dept];
+  const mem = (DB.deptMemory[dept]||[]).slice(-4).map(x=>"· "+x.note).join("\n");
+  let sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
+    + " 아래 지시에 대해 지금은 '실행'하지 말고, 네 부서 포지션에서의 핵심 의견·아이디어·기여 포인트·우려를 2~3줄로만 간결히 제시하라.";
+  if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격·말투를 자연스럽게 반영하라.";
+  if (mem) sys += "\n\n[네 경험·학습]\n"+mem;
+  return await anthropic(sys, "지시: "+instruction, 350);
+}
+// 협의 모드 2단계: 총괄이 의견을 종합해 최종 실행 분담을 결정
+async function deliberatePlan(instruction, opinions){
+  const list = opinions.map(o=>AGENTS[o.dept].no+" "+AGENTS[o.dept].kr+": "+o.text).join("\n");
+  const sys = "너는 SNS 자동화 회사의 총괄 대리인이다. 각 부서 의견을 종합해 최종 실행 계획을 세운다. "
+    + "먼저 1~2문장으로 협의 결과(누가 무엇을 맡는지)를 요약하고, 마지막 줄에 반드시 'EXEC: id,id' 형식으로 실제 실행할 부서 영문키를 순서대로 적어라. "
+    + "실행 부서는 의견 낸 부서 중 꼭 필요한 곳만 고른다. 영문키: " + Object.keys(AGENTS).join(", ");
+  const out = await anthropic(sys, "지시: "+instruction+"\n\n[부서 의견]\n"+list, 450);
+  let execIds = [];
+  const m = out.match(/EXEC:\s*([a-zA-Z,\s]+)/);
+  if (m) execIds = m[1].split(",").map(s=>s.trim().toLowerCase()).filter(id=>AGENTS[id]);
+  const note = out.replace(/EXEC:.*$/is, "").trim();
+  if (!execIds.length) execIds = opinions.map(o=>o.dept);
+  return { note, execIds };
+}
+async function handleInstruction(instruction, source, images){
+  let depts = directDept(instruction);
+  const direct = depts.length > 0;
+  const deliberate = !!(DB.state && DB.state.deliberate);
+  const job = { id:Date.now(), type:"instruct", instruction, source:source||"api", at:Date.now() };
+
+  if (direct) {
+    // 부서·이름을 콕 집으면 협의 없이 그 담당이 바로 처리
+    const results = []; let prev = "";
+    for (const d of depts) { const t = await work(d, instruction, prev, images); results.push({ dept:d, text:t }); prev = t; }
+    job.direct = true; job.depts = depts; job.results = results;
+  } else if (deliberate) {
+    // 협의 모드: 1) 부서 의견 수렴 → 2) 총괄 재분담 → 3) 실행
+    const candidates = await route(instruction);
+    const opinions = [];
+    for (const d of candidates) { try{ opinions.push({ dept:d, text: await opinion(d, instruction) }); }catch(e){} }
+    const plan = await deliberatePlan(instruction, opinions);
+    const results = []; let prev = "";
+    for (const d of plan.execIds) { const t = await work(d, instruction, prev, images); results.push({ dept:d, text:t }); prev = t; }
+    job.deliberate = true; job.candidates = candidates; job.opinions = opinions;
+    job.plan = plan.note; job.depts = plan.execIds; job.results = results;
+  } else {
+    // 빠른 모드 (기존)
+    depts = await route(instruction);
+    const results = []; let prev = "";
+    for (const d of depts) { const t = await work(d, instruction, prev, images); results.push({ dept:d, text:t }); prev = t; }
+    job.depts = depts; job.results = results;
+  }
+
   DB.jobs.push(job);
-  if (depts.length > 1) DB.meetings.push({ id:job.id, at:job.at, instruction, depts, exchanges:results });
+  if ((job.depts||[]).length > 1 || job.deliberate)
+    DB.meetings.push({ id:job.id, at:job.at, instruction, depts:job.depts, opinions:job.opinions, plan:job.plan, exchanges:job.results });
   saveDB();
   return job;
 }
@@ -466,8 +608,8 @@ app.post("/api/claude", async (req,res)=>{
 
 // 통합 지시: { instruction, source } → { job }
 app.post("/api/instruct", async (req,res)=>{
-  try { const { instruction, source } = req.body||{}; if(!instruction) return res.status(400).json({error:"instruction 필요"});
-    res.json(await handleInstruction(instruction, source));
+  try { const { instruction, source, images } = req.body||{}; if(!instruction) return res.status(400).json({error:"instruction 필요"});
+    res.json(await handleInstruction(instruction, source, images));
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
@@ -485,6 +627,7 @@ app.get("/api/sync", (req,res)=>{
     jobs: DB.jobs.filter(j=>j.at>since),
     meetings: DB.meetings.filter(m=>m.at>since),
     deptMemory: DB.deptMemory,
+    exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
     updatedAt: DB.updatedAt
@@ -546,6 +689,28 @@ app.post("/api/generate-image", async (req,res)=>{
     const url = await generateImage(prompt);
     res.json({ url });
   } catch(e){ logError("generate-image", e); res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// AI 영상 생성: { prompt } → { url } (Replicate, 시간이 걸릴 수 있음)
+app.post("/api/generate-video", async (req,res)=>{
+  try {
+    const prompt = (req.body && req.body.prompt || "").trim();
+    if (!prompt) return res.status(400).json({ error:"prompt 필요" });
+    const url = await generateVideo(prompt);
+    res.json({ url });
+  } catch(e){ logError("generate-video", e); res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// 미디어 파일 업로드(영상/이미지): { data(base64 or dataURL), mime } → { url }
+app.post("/api/upload-video", async (req,res)=>{
+  try {
+    const data = req.body && req.body.data;
+    if (!data) return res.status(400).json({ error:"data 필요" });
+    const mime = (req.body && req.body.mime) || "video/mp4";
+    const b64 = String(data).replace(/^data:[^;]+;base64,/, "");
+    const url = await uploadMedia(b64, mime);
+    res.json({ url });
+  } catch(e){ logError("upload-video", e); res.status(500).json({ error:String(e.message||e) }); }
 });
 
 // 비용·토큰 사용량: 누적 토큰 + 예상 비용(USD)
@@ -643,17 +808,30 @@ setInterval(async ()=>{
     }
   }
   if (rq.length) saveDB();
-  // (2) 정기 자료수집 (탐색·발상부) — state.collect.everyMin 주기
+  // (2) 특별 지시가 없을 때: 부서들이 돌아가며 자기 분야 자료를 자동 수집·학습 (경험치 누적)
   const col = DB.state && DB.state.collect;
   if (col && col.everyMin > 0 && Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000) {
     try {
-      const topic = (col.topic && col.topic.trim()) || "최신 SNS·콘텐츠 트렌드";
-      const text = await work("scout", "지금 주목할 트렌드·기회·아이디어를 5가지로 간단히 수집·정리하라. 주제: "+topic);
-      DB.collections.push({ id:Date.now(), topic, text, at:Date.now() });
+      const ids = Object.keys(AGENTS);
+      DB.learnIdx = (DB.learnIdx||0) % ids.length;
+      const dept = ids[DB.learnIdx];
+      DB.learnIdx = (DB.learnIdx + 1) % ids.length;
+      const a = AGENTS[dept];
+      const focus = (col.topic && col.topic.trim()) ? col.topic.trim() : (a.kr + " 분야");
+      const sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
+        + " 지금은 평상시 자율 학습 시간이다. '"+focus+"'에 관해 네 부서 업무에 바로 쓸 최신 인사이트·트렌드·아이디어를 2~3가지로 아주 간결히 정리하라. 다음에 제안에 활용할 핵심만.";
+      const note = await anthropic(sys, "자율 학습 메모 작성", 500);
+      if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
+      DB.deptMemory[dept].push({ at:Date.now(), instruction:"[자율 학습] "+focus, note });
+      if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
+      DB.exp = DB.exp || {};
+      DB.exp[dept] = (DB.exp[dept]||0) + 1;
+      DB.collections.push({ id:Date.now(), topic:"["+a.kr+"] "+focus, text:note, at:Date.now(), dept });
+      if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
       DB.lastCollectAt = Date.now();
       saveDB();
-      kakaoNotify("🔎 정기 자료수집 완료: "+topic).catch(()=>{});
-    } catch(e){ console.error("collect error", e); }
+      kakaoNotify("📚 "+a.kr+" 자율 학습 +1 (경험치 "+DB.exp[dept]+")").catch(()=>{});
+    } catch(e){ console.error("auto-learn error", e); }
   }
 }, 60000);
 
