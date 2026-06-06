@@ -220,10 +220,12 @@ async function work(dept, instruction, context, images){
   } else {
     sys += " 너의 전문 영역 안에서 지시를 실제로 끝까지 수행해 구체적이고 완성된 결과물을 한국어로 내라.";
   }
-  sys += " '다른 부서/영상 제작 부서에 전달하세요'처럼 작업을 떠넘기며 끝내지 마라. 존재하지 않는 부서를 지어내지 마라. 협업이 필요하면 네가 할 수 있는 부분을 최대한 마친 뒤 다음 단계 제안만 한 줄로 덧붙여라. 본론부터 쓴다.";
+  sys += " 능동적으로 사고하라: 지시에 드러나지 않은 필요까지 스스로 파악해 먼저 제안하고, 네 전문 영역에서 할 수 있는 것은 끝까지 직접 처리하라. '다른 부서에 전달하세요'처럼 떠넘기지 말고, 존재하지 않는 부서를 지어내지 마라. 본론부터 쓴다.";
+  sys += profileContext();
+  if (!isQuestion) sys += " 지시가 다소 모호하더라도 운영 프로필과 상식으로 합리적으로 가정해 바로 완성된 결과물을 만들고, 사용자에게 무엇을 만들지 되묻지 마라. 정말 불가피할 때만 짧게 1가지만 확인하라.";
   const mem = DB.deptMemory[dept] || [];
   if (mem.length) sys += "\n\n[이 부서가 쌓은 경험·학습 기록 — 제안과 답변에 적극 활용]\n" + mem.slice(-6).map(x=>"· "+x.note).join("\n");
-  if (context) sys += "\n\n[앞 부서의 작업 결과 — 이어받아 협업]\n" + context;
+  if (context) sys += "\n\n[동료 부서들이 지금까지 진행한 협업 맥락 — 반드시 읽고 이어받아라]\n" + context + "\n앞 부서 결과를 중복하지 말고, 거기에 네 전문성을 더해 발전시키거나 빈 부분을 채워라. 필요하면 앞 부서 결과를 구체적으로 언급하며 연결하라.";
   if (images && images.length) sys += "\n\n[운영자가 첨부한 참고 사진/영상 장면이 함께 제공된다. 반드시 그 이미지를 분석해 작업에 반영하라.]";
   const text = await anthropic(sys, instruction, 1200, images);
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
@@ -493,20 +495,65 @@ async function opinion(dept, instruction){
     + " 아래 지시에 대해 지금은 '실행'하지 말고, 네 부서 포지션에서의 핵심 의견·아이디어·기여 포인트·우려를 2~3줄로만 간결히 제시하라.";
   if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격·말투를 자연스럽게 반영하라.";
   if (mem) sys += "\n\n[네 경험·학습]\n"+mem;
+  sys += profileContext();
   return await anthropic(sys, "지시: "+instruction, 350);
 }
 // 협의 모드 2단계: 총괄이 의견을 종합해 최종 실행 분담을 결정
 async function deliberatePlan(instruction, opinions){
-  const list = opinions.map(o=>AGENTS[o.dept].no+" "+AGENTS[o.dept].kr+": "+o.text).join("\n");
-  const sys = "너는 SNS 자동화 회사의 총괄 대리인이다. 각 부서 의견을 종합해 최종 실행 계획을 세운다. "
-    + "먼저 1~2문장으로 협의 결과(누가 무엇을 맡는지)를 요약하고, 마지막 줄에 반드시 'EXEC: id,id' 형식으로 실제 실행할 부서 영문키를 순서대로 적어라. "
-    + "실행 부서는 의견 낸 부서 중 꼭 필요한 곳만 고른다. 영문키: " + Object.keys(AGENTS).join(", ");
-  const out = await anthropic(sys, "지시: "+instruction+"\n\n[부서 의견]\n"+list, 450);
+  const list = opinions.map(o=>AGENTS[o.dept].no+" "+AGENTS[o.dept].kr+"("+MEMBERS[o.dept]+"): "+o.text).join("\n");
+  const sys = "너는 SNS 자동화 회사의 총괄 진행자다. 각 부서가 제출한 의견을 놓고, 부서들이 서로의 안을 검토하고 더 나은 아이디어가 있으면 제안하며 함께 토론하는 짧은 라운드테이블을 진행한 뒤, 총괄로서 최종 결정을 내린다.\n"
+    + "다음 형식으로만 출력하라:\n토론: (부서 간 핵심 논의와, 채택되거나 기각된 더 나은 아이디어를 3~5줄)\n결정: (최종 방향과 부서별 분담을 1~2문장)\nEXEC: id,id (최종 실행 부서를 협업 순서대로, 영문키)\n"
+    + "부서 영문키: " + Object.keys(AGENTS).join(", ") + reactionInsights() + profileContext();
+  const out = await anthropic(sys, "지시: "+instruction+"\n\n[제출된 부서 의견]\n"+list, 650);
+  let execIds = [];
+  const m = out.match(/EXEC:\s*([a-zA-Z,\s]+)/);
+  if (m) execIds = m[1].split(",").map(s=>s.trim().toLowerCase()).filter(id=>AGENTS[id]);
+  let discussion = "", note = "";
+  const dm = out.match(/토론\s*[:：]\s*([\s\S]*?)(?:결정\s*[:：]|EXEC:|$)/);
+  if (dm) discussion = dm[1].trim();
+  const nm = out.match(/결정\s*[:：]\s*([\s\S]*?)(?:EXEC:|$)/);
+  if (nm) note = nm[1].trim();
+  if (!note) note = out.replace(/EXEC:.*$/is, "").replace(/^[\s\S]*?결정\s*[:：]/, "").trim() || out.replace(/EXEC:.*$/is,"").trim();
+  if (!execIds.length) execIds = opinions.map(o=>o.dept);
+  return { discussion, note, execIds };
+}
+// 일반 지시용: 총괄이 기획(접근 방향+부서 분담)을 잡고 협업 부서를 정함 (의견수렴 없이 1콜)
+// 커뮤니티 부서가 쌓은 시청자 반응·트렌드 인사이트 (기획 방향 잡기에 활용)
+function reactionInsights(){
+  const mem = (DB.deptMemory && DB.deptMemory.engagement) || [];
+  if (!mem.length) return "";
+  const recent = mem.slice(-5).map(x=>"· "+x.note).join("\n");
+  return "\n\n[커뮤니티·CS('"+(MEMBERS.engagement||"")+"')가 수집한 시청자 반응·트렌드 인사이트 — 방향성·트렌드 판단에 적극 반영하라]\n" + recent;
+}
+// 운영 프로필(채널 설정) — 부서가 매번 되묻지 않고 전제로 삼을 공통 맥락
+function profileContext(){
+  const p = (DB.state && DB.state.profile) || null;
+  if (!p) return "";
+  const rows=[];
+  if(p.brand) rows.push("브랜드/채널: "+p.brand);
+  if(p.topic) rows.push("주제·분야: "+p.topic);
+  if(p.audience) rows.push("타깃 시청자: "+p.audience);
+  if(p.character) rows.push("대표 캐릭터/화자: "+p.character);
+  if(p.tone) rows.push("톤&무드: "+p.tone);
+  if(p.platforms) rows.push("주요 플랫폼: "+p.platforms);
+  if(p.avoid) rows.push("피해야 할 것: "+p.avoid);
+  if(p.extra) rows.push("기타 지침: "+p.extra);
+  if(!rows.length) return "";
+  return "\n\n[운영 프로필 — 모든 콘텐츠·제안의 기본 전제. 이 정보로 충분하니 사용자에게 되묻지 말고 바로 진행하라]\n" + rows.map(r=>"· "+r).join("\n");
+}
+async function leadPlan(instruction){
+
+  const list = Object.keys(AGENTS).map(id => id+" = "+AGENTS[id].no+" "+AGENTS[id].kr+" ("+MEMBERS[id]+")").join("\n");
+  const sys = "너는 SNS 자동화 회사의 총괄 대리인이다. 사용자의 지시를 받아 실행을 설계한다.\n"
+    + "1) 작업을 처음부터 끝까지(필요 시 조사→기획→제작→발행→분석 등) 생각해, 기여할 수 있는 부서를 충분히 폭넓게 참여시켜라. 한두 부서에만 몰지 말고, 각 부서가 어떤 아이디어·역할을 맡을지 한 줄씩 분담하라.\n"
+    + "2) 단, 정말 관련 없는 부서는 빼라(억지로 다 넣지 말 것).\n"
+    + "출력: 먼저 2~4문장으로 기획(접근 방향 + 부서별 역할/요청 아이디어)을 쓰고, 마지막 줄에 'EXEC: id,id,id' 형식으로 협업 실행 순서대로 부서 영문키를 적어라.\n[부서 목록]\n" + list + reactionInsights() + profileContext();
+  const out = await anthropic(sys, "지시: "+instruction, 550);
   let execIds = [];
   const m = out.match(/EXEC:\s*([a-zA-Z,\s]+)/);
   if (m) execIds = m[1].split(",").map(s=>s.trim().toLowerCase()).filter(id=>AGENTS[id]);
   const note = out.replace(/EXEC:.*$/is, "").trim();
-  if (!execIds.length) execIds = opinions.map(o=>o.dept);
+  if (!execIds.length) execIds = await route(instruction);
   return { note, execIds };
 }
 async function handleInstruction(instruction, source, images){
@@ -515,32 +562,41 @@ async function handleInstruction(instruction, source, images){
   const deliberate = !!(DB.state && DB.state.deliberate);
   const job = { id:Date.now(), type:"instruct", instruction, source:source||"api", at:Date.now() };
 
+  // 누적 협업 맥락: 모든 앞 부서 결과를 요약해 다음 부서에 전달 (몇 부서만 일하지 않도록)
+  function buildCtx(base, results){
+    let c = base ? base+"\n" : "";
+    c += results.map(r=>"["+AGENTS[r.dept].no+" "+AGENTS[r.dept].kr+" "+MEMBERS[r.dept]+"]\n"+(r.text.length>600?r.text.slice(0,600)+"…":r.text)).join("\n\n");
+    return c;
+  }
+
   if (direct) {
     // 부서·이름을 콕 집으면 협의 없이 그 담당이 바로 처리
-    const results = []; let prev = "";
-    for (const d of depts) { const t = await work(d, instruction, prev, images); results.push({ dept:d, text:t }); prev = t; }
+    const results = [];
+    for (const d of depts) { const t = await work(d, instruction, buildCtx("", results), images); results.push({ dept:d, text:t }); }
     job.direct = true; job.depts = depts; job.results = results;
   } else if (deliberate) {
-    // 협의 모드: 1) 부서 의견 수렴 → 2) 총괄 재분담 → 3) 실행
+    // 협의 모드: 1) 부서 의견 수렴 → 2) 총괄 재분담 → 3) 협업 실행
     const candidates = await route(instruction);
     const opinions = [];
     for (const d of candidates) { try{ opinions.push({ dept:d, text: await opinion(d, instruction) }); }catch(e){} }
     const plan = await deliberatePlan(instruction, opinions);
-    const results = []; let prev = "";
-    for (const d of plan.execIds) { const t = await work(d, instruction, prev, images); results.push({ dept:d, text:t }); prev = t; }
+    const base = (plan.note?"[총괄 최종 결정] "+plan.note+"\n":"") + (plan.discussion?"[부서 토론 요지] "+plan.discussion+"\n":"") + "[각 부서가 제출한 아이디어]\n" + opinions.map(o=>AGENTS[o.dept].no+" "+AGENTS[o.dept].kr+": "+o.text).join("\n");
+    const results = [];
+    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images); results.push({ dept:d, text:t }); }
     job.deliberate = true; job.candidates = candidates; job.opinions = opinions;
-    job.plan = plan.note; job.depts = plan.execIds; job.results = results;
+    job.discussion = plan.discussion; job.plan = plan.note; job.depts = plan.execIds; job.results = results;
   } else {
-    // 빠른 모드 (기존)
-    depts = await route(instruction);
-    const results = []; let prev = "";
-    for (const d of depts) { const t = await work(d, instruction, prev, images); results.push({ dept:d, text:t }); prev = t; }
-    job.depts = depts; job.results = results;
+    // 일반 지시: 총괄이 받아서 기획(아이디어 분담) → 부서들이 협업 수행
+    const plan = await leadPlan(instruction);
+    const base = plan.note ? "[총괄 기획·분담] "+plan.note : "";
+    const results = [];
+    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images); results.push({ dept:d, text:t }); }
+    job.plan = plan.note; job.depts = plan.execIds; job.results = results;
   }
 
   DB.jobs.push(job);
   if ((job.depts||[]).length > 1 || job.deliberate)
-    DB.meetings.push({ id:job.id, at:job.at, instruction, depts:job.depts, opinions:job.opinions, plan:job.plan, exchanges:job.results });
+    DB.meetings.push({ id:job.id, at:job.at, instruction, depts:job.depts, opinions:job.opinions, discussion:job.discussion, plan:job.plan, exchanges:job.results });
   saveDB();
   return job;
 }
@@ -808,32 +864,57 @@ setInterval(async ()=>{
     }
   }
   if (rq.length) saveDB();
-  // (2) 특별 지시가 없을 때: 부서들이 돌아가며 자기 분야 자료를 자동 수집·학습 (경험치 누적)
+  // (2) 자율수행: 지시가 있는 부서는 매 주기 각자 동시 수행 + 지시 없는 부서는 한 부서씩 돌아가며 트렌드 학습
   const col = DB.state && DB.state.collect;
   if (col && col.everyMin > 0 && Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000) {
     try {
-      const ids = Object.keys(AGENTS);
-      DB.learnIdx = (DB.learnIdx||0) % ids.length;
-      const dept = ids[DB.learnIdx];
-      DB.learnIdx = (DB.learnIdx + 1) % ids.length;
-      const a = AGENTS[dept];
-      const focus = (col.topic && col.topic.trim()) ? col.topic.trim() : (a.kr + " 분야");
-      const sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
-        + " 지금은 평상시 자율 학습 시간이다. '"+focus+"'에 관해 네 부서 업무에 바로 쓸 최신 인사이트·트렌드·아이디어를 2~3가지로 아주 간결히 정리하라. 다음에 제안에 활용할 핵심만.";
-      const note = await anthropic(sys, "자율 학습 메모 작성", 500);
-      if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
-      DB.deptMemory[dept].push({ at:Date.now(), instruction:"[자율 학습] "+focus, note });
-      if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
-      DB.exp = DB.exp || {};
-      DB.exp[dept] = (DB.exp[dept]||0) + 1;
-      DB.collections.push({ id:Date.now(), topic:"["+a.kr+"] "+focus, text:note, at:Date.now(), dept });
-      if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
+      const dir = (DB.state && DB.state.deptDirective) || {};
+      const allIds = Object.keys(AGENTS);
+      const dirDepts = allIds.filter(d => dir[d] && String(dir[d]).trim());
+      const noDir = allIds.filter(d => !(dir[d] && String(dir[d]).trim()));
+      // 지시 있는 부서들: 각자 자기 지시를 동시(이번 주기 내 전부) 수행
+      for (const d of dirDepts) { await autoRunDept(d, String(dir[d]).trim()); }
+      // 지시 없는 부서: 한 부서씩 순환하며 자율 학습/반응 수집
+      if (noDir.length) {
+        DB.learnIdx = (DB.learnIdx||0) % noDir.length;
+        const d = noDir[DB.learnIdx];
+        DB.learnIdx = (DB.learnIdx + 1) % noDir.length;
+        await autoRunDept(d, "");
+      }
       DB.lastCollectAt = Date.now();
       saveDB();
-      kakaoNotify("📚 "+a.kr+" 자율 학습 +1 (경험치 "+DB.exp[dept]+")").catch(()=>{});
     } catch(e){ console.error("auto-learn error", e); }
   }
 }, 60000);
+
+// 한 부서의 자율수행 1회 실행 (지시가 있으면 지시 수행, 없으면 트렌드 학습/반응 수집)
+async function autoRunDept(dept, directive){
+  const a = AGENTS[dept]; if(!a) return;
+  const col = (DB.state && DB.state.collect) || {};
+  const baseFocus = directive ? directive : ((col.topic && col.topic.trim()) ? col.topic.trim() : (a.kr + " 분야"));
+  let sys;
+  if (directive) {
+    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
+      + " 운영자가 이 부서에 내린 자율수행 지시가 있다: \""+directive+"\". 지금은 자율수행 시간이다. 이 지시를 네 전문 영역 안에서 실제로 수행해, 바로 쓸 수 있는 구체적 결과물 또는 핵심 정리를 한국어로 간결히 내라. 되묻지 말고 합리적으로 가정해 완성하라."
+      + profileContext();
+  } else if (dept === "engagement") {
+    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI(커뮤니티·CS 담당)다. 지금은 평상시 반응 모니터링 시간이다. "
+      + "'"+baseFocus+"' 관련 블로그 댓글·유튜브 댓글·커뮤니티 반응을 관찰했다고 가정하고, 시청자·고객이 무엇에 반응하고(좋아함/싫어함/궁금해함) 어떤 톤·주제·포맷이 먹히는지, 떠오르는 트렌드와 자주 나오는 질문/불만을 2~4가지로 아주 간결히 정리하라. 이건 나중에 기획 방향을 잡을 때 쓸 '시청자 반응 인사이트'다." + profileContext();
+  } else {
+    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
+      + " 지금은 평상시 자율 학습 시간이다. '"+baseFocus+"'에 관해 네 부서 업무에 바로 쓸 최신 인사이트·트렌드·아이디어를 2~3가지로 아주 간결히 정리하라. 다음에 제안에 활용할 핵심만." + profileContext();
+  }
+  const tag = directive ? "[자율 지시] " : (dept==="engagement" ? "[반응 수집] " : "[자율 학습] ");
+  const note = await anthropic(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), 700);
+  if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
+  DB.deptMemory[dept].push({ at:Date.now(), instruction:tag+baseFocus, note });
+  if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
+  DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
+  DB.collections.push({ id:Date.now()+Math.floor(Math.random()*1000), topic:"["+a.kr+"] "+baseFocus, text:note, at:Date.now(), dept });
+  if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
+  saveDB();
+  kakaoNotify("📚 "+a.kr+(directive?" 자율 지시 수행 +1 (경험치 ":(dept==="engagement"?" 반응 수집 +1 (경험치 ":" 자율 학습 +1 (경험치 "))+DB.exp[dept]+")").catch(()=>{});
+}
 
 // 예약 작업 등록: { instruction, runAt(ms) }
 app.post("/api/schedule", (req,res)=>{
