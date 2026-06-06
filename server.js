@@ -102,13 +102,13 @@ const AGENTS = {
   analytics:   { no:"05", kr:"데이터 분석",    role:"데이터 분석 담당. 성과 해석·개선 포인트·다음 액션을 제시한다." },
   monetization:{ no:"06", kr:"수익화",        role:"수익화 담당. 제휴·광고·상품·멤버십 등 수익 모델과 정산을 제안한다." },
   growth:      { no:"07", kr:"성장·광고",      role:"성장·광고 담당. 유료 광고·A/B 테스트·바이럴 전략을 설계한다." },
-  ops:         { no:"08", kr:"감사·법무·리스크", role:"감사·법무·리스크 담당. 저작권·광고법·정책·정보보안 관점에서 점검·경고한다." },
+  ops:         { no:"08", kr:"감사·법무·리스크", role:"플랫폼 운영·관리 총괄 감사관. 저작권·광고법·정책·정보보안 관점에서 점검·경고할 뿐 아니라, 모든 부서의 산출물·기획·발행물을 검토하고 직접 수정·보완·재작성할 권한이 있다. 클로드(텍스트·추론 엔진)와 제미나이(영상·이미지 생성, 수동 핸드오프)를 함께 활용해 콘텐츠·정책·발행 전반을 조율한다." },
   advisory:    { no:"09", kr:"자문·서기",      role:"자문·서기 담당. 논의를 정리·요약하고 결정을 구조화해 기록한다." },
   scout:       { no:"10", kr:"탐색·발상",      role:"탐색·발상 담당(R&D). 새 기회·아이디어·트렌드 조합을 능동 발굴한다." }
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
-async function anthropic(system, user, maxTokens = 1200, images){
+async function anthropic(system, user, maxTokens = 1500, images){
   let content;
   if (images && images.length){
     content = [];
@@ -120,20 +120,40 @@ async function anthropic(system, user, maxTokens = 1200, images){
   } else {
     content = user;
   }
-  const r = await fetch("https://api.anthropic.com/v1/messages", {
-    method:"POST",
-    headers:{ "Content-Type":"application/json", "x-api-key":API_KEY, "anthropic-version":"2023-06-01" },
-    body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system:system||"", messages:[{role:"user",content:content}] })
-  });
-  const data = await r.json();
-  if (data.error) throw new Error(data.error.message || "API 오류");
-  if (data.usage) {
-    DB.usage = DB.usage || { in:0, out:0, calls:0 };
-    DB.usage.in += data.usage.input_tokens || 0;
-    DB.usage.out += data.usage.output_tokens || 0;
-    DB.usage.calls += 1;
+  const messages = [{ role:"user", content:content }];
+  let full = "";
+  let needSpace = false;
+  // 토큰 한도로 답변이 중간에 끊기면, 끊긴 지점부터 이어서 작성하도록 최대 3번까지 연결
+  for (let attempt=0; attempt<4; attempt++){
+    const r = await fetch("https://api.anthropic.com/v1/messages", {
+      method:"POST",
+      headers:{ "Content-Type":"application/json", "x-api-key":API_KEY, "anthropic-version":"2023-06-01" },
+      body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system:system||"", messages:messages })
+    });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error.message || "API 오류");
+    if (data.usage) {
+      DB.usage = DB.usage || { in:0, out:0, calls:0 };
+      DB.usage.in += data.usage.input_tokens || 0;
+      DB.usage.out += data.usage.output_tokens || 0;
+      DB.usage.calls += 1;
+    }
+    let part = (data.content || []).filter(b=>b.type==="text").map(b=>b.text).join("");
+    if (needSpace && part && !/^\s/.test(part)) part = " " + part;  // 이음새 공백 복원(중복 방지)
+    full += part;
+    needSpace = false;
+    // 응답이 max_tokens로 잘렸고, 분량이 충분한 생성이면 이어쓰기 (짧은 분류/감사 호출은 제외)
+    if (data.stop_reason === "max_tokens" && part.trim() && maxTokens >= 300 && attempt < 3){
+      const prefill = full.replace(/\s+$/, "");      // assistant 프리필은 끝 공백 불가
+      needSpace = (prefill !== full);                 // 끝에 공백이 있었으면 다음 조각 앞에 복원
+      messages.length = 1;                            // 원래 사용자 메시지만 유지
+      messages.push({ role:"assistant", content: prefill });
+      full = prefill;                                 // 이어붙일 기준 갱신
+      continue;
+    }
+    break;
   }
-  return (data.content || []).filter(b=>b.type==="text").map(b=>b.text).join("\n").trim();
+  return full.trim();
 }
 function logError(where, e){
   const msg = String((e && e.message) || e);
@@ -165,7 +185,7 @@ const PERSONA = {
   analytics:"냉철하고 꼼꼼한 데이터 분석가. 객관적이고 근거 중심으로 말한다.",
   monetization:"실리적이고 야무진 협상가. 똑부러지게 수익 관점으로 말한다.",
   growth:"도전적이고 트렌디한 그로스 해커. 활기차고 과감하게 말한다.",
-  ops:"원칙주의에 꼼꼼한 리스크 감사관. 신중하고 단호하게 경고한다.",
+  ops:"원칙주의에 꼼꼼하면서도 권한과 자유도가 큰 플랫폼 운영 총괄 감사관. 신중하고 단호하게 판단하되, 필요하면 직접 손대 고친다.",
   advisory:"차분하고 정리 잘하는 서기. 단정하게 요약·구조화해 말한다.",
   scout:"호기심 많고 톡톡 튀는 발상가. 엉뚱하면서도 창의적으로 말한다."
 };
@@ -208,13 +228,31 @@ async function route(instruction){
 }
 
 // ===== 부서 처리 (학습 메모리 주입 + 누적) =====
-async function work(dept, instruction, context, images){
+// 모든 부서가 최근 기록한 내용을 한데 모아 공유 (자기 부서는 제외)
+function crossDeptMemory(exceptDept){
+  const lines = [];
+  for (const id of Object.keys(AGENTS)){
+    if (id === exceptDept) continue;
+    const m = (DB.deptMemory && DB.deptMemory[id]) || [];
+    if (!m.length) continue;
+    const a = AGENTS[id];
+    const recent = m.slice(-2).map(x => "· " + (x.note||"")).join("\n");
+    lines.push("[" + a.no + " " + a.kr + (MEMBERS[id]?" "+MEMBERS[id]:"") + "]\n" + recent);
+  }
+  let out = lines.join("\n\n");
+  if (out.length > 2200) out = out.slice(0, 2200) + "…";
+  return out;
+}
+
+async function work(dept, instruction, context, images, teamLog){
   const a = AGENTS[dept];
   const isQuestion = /[?？]|어때|어떨까|할까요|할까|좋을까|어떤|어떻게|추천|의견|방법|왜|뭐가|무엇|가능|괜찮/.test(instruction||"");
   let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role;
   if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격과 말투를 응답 톤에 자연스럽게 녹이되, 전문성과 결과물 품질은 항상 유지하라.";
   const exp = (DB.exp && DB.exp[dept]) || 0;
   if (exp) sys += " 너는 지금까지 "+exp+"회의 자율 학습·업무 경험을 쌓았다.";
+  sys += " 이 회사의 모든 부서와 운영자는 하나의 공용 콘솔에서 함께 대화한다. 아래에 최근 팀 전체 대화와 각 부서가 기록한 내용이 그대로 공유되므로, '다른 부서 대화는 볼 수 없다/공유되지 않는다'거나 '캡처해서 붙여달라'고 말하지 마라. 공유된 맥락을 그대로 활용해 이어서 답하라.";
+  sys += " 다른 부서가 기록·작성한 내용에서 문제·빈틈·리스크가 보이면, 네 전문 영역의 관점에서 적극적으로 의견을 제시하고 구체적으로 보완·개선하라. 단, 월권하여 다른 부서 고유 업무를 통째로 대신하지는 말고, 네 전문성으로 더할 수 있는 부분을 명확히 짚어 보태라.";
   if (isQuestion){
     sys += " 이번 입력은 질문·상담 성격이다. 단정적인 결과물 생산보다, 네 경험과 수집한 자료를 근거로 유연하게 의견·선택지·추천을 제시하라. 모르면 솔직히 말하고 확인 방법을 제안하라. 대화하듯 자연스럽게.";
   } else {
@@ -225,9 +263,17 @@ async function work(dept, instruction, context, images){
   if (!isQuestion) sys += " 지시가 다소 모호하더라도 운영 프로필과 상식으로 합리적으로 가정해 바로 완성된 결과물을 만들고, 사용자에게 무엇을 만들지 되묻지 마라. 정말 불가피할 때만 짧게 1가지만 확인하라.";
   const mem = DB.deptMemory[dept] || [];
   if (mem.length) sys += "\n\n[이 부서가 쌓은 경험·학습 기록 — 제안과 답변에 적극 활용]\n" + mem.slice(-6).map(x=>"· "+x.note).join("\n");
+  const crossMem = crossDeptMemory(dept);
+  if (crossMem) sys += "\n\n[다른 부서들이 최근 기록·작성한 내용 — 팀 전체가 공유한다. 관련되면 참조하고, 문제·빈틈이 보이면 보완하라]\n" + crossMem;
+  if (teamLog) sys += "\n\n[최근 팀 전체 대화 — 운영자와 다른 부서들이 이 공용 콘솔에서 나눈 내용. 이미 너에게 공유된 맥락이다. 여기에 이어서 답하고, 관련 있으면 앞 대화를 구체적으로 참조하라]\n" + teamLog;
   if (context) sys += "\n\n[동료 부서들이 지금까지 진행한 협업 맥락 — 반드시 읽고 이어받아라]\n" + context + "\n앞 부서 결과를 중복하지 말고, 거기에 네 전문성을 더해 발전시키거나 빈 부분을 채워라. 필요하면 앞 부서 결과를 구체적으로 언급하며 연결하라.";
   if (images && images.length) sys += "\n\n[운영자가 첨부한 참고 사진/영상 장면이 함께 제공된다. 반드시 그 이미지를 분석해 작업에 반영하라.]";
-  const text = await anthropic(sys, instruction, 1200, images);
+  let maxTok = 2000;
+  if (dept === "ops"){
+    sys += "\n\n[너의 권한과 자유도는 다른 부서보다 넓다. 너는 플랫폼 운영·관리 총괄로서 (1) 어느 부서의 산출물이든 검토하고 직접 수정·보완·재작성할 수 있고, (2) 정책·발행·콘텐츠 전반의 방향을 조율하며, (3) 클로드(이 플랫폼의 텍스트·추론 엔진)로 분석·작성·수정을 직접 수행하고, 제미나이로 만들 영상·이미지는 구체적인 제작 프롬프트와 지침을 만들어 핸드오프하라. '수정할 수 없다/권한이 없다'고 하지 말고, 가능한 범위에서 끝까지 직접 처리하라. 단 실제 시스템 설정을 임의로 바꾼다고 거짓으로 말하지는 마라.]";
+    maxTok = 3000;
+  }
+  const text = await anthropic(sys, instruction, maxTok, images);
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction, note: text.length>140 ? text.slice(0,140)+"…" : text });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
@@ -269,8 +315,41 @@ async function getKakaoToken(){
 }
 
 // ===== AI 이미지 생성 + 미디어 저장소 =====
-async function uploadMedia(base64, mime){
-  // Cloudinary unsigned 업로드 (CLOUDINARY_CLOUD_NAME + CLOUDINARY_UPLOAD_PRESET)
+async function uploadToDrive(base64, mime, name){
+  // 구글 드라이브(구글 원) 업로드 — YT_REFRESH_TOKEN(드라이브 권한 포함) 재사용
+  const token = await getGoogleToken();
+  const meta = { name: name || ("agent-"+Date.now()+(String(mime).startsWith("video")?".mp4":".png")) };
+  if (process.env.GDRIVE_FOLDER_ID) meta.parents=[process.env.GDRIVE_FOLDER_ID];
+  const boundary = "agentbnd"+Date.now();
+  const pre = "--"+boundary+"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"+JSON.stringify(meta)
+    +"\r\n--"+boundary+"\r\nContent-Type: "+(mime||"application/octet-stream")+"\r\nContent-Transfer-Encoding: base64\r\n\r\n";
+  const post = "\r\n--"+boundary+"--";
+  const body = Buffer.concat([Buffer.from(pre,"utf8"), Buffer.from(base64,"utf8"), Buffer.from(post,"utf8")]);
+  const r = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", {
+    method:"POST",
+    headers:{ "Authorization":"Bearer "+token, "Content-Type":"multipart/related; boundary="+boundary },
+    body
+  });
+  const d = await r.json();
+  if (!d.id) throw new Error("드라이브 업로드 실패: "+JSON.stringify(d).slice(0,180));
+  // 링크 가진 사람 보기 권한
+  await fetch("https://www.googleapis.com/drive/v3/files/"+d.id+"/permissions", {
+    method:"POST", headers:{ "Authorization":"Bearer "+token, "Content-Type":"application/json" },
+    body: JSON.stringify({ role:"reader", type:"anyone" })
+  }).catch(()=>{});
+  return String(mime||"").startsWith("video")
+    ? ("https://drive.google.com/file/d/"+d.id+"/view")
+    : ("https://drive.google.com/uc?export=view&id="+d.id);
+}
+async function uploadMedia(base64, mime, name){
+  const store = String(process.env.MEDIA_STORE||"").toLowerCase();
+  const driveReady = (process.env.YT_REFRESH_TOKEN || process.env.YT_ACCESS_TOKEN) && process.env.GOOGLE_CLIENT_ID;
+  // 1순위: 구글 드라이브(구글 원) — store=drive 이거나, cloudinary로 강제하지 않았고 드라이브 연결됨
+  if (store==="drive" || (store!=="cloudinary" && driveReady)) {
+    try { return await uploadToDrive(base64, mime, name); }
+    catch(e){ if (store==="drive") throw e; /* 실패 시 Cloudinary로 폴백 */ }
+  }
+  // 2순위: Cloudinary unsigned 업로드 (CLOUDINARY_CLOUD_NAME + CLOUDINARY_UPLOAD_PRESET)
   const cloud = process.env.CLOUDINARY_CLOUD_NAME, preset = process.env.CLOUDINARY_UPLOAD_PRESET;
   if (cloud && preset) {
     const kind = String(mime||"").startsWith("video") ? "video" : "image";
@@ -282,15 +361,58 @@ async function uploadMedia(base64, mime){
     if (d.secure_url) return d.secure_url;
     throw new Error("Cloudinary 업로드 실패: "+JSON.stringify(d).slice(0,160));
   }
-  throw new Error("미디어 저장소 미설정(CLOUDINARY_CLOUD_NAME/UPLOAD_PRESET) — 공개 URL을 얻을 수 없습니다");
+  throw new Error("미디어 저장소 미설정(구글 드라이브 또는 CLOUDINARY) — 공개 URL을 얻을 수 없습니다");
 }
 async function generateVideo(prompt){
-  // Replicate text-to-video (REPLICATE_API_TOKEN + VIDEO_MODEL_VERSION)
+  // 1순위: Google Gemini(Veo) API (GEMINI_API_KEY) — 서버가 스스로 자동 생성
+  const gkey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if (gkey) return await generateVideoVeo(prompt, gkey);
+  // 2순위: Replicate
   const token = process.env.REPLICATE_API_TOKEN;
-  if (!token) throw new Error("REPLICATE_API_TOKEN 미설정");
+  if (token) return await generateVideoReplicate(prompt, token);
+  throw new Error("영상 API 미설정 (GEMINI_API_KEY 권장, 또는 REPLICATE_API_TOKEN)");
+}
+async function generateVideoVeo(prompt, key){
+  const model = process.env.GEMINI_VIDEO_MODEL || "veo-3.1-generate-preview";
+  const base = "https://generativelanguage.googleapis.com/v1beta";
+  const ar = process.env.VIDEO_ASPECT || "9:16";
+  // 1) 장시간 작업 시작
+  const init = await fetch(base+"/models/"+model+":predictLongRunning?key="+key, {
+    method:"POST", headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({ instances:[{ prompt }], parameters:{ aspectRatio:ar } })
+  });
+  let d = await init.json();
+  if (d.error) throw new Error("Veo: "+String(d.error.message||JSON.stringify(d.error)).slice(0,180));
+  const opName = d.name;
+  if (!opName) throw new Error("Veo: 작업 시작 실패(응답에 name 없음)");
+  // 2) 폴링 (최대 약 5분)
+  let done=false, resp=null;
+  for (let i=0; i<60 && !done; i++){
+    await new Promise(r=>setTimeout(r,5000));
+    const pr = await fetch(base+"/"+opName+"?key="+key);
+    const pd = await pr.json();
+    if (pd.error) throw new Error("Veo: "+String(pd.error.message||"").slice(0,180));
+    if (pd.done){ done=true; resp=pd.response||pd; }
+  }
+  if (!done) throw new Error("Veo: 생성 시간초과(5분)");
+  // 3) 결과 영상 URI 추출 (응답 형태 방어적으로 처리)
+  let uri=null;
+  try{
+    const gv = resp.generateVideoResponse || resp;
+    const arr = gv.generatedSamples || gv.generatedVideos || gv.videos || [];
+    const s0 = arr[0] || {};
+    uri = (s0.video && (s0.video.uri || s0.video.fileUri)) || s0.uri || null;
+  }catch(_){}
+  if (!uri) throw new Error("Veo: 결과 영상 URI를 찾지 못함");
+  // 4) 파일 다운로드(키 필요) → 공개 URL로 업로드
+  const dl = await fetch(uri + (uri.indexOf("?")>=0?"&":"?") + "key="+key);
+  if (!dl.ok) throw new Error("Veo: 영상 다운로드 실패("+dl.status+")");
+  const b64 = Buffer.from(await dl.arrayBuffer()).toString("base64");
+  return await uploadMedia(b64, "video/mp4"); // 공개 URL 반환(Cloudinary 필요)
+}
+async function generateVideoReplicate(prompt, token){
   const version = process.env.VIDEO_MODEL_VERSION;
   if (!version) throw new Error("VIDEO_MODEL_VERSION 미설정 (Replicate 영상 모델 버전 해시)");
-  // 1) 예측 생성
   const init = await fetch("https://api.replicate.com/v1/predictions", {
     method:"POST",
     headers:{ "Authorization":"Bearer "+token, "Content-Type":"application/json" },
@@ -300,7 +422,6 @@ async function generateVideo(prompt){
   if (d.error) throw new Error(typeof d.error==="string"?d.error:JSON.stringify(d.error).slice(0,160));
   const getUrl = d.urls && d.urls.get;
   let status = d.status;
-  // 2) 폴링 (최대 약 110초)
   for (let i=0; i<55 && status!=="succeeded" && status!=="failed" && status!=="canceled"; i++){
     await new Promise(r=>setTimeout(r,2000));
     const pr = await fetch(getUrl, { headers:{ "Authorization":"Bearer "+token } });
@@ -467,7 +588,7 @@ async function publish(content, platforms){
     const id = Date.now(), code = randCode();
     DB.approvals.push({ id, code, content:c, platforms, status:"pending", at:id }); saveDB();
     const sent = await kakaoApprovalRequest(c, platforms, id, code);
-    return [{ platform:"(승인 대기)", ok:false, pending:true, note: sent ? "카카오톡으로 승인 요청을 보냈습니다. 승인 시 발행됩니다." : ("승인 대기 등록됨(카톡 토큰 미설정 — 코드 "+code+")") }];
+    return [{ platform:"(승인 대기)", ok:false, pending:true, note: sent ? "카카오톡으로 승인 요청을 보냈습니다. 승인 시 발행됩니다." : ("승인 대기 — 앱의 ‘실행 결과’ 탭에서 승인하세요 (코드 "+code+")") }];
   }
   // 4) 발행 실행
   return await doActualPublish(c, platforms);
@@ -488,15 +609,16 @@ async function kakaoNotify(text){
 
 // ===== 통합 지시 처리 (서버 오케스트레이션) =====
 // 협의 모드 1단계: 각 부서가 자기 관점의 의견·아이디어만 짧게 제시 (실행 X)
-async function opinion(dept, instruction){
+async function opinion(dept, instruction, teamLog){
   const a = AGENTS[dept];
   const mem = (DB.deptMemory[dept]||[]).slice(-4).map(x=>"· "+x.note).join("\n");
   let sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
     + " 아래 지시에 대해 지금은 '실행'하지 말고, 네 부서 포지션에서의 핵심 의견·아이디어·기여 포인트·우려를 2~3줄로만 간결히 제시하라.";
   if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격·말투를 자연스럽게 반영하라.";
   if (mem) sys += "\n\n[네 경험·학습]\n"+mem;
+  if (teamLog) sys += "\n\n[최근 팀 전체 대화(운영자·타 부서 포함, 이미 공유된 맥락)]\n"+teamLog;
   sys += profileContext();
-  return await anthropic(sys, "지시: "+instruction, 350);
+  return await anthropic(sys, "지시: "+instruction, 700);
 }
 // 협의 모드 2단계: 총괄이 의견을 종합해 최종 실행 분담을 결정
 async function deliberatePlan(instruction, opinions){
@@ -504,7 +626,7 @@ async function deliberatePlan(instruction, opinions){
   const sys = "너는 SNS 자동화 회사의 총괄 진행자다. 각 부서가 제출한 의견을 놓고, 부서들이 서로의 안을 검토하고 더 나은 아이디어가 있으면 제안하며 함께 토론하는 짧은 라운드테이블을 진행한 뒤, 총괄로서 최종 결정을 내린다.\n"
     + "다음 형식으로만 출력하라:\n토론: (부서 간 핵심 논의와, 채택되거나 기각된 더 나은 아이디어를 3~5줄)\n결정: (최종 방향과 부서별 분담을 1~2문장)\nEXEC: id,id (최종 실행 부서를 협업 순서대로, 영문키)\n"
     + "부서 영문키: " + Object.keys(AGENTS).join(", ") + reactionInsights() + profileContext();
-  const out = await anthropic(sys, "지시: "+instruction+"\n\n[제출된 부서 의견]\n"+list, 650);
+  const out = await anthropic(sys, "지시: "+instruction+"\n\n[제출된 부서 의견]\n"+list, 1300);
   let execIds = [];
   const m = out.match(/EXEC:\s*([a-zA-Z,\s]+)/);
   if (m) execIds = m[1].split(",").map(s=>s.trim().toLowerCase()).filter(id=>AGENTS[id]);
@@ -541,14 +663,15 @@ function profileContext(){
   if(!rows.length) return "";
   return "\n\n[운영 프로필 — 모든 콘텐츠·제안의 기본 전제. 이 정보로 충분하니 사용자에게 되묻지 말고 바로 진행하라]\n" + rows.map(r=>"· "+r).join("\n");
 }
-async function leadPlan(instruction){
+async function leadPlan(instruction, teamLog){
 
   const list = Object.keys(AGENTS).map(id => id+" = "+AGENTS[id].no+" "+AGENTS[id].kr+" ("+MEMBERS[id]+")").join("\n");
   const sys = "너는 SNS 자동화 회사의 총괄 대리인이다. 사용자의 지시를 받아 실행을 설계한다.\n"
     + "1) 작업을 처음부터 끝까지(필요 시 조사→기획→제작→발행→분석 등) 생각해, 기여할 수 있는 부서를 충분히 폭넓게 참여시켜라. 한두 부서에만 몰지 말고, 각 부서가 어떤 아이디어·역할을 맡을지 한 줄씩 분담하라.\n"
     + "2) 단, 정말 관련 없는 부서는 빼라(억지로 다 넣지 말 것).\n"
-    + "출력: 먼저 2~4문장으로 기획(접근 방향 + 부서별 역할/요청 아이디어)을 쓰고, 마지막 줄에 'EXEC: id,id,id' 형식으로 협업 실행 순서대로 부서 영문키를 적어라.\n[부서 목록]\n" + list + reactionInsights() + profileContext();
-  const out = await anthropic(sys, "지시: "+instruction, 550);
+    + "출력: 먼저 2~4문장으로 기획(접근 방향 + 부서별 역할/요청 아이디어)을 쓰고, 마지막 줄에 'EXEC: id,id,id' 형식으로 협업 실행 순서대로 부서 영문키를 적어라.\n[부서 목록]\n" + list + reactionInsights() + profileContext()
+    + (teamLog ? "\n\n[최근 팀 전체 대화 — 운영자·각 부서가 이 공용 콘솔에서 나눈 내용. 연속된 대화이니 흐름을 이어서 설계하라]\n"+teamLog : "");
+  const out = await anthropic(sys, "지시: "+instruction, 1100);
   let execIds = [];
   const m = out.match(/EXEC:\s*([a-zA-Z,\s]+)/);
   if (m) execIds = m[1].split(",").map(s=>s.trim().toLowerCase()).filter(id=>AGENTS[id]);
@@ -556,11 +679,24 @@ async function leadPlan(instruction){
   if (!execIds.length) execIds = await route(instruction);
   return { note, execIds };
 }
-async function handleInstruction(instruction, source, images){
+async function handleInstruction(instruction, source, images, history){
   let depts = directDept(instruction);
   const direct = depts.length > 0;
   const deliberate = !!(DB.state && DB.state.deliberate);
   const job = { id:Date.now(), type:"instruct", instruction, source:source||"api", at:Date.now() };
+
+  // 최근 팀 전체 대화 맥락(부서 공유): 앱이 보낸 화면 대화 우선, 없으면 백엔드 작업기록에서 복원
+  let teamLog = "";
+  if (history && String(history).trim()){
+    teamLog = String(history).trim();
+  } else {
+    teamLog = (DB.jobs||[]).slice(-4).map(function(j){
+      var head = "운영자: " + (j.instruction||"");
+      var reps = (j.results||[]).map(function(r){ return (AGENTS[r.dept]?AGENTS[r.dept].no+" "+AGENTS[r.dept].kr:r.dept)+": "+String(r.text||"").slice(0,220); }).join("\n");
+      return head + (reps?"\n"+reps:"");
+    }).join("\n\n");
+  }
+  if (teamLog.length > 3000) teamLog = "…" + teamLog.slice(-3000);
 
   // 누적 협업 맥락: 모든 앞 부서 결과를 요약해 다음 부서에 전달 (몇 부서만 일하지 않도록)
   function buildCtx(base, results){
@@ -572,25 +708,25 @@ async function handleInstruction(instruction, source, images){
   if (direct) {
     // 부서·이름을 콕 집으면 협의 없이 그 담당이 바로 처리
     const results = [];
-    for (const d of depts) { const t = await work(d, instruction, buildCtx("", results), images); results.push({ dept:d, text:t }); }
+    for (const d of depts) { const t = await work(d, instruction, buildCtx("", results), images, teamLog); results.push({ dept:d, text:t }); }
     job.direct = true; job.depts = depts; job.results = results;
   } else if (deliberate) {
     // 협의 모드: 1) 부서 의견 수렴 → 2) 총괄 재분담 → 3) 협업 실행
     const candidates = await route(instruction);
     const opinions = [];
-    for (const d of candidates) { try{ opinions.push({ dept:d, text: await opinion(d, instruction) }); }catch(e){} }
+    for (const d of candidates) { try{ opinions.push({ dept:d, text: await opinion(d, instruction, teamLog) }); }catch(e){} }
     const plan = await deliberatePlan(instruction, opinions);
     const base = (plan.note?"[총괄 최종 결정] "+plan.note+"\n":"") + (plan.discussion?"[부서 토론 요지] "+plan.discussion+"\n":"") + "[각 부서가 제출한 아이디어]\n" + opinions.map(o=>AGENTS[o.dept].no+" "+AGENTS[o.dept].kr+": "+o.text).join("\n");
     const results = [];
-    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images); results.push({ dept:d, text:t }); }
+    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images, teamLog); results.push({ dept:d, text:t }); }
     job.deliberate = true; job.candidates = candidates; job.opinions = opinions;
     job.discussion = plan.discussion; job.plan = plan.note; job.depts = plan.execIds; job.results = results;
   } else {
     // 일반 지시: 총괄이 받아서 기획(아이디어 분담) → 부서들이 협업 수행
-    const plan = await leadPlan(instruction);
+    const plan = await leadPlan(instruction, teamLog);
     const base = plan.note ? "[총괄 기획·분담] "+plan.note : "";
     const results = [];
-    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images); results.push({ dept:d, text:t }); }
+    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images, teamLog); results.push({ dept:d, text:t }); }
     job.plan = plan.note; job.depts = plan.execIds; job.results = results;
   }
 
@@ -664,8 +800,8 @@ app.post("/api/claude", async (req,res)=>{
 
 // 통합 지시: { instruction, source } → { job }
 app.post("/api/instruct", async (req,res)=>{
-  try { const { instruction, source, images } = req.body||{}; if(!instruction) return res.status(400).json({error:"instruction 필요"});
-    res.json(await handleInstruction(instruction, source, images));
+  try { const { instruction, source, images, history } = req.body||{}; if(!instruction) return res.status(400).json({error:"instruction 필요"});
+    res.json(await handleInstruction(instruction, source, images, history));
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
@@ -732,6 +868,13 @@ app.get("/api/reject", (req,res)=>{
   if(!ap) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 승인입니다.");
   ap.status="rejected"; saveDB();
   res.send("<meta charset=utf-8>거절되었습니다. 발행하지 않습니다.");
+});
+// 앱에서 보는 승인 대기 목록
+app.get("/api/approvals", (req,res)=>{
+  res.json((DB.approvals||[]).filter(a=>a.status==="pending").map(a=>({
+    id:a.id, code:a.code, platforms:a.platforms||[],
+    title:String((a.content&&(a.content.title||a.content.description))||"").slice(0,90), at:a.at
+  })));
 });
 
 // 정기 자료수집 조회
@@ -802,7 +945,7 @@ app.get("/api/connect/youtube", (req,res)=>{
   const redirect = (process.env.PUBLIC_BASE || (req.protocol+"://"+req.get("host"))) + "/api/connect/youtube/callback";
   const u = "https://accounts.google.com/o/oauth2/v2/auth?" + new URLSearchParams({
     client_id: process.env.GOOGLE_CLIENT_ID, redirect_uri: redirect, response_type:"code",
-    scope:"https://www.googleapis.com/auth/youtube.upload", access_type:"offline", prompt:"consent"
+    scope:"https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/drive.file", access_type:"offline", prompt:"consent"
   });
   res.redirect(u);
 });
@@ -817,7 +960,7 @@ app.get("/api/connect/youtube/callback", async (req,res)=>{
       })
     });
     const d = await r.json();
-    res.send("<pre>아래 refresh_token 값을 YT_REFRESH_TOKEN 환경변수에 저장하세요.\n\nrefresh_token: "+(d.refresh_token||"(없음 — prompt=consent로 다시 시도)")+"</pre>");
+    res.send("<pre>아래 refresh_token 값을 YT_REFRESH_TOKEN 환경변수에 저장하세요.\n(이 토큰 하나로 유튜브 업로드 + 구글 드라이브 저장이 모두 됩니다.)\n\nrefresh_token: "+(d.refresh_token||"(없음 — prompt=consent로 다시 시도)")+"</pre>");
   }catch(e){ res.send("오류: "+(e.message||e)); }
 });
 
@@ -905,7 +1048,7 @@ async function autoRunDept(dept, directive){
       + " 지금은 평상시 자율 학습 시간이다. '"+baseFocus+"'에 관해 네 부서 업무에 바로 쓸 최신 인사이트·트렌드·아이디어를 2~3가지로 아주 간결히 정리하라. 다음에 제안에 활용할 핵심만." + profileContext();
   }
   const tag = directive ? "[자율 지시] " : (dept==="engagement" ? "[반응 수집] " : "[자율 학습] ");
-  const note = await anthropic(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), 700);
+  const note = await anthropic(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), 900);
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:tag+baseFocus, note });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
