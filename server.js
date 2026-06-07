@@ -892,11 +892,11 @@ async function leadPlan(instruction, teamLog){
   if (!execIds.length) execIds = await route(instruction);
   return { note, execIds };
 }
-async function handleInstruction(instruction, source, images, history){
+async function handleInstruction(instruction, source, images, history, shell){
   let depts = directDept(instruction);
   const direct = depts.length > 0;
   const deliberate = !!(DB.state && DB.state.deliberate);
-  const job = { id:Date.now(), type:"instruct", instruction, source:source||"api", at:Date.now() };
+  const job = shell || { id:Date.now(), type:"instruct", instruction, source:source||"api", at:Date.now() };
 
   // 최근 팀 전체 대화 맥락(부서 공유): 앱이 보낸 화면 대화 우선, 없으면 백엔드 작업기록에서 복원
   let teamLog = "";
@@ -943,7 +943,8 @@ async function handleInstruction(instruction, source, images, history){
     job.plan = plan.note; job.depts = plan.execIds; job.results = results;
   }
 
-  DB.jobs.push(job);
+  if (!shell) DB.jobs.push(job);
+  job.status = "done";
   if ((job.depts||[]).length > 1 || job.deliberate)
     DB.meetings.push({ id:job.id, at:job.at, instruction, depts:job.depts, opinions:job.opinions, discussion:job.discussion, plan:job.plan, exchanges:job.results });
   saveDB();
@@ -1012,10 +1013,22 @@ app.post("/api/claude", async (req,res)=>{
 });
 
 // 통합 지시: { instruction, source } → { job }
-app.post("/api/instruct", async (req,res)=>{
+app.post("/api/instruct", (req,res)=>{
   try { const { instruction, source, images, history } = req.body||{}; if(!instruction) return res.status(400).json({error:"instruction 필요"});
-    res.json(await handleInstruction(instruction, source, images, history));
+    // 작업 셸을 먼저 저장하고 즉시 응답 → 앱을 닫아도 서버가 백그라운드에서 계속 수행
+    const shell = { id:Date.now()+Math.floor(Math.random()*1000), type:"instruct", instruction, source:source||"app", at:Date.now(), status:"running" };
+    DB.jobs.push(shell); saveDB();
+    handleInstruction(instruction, source, images, history, shell)
+      .then(()=>saveDB())
+      .catch(e=>{ shell.status="error"; shell.error=String(e.message||e).slice(0,200); saveDB(); logError("instruct", e); });
+    res.json({ ok:true, id:shell.id, status:"running" });
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 지시 작업 단건 조회 (백그라운드 진행 폴링용)
+app.get("/api/instruct/:id", (req,res)=>{
+  const j=(DB.jobs||[]).find(x=>x.id===+req.params.id);
+  if(!j) return res.status(404).json({ error:"작업 없음" });
+  res.json(j);
 });
 
 // 발행: { content, platforms[] } → { results }
@@ -1029,7 +1042,7 @@ app.post("/api/publish", async (req,res)=>{
 app.get("/api/sync", (req,res)=>{
   const since = +req.query.since || 0;
   res.json({
-    jobs: DB.jobs.filter(j=>j.at>since),
+    jobs: DB.jobs.filter(j=>j.at>since && j.status!=="running"),
     meetings: DB.meetings.filter(m=>m.at>since),
     deptMemory: DB.deptMemory,
     exp: DB.exp || {},
