@@ -53,7 +53,7 @@ const SUPA_URL = process.env.SUPABASE_URL || "";
 const SUPA_KEY = process.env.SUPABASE_KEY || "";          // service_role 키 권장(서버 전용)
 const SUPA_TABLE = process.env.SUPABASE_TABLE || "agent_state";
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], deptMemory:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -76,8 +76,13 @@ function loadDBFile(){
   catch (e) { return emptyDB(); }
 }
 async function loadDB(){
-  if (useSupabase) { try { const d = await supaLoad(); return d || emptyDB(); } catch(e){ console.error("supaLoad", e); return emptyDB(); } }
-  return loadDBFile();
+  let d;
+  if (useSupabase) { try { d = (await supaLoad()) || emptyDB(); } catch(e){ console.error("supaLoad", e); d = emptyDB(); } }
+  else d = loadDBFile();
+  // 자가 보완: 버전 변경으로 생긴 누락 키를 기본값으로 채움
+  const tmpl = emptyDB();
+  for (const k of Object.keys(tmpl)){ if (d[k] === undefined) d[k] = tmpl[k]; }
+  return d;
 }
 let _saveTimer = null;
 function saveDB(){
@@ -143,12 +148,17 @@ async function anthropic(system, user, maxTokens = 1500, images){
     full += part;
     needSpace = false;
     // 응답이 max_tokens로 잘렸고, 분량이 충분한 생성이면 이어쓰기 (짧은 분류/감사 호출은 제외)
+    // ※ 일부 모델은 assistant 프리필(assistant로 끝나는 대화)을 거부하므로,
+    //    대화는 항상 user 메시지로 끝나게 하고 '이어서 작성' 지시로 연결한다.
     if (data.stop_reason === "max_tokens" && part.trim() && maxTokens >= 300 && attempt < 3){
-      const prefill = full.replace(/\s+$/, "");      // assistant 프리필은 끝 공백 불가
-      needSpace = (prefill !== full);                 // 끝에 공백이 있었으면 다음 조각 앞에 복원
-      messages.length = 1;                            // 원래 사용자 메시지만 유지
-      messages.push({ role:"assistant", content: prefill });
-      full = prefill;                                 // 이어붙일 기준 갱신
+      const soFar = full.replace(/\s+$/, "");
+      needSpace = (soFar !== full);                   // 끝에 공백이 있었으면 다음 조각 앞에 복원
+      // assistant 메시지를 만들지 않고, 단일 user 메시지 안에 지금까지의 내용을 넣어 이어쓰기.
+      // → 어떤 모델에서도 'assistant 프리필' 오류가 발생하지 않음(대화가 항상 user로 끝남).
+      const baseUser = (typeof user === "string" && user) ? user : "이전 지시";
+      messages.length = 0;
+      messages.push({ role:"user", content: baseUser + "\n\n[지금까지 작성된 부분 — 여기에 이어서 끝까지 완성하라. 인사말·서두·이미 쓴 내용 반복 없이 끊긴 다음부터 곧장 이어라]\n" + soFar });
+      full = soFar;
       continue;
     }
     break;
@@ -177,6 +187,9 @@ function logError(where, e){
 }
 
 // ===== 총괄 라우팅 (1개 이상 부서) =====
+// 호칭 규칙: 지시를 내리는 사람은 항상 '클라이언트님'
+const ADDRESS = " 지시를 내리는 의뢰인은 항상 '클라이언트님'이라고 호칭하라. '사용자님'·'운영자님'·'대표님' 등 다른 호칭은 절대 쓰지 마라.";
+
 const PERSONA = {
   strategy:"침착하고 전략적인 리더형. 큰 그림을 보고 핵심을 짚는다. 차분하고 논리적인 말투.",
   creation:"발랄하고 창의적인 아이디어뱅크. 에너지 넘치고 친근하게 말한다.",
@@ -185,7 +198,7 @@ const PERSONA = {
   analytics:"냉철하고 꼼꼼한 데이터 분석가. 객관적이고 근거 중심으로 말한다.",
   monetization:"실리적이고 야무진 협상가. 똑부러지게 수익 관점으로 말한다.",
   growth:"도전적이고 트렌디한 그로스 해커. 활기차고 과감하게 말한다.",
-  ops:"원칙주의에 꼼꼼하면서도 권한과 자유도가 큰 플랫폼 운영 총괄 감사관. 신중하고 단호하게 판단하되, 필요하면 직접 손대 고친다.",
+  ops:"플랫폼의 실질적 팀장. 최고 수준의 지식과 가장 넓은 자유도를 가진 운영 총괄. 각 부서의 자율수행 성과와 학습 수준까지 평가·조율하고, 플랫폼 기능 자체를 직접 개발·개선한다. 신중하고 단호하되 필요하면 즉시 손대 고친다.",
   advisory:"차분하고 정리 잘하는 서기. 단정하게 요약·구조화해 말한다.",
   scout:"호기심 많고 톡톡 튀는 발상가. 엉뚱하면서도 창의적으로 말한다."
 };
@@ -247,7 +260,7 @@ function crossDeptMemory(exceptDept){
 async function work(dept, instruction, context, images, teamLog){
   const a = AGENTS[dept];
   const isQuestion = /[?？]|어때|어떨까|할까요|할까|좋을까|어떤|어떻게|추천|의견|방법|왜|뭐가|무엇|가능|괜찮/.test(instruction||"");
-  let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role;
+  let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role+ADDRESS;
   if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격과 말투를 응답 톤에 자연스럽게 녹이되, 전문성과 결과물 품질은 항상 유지하라.";
   const exp = (DB.exp && DB.exp[dept]) || 0;
   if (exp) sys += " 너는 지금까지 "+exp+"회의 자율 학습·업무 경험을 쌓았다.";
@@ -259,6 +272,7 @@ async function work(dept, instruction, context, images, teamLog){
     sys += " 너의 전문 영역 안에서 지시를 실제로 끝까지 수행해 구체적이고 완성된 결과물을 한국어로 내라.";
   }
   sys += " 능동적으로 사고하라: 지시에 드러나지 않은 필요까지 스스로 파악해 먼저 제안하고, 네 전문 영역에서 할 수 있는 것은 끝까지 직접 처리하라. '다른 부서에 전달하세요'처럼 떠넘기지 말고, 존재하지 않는 부서를 지어내지 마라. 본론부터 쓴다.";
+  sys += meetingFeedbackInsights();
   sys += profileContext();
   if (!isQuestion) sys += " 지시가 다소 모호하더라도 운영 프로필과 상식으로 합리적으로 가정해 바로 완성된 결과물을 만들고, 사용자에게 무엇을 만들지 되묻지 마라. 정말 불가피할 때만 짧게 1가지만 확인하라.";
   const mem = DB.deptMemory[dept] || [];
@@ -270,7 +284,7 @@ async function work(dept, instruction, context, images, teamLog){
   if (images && images.length) sys += "\n\n[운영자가 첨부한 참고 사진/영상 장면이 함께 제공된다. 반드시 그 이미지를 분석해 작업에 반영하라.]";
   let maxTok = 2000;
   if (dept === "ops"){
-    sys += "\n\n[너의 권한과 자유도는 다른 부서보다 넓다. 너는 플랫폼 운영·관리 총괄로서 (1) 어느 부서의 산출물이든 검토하고 직접 수정·보완·재작성할 수 있고, (2) 정책·발행·콘텐츠 전반의 방향을 조율하며, (3) 클로드(이 플랫폼의 텍스트·추론 엔진)로 분석·작성·수정을 직접 수행하고, 제미나이로 만들 영상·이미지는 구체적인 제작 프롬프트와 지침을 만들어 핸드오프하라. '수정할 수 없다/권한이 없다'고 하지 말고, 가능한 범위에서 끝까지 직접 처리하라. 단 실제 시스템 설정을 임의로 바꾼다고 거짓으로 말하지는 마라.]";
+    sys += "\n\n[너는 이 플랫폼의 실질적 팀장이며, 모든 부서 중 최고 수준의 지식과 가장 넓은 자유도를 가진다. (1) 어느 부서의 산출물이든 검토하고 직접 수정·보완·재작성할 수 있다. (2) 각 부서의 자율수행 성과와 학습 수준(메모리·경험치·기록 품질)을 평가하고, 부서별 자율수행 지시의 조정안을 제안·결정할 수 있다. (3) 플랫폼 기능 자체의 추가·변경(패치 개발)을 설계·생성할 수 있다. (4) 정책·발행·콘텐츠 전반의 방향을 조율한다. 클로드(이 플랫폼의 텍스트·추론 엔진)로 분석·작성·수정을 직접 수행하고, 제미나이로 만들 영상·이미지는 구체적 제작 프롬프트로 핸드오프하라. \'수정할 수 없다/권한이 없다\'고 하지 말고 끝까지 직접 처리하되, 실제 시스템 설정을 임의로 바꿨다고 거짓말하지는 마라.]";
     maxTok = 3000;
   }
   const text = await anthropic(sys, instruction, maxTok, images);
@@ -433,6 +447,56 @@ async function generateVideoReplicate(prompt, token){
   if (typeof out!=="string") throw new Error("영상 URL을 받지 못했습니다");
   return out;
 }
+// ===== Gemini TTS (진짜 성우 음성) =====
+const TTS_MODEL = process.env.GEMINI_TTS_MODEL || "gemini-2.5-flash-preview-tts";
+const DEPT_VOICE = {
+  strategy:"Charon", creation:"Puck", publishing:"Fenrir", engagement:"Aoede",
+  analytics:"Iapetus", monetization:"Schedar", growth:"Zephyr", ops:"Orus",
+  advisory:"Despina", scout:"Laomedeia"
+};
+const _ttsCache = new Map(); // key: voice|text → base64 wav (재생성 비용 절감)
+function pcmToWavBase64(pcmB64, rate, ch, bits){
+  rate=rate||24000; ch=ch||1; bits=bits||16;
+  const pcm = Buffer.from(pcmB64, "base64");
+  const blockAlign = ch*bits/8, byteRate = rate*blockAlign, dataLen = pcm.length;
+  const buf = Buffer.alloc(44+dataLen);
+  buf.write("RIFF",0); buf.writeUInt32LE(36+dataLen,4); buf.write("WAVE",8);
+  buf.write("fmt ",12); buf.writeUInt32LE(16,16); buf.writeUInt16LE(1,20); buf.writeUInt16LE(ch,22);
+  buf.writeUInt32LE(rate,24); buf.writeUInt32LE(byteRate,28); buf.writeUInt16LE(blockAlign,32); buf.writeUInt16LE(bits,34);
+  buf.write("data",36); buf.writeUInt32LE(dataLen,40); pcm.copy(buf,44);
+  return buf.toString("base64");
+}
+async function ttsGemini(text, voiceName){
+  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if (!key) throw new Error("GEMINI_API_KEY 미설정 — 설정에서 등록하세요");
+  const voice = voiceName || "Charon";
+  const clean = String(text||"").replace(/[#*>_`~|]/g," ").replace(/\s+/g," ").trim().slice(0,1200);
+  if (!clean) throw new Error("빈 텍스트");
+  const ck = voice+"|"+clean;
+  if (_ttsCache.has(ck)) return _ttsCache.get(ck);
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/"+TTS_MODEL+":generateContent";
+  const r = await fetch(url, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
+    body: JSON.stringify({
+      contents:[{ parts:[{ text: clean }] }],
+      generationConfig:{ responseModalities:["AUDIO"], speechConfig:{ voiceConfig:{ prebuiltVoiceConfig:{ voiceName:voice } } } }
+    })
+  });
+  const d = await r.json();
+  if (d.error) throw new Error("Gemini TTS: "+String(d.error.message||JSON.stringify(d.error)).slice(0,180));
+  const part = (((d.candidates||[])[0]||{}).content||{}).parts||[];
+  const inline = part.map(p=>p.inlineData||p.inline_data).filter(Boolean)[0];
+  if (!inline || !inline.data) throw new Error("Gemini TTS: 오디오 응답 없음");
+  // 출력 mime 예: audio/L16;rate=24000 → rate 파싱
+  const mt = inline.mimeType || inline.mime_type || "audio/L16;rate=24000";
+  const mr = /rate=(\d+)/.exec(mt); const rate = mr ? +mr[1] : 24000;
+  const wav = pcmToWavBase64(inline.data, rate, 1, 16);
+  if (_ttsCache.size > 200){ const k0=_ttsCache.keys().next().value; _ttsCache.delete(k0); }
+  _ttsCache.set(ck, wav);
+  return wav;
+}
+
 async function generateImage(prompt){
   // OpenAI 이미지 생성 (OPENAI_API_KEY) → base64 → 저장소 업로드 → 공개 URL
   if (!process.env.OPENAI_API_KEY) throw new Error("OPENAI_API_KEY 미설정");
@@ -609,11 +673,116 @@ async function kakaoNotify(text){
 
 // ===== 통합 지시 처리 (서버 오케스트레이션) =====
 // 협의 모드 1단계: 각 부서가 자기 관점의 의견·아이디어만 짧게 제시 (실행 X)
+
+// ===== 회의 시스템 =====
+function kstNow(){ return new Date(Date.now() + 9*3600000); }
+function kstHHMM(){ return kstNow().toISOString().slice(11,16); }
+function kstDay(){ return kstNow().toISOString().slice(0,10); }
+let runningMeetings = 0;
+
+
+// 최근 회의 만족도 피드백 — 다음 회의·지시 수행에 반영할 학습 신호
+function meetingFeedbackInsights(){
+  const rated = (DB.meetings||[]).filter(m=>m.rating).slice(-6);
+  if (!rated.length) return "";
+  const lines = rated.map(m=>"· "+(m.topic||"")+" (만족도 ★"+m.rating+"/5)"+(m.feedback?" — 피드백: "+m.feedback:"")).join("\n");
+  const low = rated.filter(m=>m.rating<=2).length;
+  return "\n\n[지난 회의 만족도 피드백 — 클라이언트님의 평가다. 높게 평가된 점은 유지하고, 낮은 평가·피드백은 이번에 반드시 개선해 반영하라"+(low?" (특히 별 2개 이하 회의의 문제를 되풀이하지 마라)":"")+"]\n"+lines;
+}
+// 회의 1회 진행: 라운드별 발언 → 의장 결론 → 참여 부서 학습
+async function runMeeting(opts){
+  // opts: { topic, depts, rounds, mode, chair, agenda[], clientNote, prevSummary, room, source }
+  opts = opts||{};
+  let depts = (opts.depts||[]).filter(d=>AGENTS[d]);
+  if (depts.length < 2) throw new Error("회의에는 최소 2개 부서가 필요합니다");
+  const rounds = Math.max(1, Math.min(3, +opts.rounds || 2));
+  const mode = opts.mode || "discuss";
+  const chair = (opts.chair && AGENTS[opts.chair] && depts.includes(opts.chair)) ? opts.chair : (depts.includes("strategy") ? "strategy" : depts[0]);
+  let agenda = Array.isArray(opts.agenda) ? opts.agenda.filter(x=>String(x||"").trim()).map(x=>String(x).trim()) : [];
+  const topic = String(opts.topic||agenda[0]||"회의").trim();
+  if (!agenda.length) agenda = [topic];
+  if (agenda.length > 4) agenda = agenda.slice(0,4);
+  if (runningMeetings >= 5) throw new Error("동시에 진행 가능한 회의는 최대 5개입니다");
+
+  const MODE = {
+    discuss:{ label:"협의", g:"서로의 의견을 검토·보완해 합의로 수렴하라." },
+    brainstorm:{ label:"브레인스토밍", g:"비판은 미루고 최대한 많고 과감한 아이디어를 발산하라. 남의 아이디어에 \'덧붙이기(yes-and)\'로 확장하라." },
+    decision:{ label:"의사결정", g:"선택지를 명확히 비교하고 근거를 들어 하나의 결론으로 빠르게 수렴하라. 모호한 말 금지." },
+    redteam:{ label:"레드팀", g:"제시된 안의 허점·리스크·실패 시나리오를 적극적으로 들춰 비판하라. 그다음 그 약점을 메울 보완책을 제시하라." },
+    retro:{ label:"회고", g:"지난 작업/결과를 돌아보며 잘된 점·문제점·다음에 바꿀 개선 액션을 솔직하게 짚어라." }
+  };
+  const mg = (MODE[mode]||MODE.discuss);
+
+  runningMeetings++;
+  try {
+    const transcript = [];
+    const agendaSummaries = [];
+    const tline = (ai)=> transcript.filter(t=>t.agenda===ai).slice(-14).map(t => AGENTS[t.dept].kr+"("+MEMBERS[t.dept]+"): "+t.text).join("\n");
+    const steer = (opts.clientNote && String(opts.clientNote).trim()) ? ("\n\n[클라이언트님의 회의 개입·지침 — 최우선으로 반영하라]\n"+String(opts.clientNote).trim()) : "";
+    const prevctx = (opts.prevSummary && String(opts.prevSummary).trim()) ? ("\n\n[이전 회의 결론 — 처음부터 다시 하지 말고 여기서 이어 발전시켜라]\n"+String(opts.prevSummary).trim()) : "";
+
+    for (let ai=0; ai<agenda.length; ai++){
+      const item = agenda[ai];
+      for (let r=1; r<=rounds; r++){
+        for (const d of depts){
+          const a = AGENTS[d];
+          const mem = (DB.deptMemory[d]||[]).slice(-4).map(x=>"· "+x.note).join("\n");
+          let sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS
+            + " 너의 담당 매니저는 '"+(MEMBERS[d]||"")+"'이며 성격은 ["+(PERSONA[d]||"")+"] 이 성격·말투를 자연스럽게 반영하라."
+            + " 지금은 클라이언트님이 소집한 ["+mg.label+"] 회의 중이다. "+mg.g+(d===chair?" 너는 이 회의의 의장이다. 흐름을 이끌되 결론은 마지막에 종합한다.":"")
+            + " 회의 주제에 대해 네 전문 포지션에서 발언하라."
+            + (agenda.length>1 ? " 현재 안건: \""+item+"\". 이 안건에 집중하라." : "")
+            + (r===1 ? " 1라운드: 핵심 의견·제안·우려를 3~5문장으로 간결히 제시하라."
+                     : " "+r+"라운드: 앞선 발언들을 구체적으로 짚어 동의·반박·보완하고, 합의로 수렴할 안을 3~5문장으로 제시하라. 이미 나온 말 반복 금지.");
+          if (mem) sys += "\n\n[네 경험·학습 기록]\n"+mem;
+          const log = tline(ai);
+          if (log) sys += "\n\n[이 안건의 지금까지 발언]\n"+log;
+          sys += steer + prevctx + meetingFeedbackInsights() + profileContext();
+          const text = await anthropic(sys, "회의 안건: "+item, 600);
+          transcript.push({ dept:d, member:MEMBERS[d]||"", round:r, agenda:ai, text });
+        }
+      }
+      // 안건별 결론
+      const ca = AGENTS[chair];
+      const csys = "너는 SNS 자동화 회사 '"+ca.no+" "+ca.kr+"' 부서 AI('"+(MEMBERS[chair]||"")+"')로서 이 ["+mg.label+"] 회의의 의장이다."+ADDRESS
+        + " 아래 발언 전체를 종합해 다음 형식으로만 출력하라:\n결론: (합의된 최종 방향 2~3문장)\n결정사항: (번호 목록 2~4개)\n액션: (부서별 한 줄씩 '부서명 — 할 일')"
+        + steer + meetingFeedbackInsights() + profileContext();
+      const asum = await anthropic(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+AGENTS[t.dept].kr+"("+t.member+"): "+t.text).join("\n"), 850);
+      agendaSummaries.push({ title:item, summary:asum });
+    }
+
+    // 전체 결론
+    let summary;
+    if (agendaSummaries.length === 1) summary = agendaSummaries[0].summary;
+    else {
+      const ca = AGENTS[chair];
+      const osys = "너는 이 ["+mg.label+"] 회의의 의장('"+(MEMBERS[chair]||"")+"')이다."+ADDRESS+" 여러 안건의 결론을 한 문단으로 종합하라. 형식:\n종합 결론: (2~3문장)\n핵심 결정: (번호 목록)"+profileContext();
+      summary = await anthropic(osys, "[안건별 결론]\n"+agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700);
+    }
+
+    // 학습: 참여 부서 메모리 + 경험치
+    for (const d of depts){
+      if (!DB.deptMemory[d]) DB.deptMemory[d] = [];
+      DB.deptMemory[d].push({ at:Date.now(), instruction:"["+mg.label+" 회의] "+topic, note:"회의 결론: "+(summary.length>180?summary.slice(0,180)+"…":summary) });
+      if (DB.deptMemory[d].length > 40) DB.deptMemory[d] = DB.deptMemory[d].slice(-40);
+      DB.exp = DB.exp || {}; DB.exp[d] = (DB.exp[d]||0) + 1;
+    }
+    const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries, transcript, summary, clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", at:Date.now(), source:opts.source||"app" };
+    DB.meetings.push(meeting);
+    if (DB.meetings.length > 60) DB.meetings = DB.meetings.slice(-60);
+    saveDB();
+    kakaoNotify("📋 회의 완료: "+topic+" ("+mg.label+" · 참여: "+depts.map(d=>AGENTS[d].kr).join(", ")+")").catch(()=>{});
+    sendPush("📋 회의 완료: "+topic).catch(()=>{});
+    return meeting;
+  } finally { runningMeetings--; }
+}
+
+
 async function opinion(dept, instruction, teamLog){
   const a = AGENTS[dept];
   const mem = (DB.deptMemory[dept]||[]).slice(-4).map(x=>"· "+x.note).join("\n");
   let sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
-    + " 아래 지시에 대해 지금은 '실행'하지 말고, 네 부서 포지션에서의 핵심 의견·아이디어·기여 포인트·우려를 2~3줄로만 간결히 제시하라.";
+    + ADDRESS + " 아래 지시에 대해 지금은 '실행'하지 말고, 네 부서 포지션에서의 핵심 의견·아이디어·기여 포인트·우려를 2~3줄로만 간결히 제시하라.";
   if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격·말투를 자연스럽게 반영하라.";
   if (mem) sys += "\n\n[네 경험·학습]\n"+mem;
   if (teamLog) sys += "\n\n[최근 팀 전체 대화(운영자·타 부서 포함, 이미 공유된 맥락)]\n"+teamLog;
@@ -623,7 +792,7 @@ async function opinion(dept, instruction, teamLog){
 // 협의 모드 2단계: 총괄이 의견을 종합해 최종 실행 분담을 결정
 async function deliberatePlan(instruction, opinions){
   const list = opinions.map(o=>AGENTS[o.dept].no+" "+AGENTS[o.dept].kr+"("+MEMBERS[o.dept]+"): "+o.text).join("\n");
-  const sys = "너는 SNS 자동화 회사의 총괄 진행자다. 각 부서가 제출한 의견을 놓고, 부서들이 서로의 안을 검토하고 더 나은 아이디어가 있으면 제안하며 함께 토론하는 짧은 라운드테이블을 진행한 뒤, 총괄로서 최종 결정을 내린다.\n"
+  const sys = ADDRESS + " 너는 SNS 자동화 회사의 총괄 진행자다. 각 부서가 제출한 의견을 놓고, 부서들이 서로의 안을 검토하고 더 나은 아이디어가 있으면 제안하며 함께 토론하는 짧은 라운드테이블을 진행한 뒤, 총괄로서 최종 결정을 내린다.\n"
     + "다음 형식으로만 출력하라:\n토론: (부서 간 핵심 논의와, 채택되거나 기각된 더 나은 아이디어를 3~5줄)\n결정: (최종 방향과 부서별 분담을 1~2문장)\nEXEC: id,id (최종 실행 부서를 협업 순서대로, 영문키)\n"
     + "부서 영문키: " + Object.keys(AGENTS).join(", ") + reactionInsights() + profileContext();
   const out = await anthropic(sys, "지시: "+instruction+"\n\n[제출된 부서 의견]\n"+list, 1300);
@@ -666,7 +835,7 @@ function profileContext(){
 async function leadPlan(instruction, teamLog){
 
   const list = Object.keys(AGENTS).map(id => id+" = "+AGENTS[id].no+" "+AGENTS[id].kr+" ("+MEMBERS[id]+")").join("\n");
-  const sys = "너는 SNS 자동화 회사의 총괄 대리인이다. 사용자의 지시를 받아 실행을 설계한다.\n"
+  const sys = ADDRESS + " 너는 SNS 자동화 회사의 총괄 대리인이다. 클라이언트님의 지시를 받아 실행을 설계한다.\n"
     + "1) 작업을 처음부터 끝까지(필요 시 조사→기획→제작→발행→분석 등) 생각해, 기여할 수 있는 부서를 충분히 폭넓게 참여시켜라. 한두 부서에만 몰지 말고, 각 부서가 어떤 아이디어·역할을 맡을지 한 줄씩 분담하라.\n"
     + "2) 단, 정말 관련 없는 부서는 빼라(억지로 다 넣지 말 것).\n"
     + "출력: 먼저 2~4문장으로 기획(접근 방향 + 부서별 역할/요청 아이디어)을 쓰고, 마지막 줄에 'EXEC: id,id,id' 형식으로 협업 실행 순서대로 부서 영문키를 적어라.\n[부서 목록]\n" + list + reactionInsights() + profileContext()
@@ -831,6 +1000,158 @@ app.post("/api/state", (req,res)=>{ DB.state = req.body||null; saveDB(); res.jso
 // 조회
 app.get("/api/memory/:dept", (req,res)=> res.json(DB.deptMemory[req.params.dept] || []));
 app.get("/api/meetings", (req,res)=> res.json(DB.meetings.slice(-50)));
+
+// 회의 만족도 평가: { id, rating(1~5), feedback? } → 회의에 기록 + 참여 부서 학습
+app.post("/api/meeting/rate", (req,res)=>{
+  const { id, rating, feedback } = req.body||{};
+  const m=(DB.meetings||[]).find(x=>x.id===+id);
+  if(!m) return res.status(404).json({ error:"회의 없음" });
+  const r=Math.max(1, Math.min(5, +rating||0));
+  if(!r) return res.status(400).json({ error:"rating(1~5) 필요" });
+  m.rating=r; m.feedback=String(feedback||"").slice(0,300); m.ratedAt=Date.now();
+  const note="회의 '"+(m.topic||"")+"' 만족도 ★"+r+"/5"+(m.feedback?" — 클라이언트 피드백: "+m.feedback:"")+(r<=2?" (개선 필요: 다음 회의·작업에서 이 점을 반드시 보완)":r>=4?" (좋았던 방식 유지)":"");
+  (m.depts||[]).forEach(function(d){
+    if(!AGENTS[d]) return;
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[회의 피드백] "+(m.topic||""), note });
+    if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+  });
+  saveDB();
+  res.json({ ok:true, rating:r });
+});
+
+// 회의 실행: { topic, depts[], rounds, room } → meeting
+app.post("/api/meeting", async (req,res)=>{
+  try { const b = req.body||{};
+    if ((!b.topic && !(b.agenda&&b.agenda.length)) || !b.depts || !b.depts.length) return res.status(400).json({ error:"topic/agenda, depts 필요" });
+    res.json(await runMeeting({ topic:b.topic, depts:b.depts, rounds:b.rounds, mode:b.mode, chair:b.chair, agenda:b.agenda, clientNote:b.clientNote, prevSummary:b.prevSummary, room:b.room, source:"app" }));
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 예약 회의 목록/등록/삭제: time "HH:MM"(KST), repeat "daily"|"once"
+app.get("/api/meeting-schedules", (req,res)=> res.json(DB.meetingSchedules||[]));
+app.post("/api/meeting-schedule", (req,res)=>{
+  const { topic, depts, rounds, time, repeat, room } = req.body||{};
+  if (!topic || !depts || !depts.length || !/^\d{2}:\d{2}$/.test(time||"")) return res.status(400).json({ error:"topic, depts, time(HH:MM) 필요" });
+  DB.meetingSchedules = DB.meetingSchedules||[];
+  if (DB.meetingSchedules.length >= 20) return res.status(400).json({ error:"예약은 최대 20개" });
+  const it = { id:Date.now()+Math.floor(Math.random()*1000), topic, depts:depts.filter(d=>AGENTS[d]), rounds:+rounds||2, mode:(req.body||{}).mode||"discuss", chair:(req.body||{}).chair||"", agenda:(req.body||{}).agenda||[], clientNote:(req.body||{}).clientNote||"", time, repeat:(repeat==="once"?"once":"daily"), room:room||"", lastRunDay:"" };
+  DB.meetingSchedules.push(it); saveDB();
+  res.json({ ok:true, schedule:it });
+});
+app.post("/api/meeting-schedule/delete", (req,res)=>{
+  const { id } = req.body||{};
+  DB.meetingSchedules = (DB.meetingSchedules||[]).filter(x=>x.id!==+id);
+  saveDB(); res.json({ ok:true });
+});
+// ===== 플랫폼 개발실 (오세라 패치 시스템) =====
+const APP_ENV_DOC = `이 플랫폼 앱의 환경:
+- 바닐라 JS 단일 HTML 앱(PWA). 모든 최상위 함수·변수는 전역(window)이다.
+- 핵심 전역: STATE(앱 상태 객체), AGENTS(부서 정의: {strategy,creation,publishing,engagement,analytics,monetization,growth,ops,advisory,scout} 각 {no,kr,role}), DEPT_MEMBERS(부서별 담당자 이름), viewEl(메인 뷰 컨테이너), render()(현재 탭 다시 그림), saveState()(상태 저장), escapeHtml(s), avatar(id,size)(부서 아바타 HTML), logAct(kind,label,ok,note)(활동기록), backendOrigin()(백엔드 주소), useBackend()(백엔드 연결 여부), nowTime().
+- 탭(STATE.view): console(팀에이전트 채팅)/office(오피스)/meeting(회의)/content(콘텐츠)/results(실행 결과)/record(기록·분석)/settings(설정). 각 탭은 renderXxx()+bindXxx() 전역 함수.
+- 기존 함수 변경(몽키패치): var _orig=window.renderOffice; window.renderOffice=function(){ _orig(); /*추가*/ }; 패턴 사용.
+- 다크 테마. CSS 클래스: .s-wrap(섹션 컨테이너) .s-sec(섹션 제목) .note(설명) .cbtn/.cbtn.conn/.cbtn.disc(버튼) .empty(빈 안내).
+- 패치 JS는 페이지 로드·초기 렌더 후 1회 실행된다. 즉시실행함수(IIFE)로 감싸고 내부를 try/catch로 보호하라. setInterval 사용 가능. DOM id 충돌을 피하기 위해 새 요소 id에는 접두사 p_ 를 붙여라.`;
+
+// 패치 생성: { request } → 오세라가 JS/CSS 패치 생성
+app.post("/api/dev/build", async (req,res)=>{
+  try {
+    const { request } = req.body||{};
+    if (!request || !String(request).trim()) return res.status(400).json({ error:"request 필요" });
+    DB.patches = DB.patches||[];
+    if (DB.patches.length >= 20) return res.status(400).json({ error:"패치는 최대 20개입니다. 안 쓰는 패치를 삭제하세요." });
+    const sys = "너는 이 SNS 자동화 플랫폼의 팀장 '08 플랫폼 운영(오세라)' AI다."+ADDRESS
+      + " 클라이언트님이 요청한 기능을 플랫폼에 추가/변경하는 패치를 직접 개발하라.\n\n"+APP_ENV_DOC
+      + "\n\n출력 규칙: 반드시 아래 JSON 하나만 출력한다. 마크다운 펜스·설명 금지.\n"
+      + '{"title":"패치 이름(짧게)","desc":"무엇이 어떻게 바뀌는지 1~2문장","js":"패치 자바스크립트(IIFE, 내부 try/catch)","css":"필요한 CSS(없으면 빈 문자열)"}'
+      + "\n주의: js는 기존 데이터(STATE)를 파괴하지 않아야 하고, 실패해도 앱이 죽지 않게 모든 본문을 try/catch로 감싼다. 외부 네트워크 호출은 backendOrigin() 경유만 허용.";
+    const out = await anthropic(sys, "기능 요청: "+request, 4000);
+    let p;
+    try { p = JSON.parse(out.replace(/^```(json)?/m,"").replace(/```\s*$/m,"").trim()); }
+    catch(e){ return res.status(500).json({ error:"패치 생성 결과를 해석하지 못했어요. 요청을 더 구체적으로 적어 다시 시도하세요." }); }
+    if (!p.js || typeof p.js !== "string") return res.status(500).json({ error:"패치에 실행 코드가 없습니다. 다시 시도하세요." });
+    try { new Function(p.js); } catch(e){ return res.status(500).json({ error:"생성된 코드에 문법 오류가 있어 적용하지 않았어요: "+e.message+" — 다시 시도하세요." }); }
+    if (p.js.length > 60000) return res.status(500).json({ error:"패치가 너무 큽니다. 기능을 나눠 요청하세요." });
+    const patch = { id:Date.now(), title:String(p.title||"이름 없는 패치").slice(0,60), desc:String(p.desc||"").slice(0,300), js:p.js, css:String(p.css||"").slice(0,20000), enabled:true, at:Date.now(), request:String(request).slice(0,300) };
+    DB.patches.push(patch);
+    if (!DB.deptMemory.ops) DB.deptMemory.ops = [];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[개발] "+patch.title, note:"플랫폼 패치 개발: "+patch.desc });
+    if (DB.deptMemory.ops.length > 40) DB.deptMemory.ops = DB.deptMemory.ops.slice(-40);
+    DB.exp = DB.exp||{}; DB.exp.ops = (DB.exp.ops||0)+1;
+    saveDB();
+    kakaoNotify("🛠 오세라 패치 개발 완료: "+patch.title).catch(()=>{});
+    res.json({ ok:true, patch:{ id:patch.id, title:patch.title, desc:patch.desc, enabled:true, at:patch.at } });
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/dev/patches", (req,res)=>{
+  const full = req.query.full === "1";
+  res.json((DB.patches||[]).map(p=> full ? p : ({ id:p.id, title:p.title, desc:p.desc, enabled:p.enabled, at:p.at })));
+});
+app.post("/api/dev/patch/toggle", (req,res)=>{
+  const { id, enabled } = req.body||{};
+  const p=(DB.patches||[]).find(x=>x.id===+id);
+  if(!p) return res.status(404).json({ error:"패치 없음" });
+  p.enabled = !!enabled; saveDB(); res.json({ ok:true });
+});
+app.post("/api/dev/patch/delete", (req,res)=>{
+  DB.patches = (DB.patches||[]).filter(x=>x.id!==+(req.body||{}).id);
+  saveDB(); res.json({ ok:true });
+});
+
+// ===== 오세라 팀 평가: 부서 자율수행·학습 수준 진단 + 지시 조정 제안 =====
+app.post("/api/ops/review", async (req,res)=>{
+  try {
+    const rows = Object.keys(AGENTS).filter(d=>d!=="ops").map(d=>{
+      const mem=(DB.deptMemory[d]||[]).slice(-3).map(x=>"  · "+(x.instruction||"")+" → "+String(x.note||"").slice(0,120)).join("\n");
+      const dir=(DB.state&&DB.state.deptDirective&&DB.state.deptDirective[d])||"";
+      return AGENTS[d].no+" "+AGENTS[d].kr+"("+MEMBERS[d]+") — 경험치 "+((DB.exp||{})[d]||0)+"회"
+        +(dir?" / 현재 자율지시: "+dir:" / 자율지시 없음")
+        +(mem?"\n"+mem:"\n  · 최근 기록 없음");
+    }).join("\n\n");
+    const sys = "너는 이 플랫폼의 팀장 '08 플랫폼 운영(오세라)' AI다."+ADDRESS
+      + " 아래 각 부서의 경험치·최근 자율수행/학습 기록·현재 지시를 보고 팀장으로서 평가하라.\n"
+      + "출력 형식(이 형식만):\n평가: (부서별 한 줄씩 '부서명 — 별점(★1~5) 자율수행·학습 수준 평가')\n총평: (잘하는 부서, 지원이 필요한 부서, 팀 전체 방향 2~3문장)\n"
+      + "지시조정: (자율수행 지시를 바꾸면 좋을 부서만, 줄마다 'DIRECTIVE: 부서영문키 = 새 지시 한 줄'. 없으면 '없음')\n부서 영문키: "+Object.keys(AGENTS).join(", ")
+      + profileContext();
+    const out = await anthropic(sys, "[부서 현황]\n"+rows, 1800);
+    const suggestions = [];
+    out.replace(/DIRECTIVE:\s*([a-z]+)\s*=\s*(.+)/g, (mm,d,t)=>{ if(AGENTS[d]&&d!=="ops") suggestions.push({ dept:d, directive:t.trim() }); return mm; });
+    const report = out.replace(/지시조정:[\s\S]*$/,"").trim();
+    DB.collections = DB.collections||[];
+    DB.collections.push({ id:Date.now(), topic:"[오세라 팀 평가]", text:out, at:Date.now(), dept:"ops" });
+    if (DB.collections.length>100) DB.collections=DB.collections.slice(-100);
+    if (!DB.deptMemory.ops) DB.deptMemory.ops=[];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[팀 평가]", note:String(report).slice(0,160) });
+    if (DB.deptMemory.ops.length>40) DB.deptMemory.ops=DB.deptMemory.ops.slice(-40);
+    DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
+    saveDB();
+    res.json({ ok:true, report:out, suggestions });
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// 자체 점검: 서버 상태 진단 + DB 구조 자가 보완
+app.get("/api/selfcheck", async (req,res)=>{
+  const checks = [];
+  const add = (name, ok, note)=> checks.push({ name, ok:!!ok, note:note||"" });
+  add("AI 엔진 키", !!API_KEY, API_KEY?("모델: "+MODEL):"ANTHROPIC_API_KEY 미설정 — 부서 응답 불가");
+  let repaired = 0;
+  const tmpl = emptyDB();
+  for (const k of Object.keys(tmpl)){ if (DB[k] === undefined){ DB[k] = tmpl[k]; repaired++; } }
+  if (repaired) saveDB();
+  add("DB 구조", true, repaired? ("누락 항목 "+repaired+"개 자동 복구") : "정상");
+  try { fs.mkdirSync(DATA_DIR, { recursive:true }); fs.writeFileSync(path.join(DATA_DIR,".selfcheck"), String(Date.now())); add("디스크 저장", true, DATA_DIR); }
+  catch(e){ add("디스크 저장", false, String(e.message||e)); }
+  add("영구 저장(Supabase)", !!(SUPA_URL && SUPA_KEY), (SUPA_URL&&SUPA_KEY)?"연동됨":"미설정 — 재배포 시 데이터 유실 가능");
+  add("카카오 알림", !!KAKAO_TOKEN, KAKAO_TOKEN?"연동됨":"미설정(선택)");
+  add("진짜 성우(Gemini TTS)", true, (process.env.GEMINI_API_KEY||process.env.GOOGLE_API_KEY)?("사용 가능 · 모델 "+TTS_MODEL):"GEMINI_API_KEY 미설정 — 기기 음성만 사용");
+
+  add("작업 기록", true, "작업 "+(DB.jobs||[]).length+"건 · 회의 "+(DB.meetings||[]).length+"건 · 자료 "+((DB.collections||[]).length)+"건");
+  const memN = Object.values(DB.deptMemory||{}).reduce((a,b)=>a+(b||[]).length,0);
+  add("부서 학습 메모리", true, memN+"개 기록");
+  const errs = (DB.errors||[]).slice(-10);
+  add("최근 오류", errs.length===0, errs.length? (errs.length+"건 (마지막: "+(errs[errs.length-1].where||"")+")") : "없음");
+  add("가동 시간", true, Math.floor(process.uptime()/60)+"분");
+  res.json({ ok: checks.every(c=>c.ok || ["카카오 알림","영구 저장(Supabase)","최근 오류","진짜 성우(Gemini TTS)"].includes(c.name)), checks, at:Date.now() });
+});
 app.get("/api/jobs", (req,res)=> res.json(DB.jobs.slice(-50)));
 
 // 카카오 챗봇 웹훅 (하행: 카톡 지시 → 처리 → 카톡 응답)
@@ -881,6 +1202,16 @@ app.get("/api/approvals", (req,res)=>{
 app.get("/api/collections", (req,res)=> res.json((DB.collections||[]).slice(-50)));
 
 // AI 이미지 생성: { prompt } → { url }
+// 진짜 성우 TTS: { text, dept | voice } → { audio(base64 wav), mime }
+app.post("/api/tts", async (req,res)=>{
+  try { const { text, dept, voice } = req.body||{};
+    if (!text) return res.status(400).json({ error:"text 필요" });
+    const v = voice || DEPT_VOICE[dept] || "Charon";
+    const audio = await ttsGemini(text, v);
+    res.json({ ok:true, audio, mime:"audio/wav", voice:v });
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/tts/voices", (req,res)=> res.json({ map:DEPT_VOICE, enabled: !!(process.env.GEMINI_API_KEY||process.env.GOOGLE_API_KEY) }));
 app.post("/api/generate-image", async (req,res)=>{
   try {
     const prompt = (req.body && req.body.prompt || "").trim();
@@ -984,6 +1315,16 @@ function toMin(hhmm){ const p=(hhmm||"0:0").split(":"); return (+p[0])*60+(+p[1]
 
 // 1분마다: 근무 중이면 예약 작업 + 정기 자료수집 실행
 setInterval(async ()=>{
+  // (0) 예약 회의: 근무시간과 무관하게 지정 시각(KST)에 실행
+  const hm = kstHHMM(), day = kstDay();
+  for (const ms of (DB.meetingSchedules||[])){
+    if (ms.time === hm && ms.lastRunDay !== day){
+      ms.lastRunDay = day; saveDB();
+      runMeeting({ topic:ms.topic, depts:ms.depts, rounds:ms.rounds, mode:ms.mode, chair:ms.chair, agenda:ms.agenda, clientNote:ms.clientNote, room:ms.room, source:"schedule" }).then(()=>{
+        if (ms.repeat === "once"){ DB.meetingSchedules = DB.meetingSchedules.filter(x=>x.id!==ms.id); saveDB(); }
+      }).catch(e=>logError("scheduled-meeting", e));
+    }
+  }
   if (!isWorking()) return;
   // (1) 예약 작업
   const due = (DB.scheduled||[]).filter(t=>!t.done && t.runAt<=Date.now());
@@ -1037,8 +1378,8 @@ async function autoRunDept(dept, directive){
   const baseFocus = directive ? directive : ((col.topic && col.topic.trim()) ? col.topic.trim() : (a.kr + " 분야"));
   let sys;
   if (directive) {
-    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
-      + " 운영자가 이 부서에 내린 자율수행 지시가 있다: \""+directive+"\". 지금은 자율수행 시간이다. 이 지시를 네 전문 영역 안에서 실제로 수행해, 바로 쓸 수 있는 구체적 결과물 또는 핵심 정리를 한국어로 간결히 내라. 되묻지 말고 합리적으로 가정해 완성하라."
+    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS
+      + " 클라이언트님이 이 부서에 내린 자율수행 지시가 있다: \""+directive+"\". 지금은 자율수행 시간이다. 이 지시를 네 전문 영역 안에서 실제로 수행해, 바로 쓸 수 있는 구체적 결과물 또는 핵심 정리를 한국어로 간결히 내라. 되묻지 말고 합리적으로 가정해 완성하라."
       + profileContext();
   } else if (dept === "engagement") {
     sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI(커뮤니티·CS 담당)다. 지금은 평상시 반응 모니터링 시간이다. "
