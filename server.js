@@ -455,10 +455,18 @@ const TTS_MODELS = [
   "gemini-2.5-flash-tts"
 ].filter(Boolean);
 let TTS_MODEL = TTS_MODELS[0]; // 성공한 모델을 기억해 다음부터 바로 사용
+// 전원 여성 캐릭터 — 공식 여성 보이스 중 성격에 맞게 배정
 const DEPT_VOICE = {
-  strategy:"Charon", creation:"Puck", publishing:"Fenrir", engagement:"Aoede",
-  analytics:"Iapetus", monetization:"Schedar", growth:"Zephyr", ops:"Orus",
-  advisory:"Despina", scout:"Laomedeia"
+  strategy:"Kore",         // 한지우 — 침착·단단한 리더 (firm, confident)
+  creation:"Leda",         // 이서연 — 발랄·에너지 (youthful, energetic)
+  publishing:"Pulcherrima",// 박하늘 — 시원시원·추진력 (forward, expressive)
+  engagement:"Sulafat",    // 정유진 — 다정·따뜻 (warm, welcoming)
+  analytics:"Erinome",     // 강민서 — 냉철·또렷 (clear, precise)
+  monetization:"Despina",  // 윤소희 — 매끄러운 협상가 (smooth, flowing)
+  growth:"Zephyr",         // 임채원 — 밝고 도전적 (bright, cheerful)
+  ops:"Gacrux",            // 오세라 — 팀장, 연륜·무게감 (mature, experienced)
+  advisory:"Achernar",     // 서다은 — 차분·단정한 서기 (soft, gentle)
+  scout:"Laomedeia"        // 노아라 — 톡톡 튀는 발상 (upbeat, lively)
 };
 const _ttsCache = new Map(); // key: voice|text → base64 wav (재생성 비용 절감)
 function pcmToWavBase64(pcmB64, rate, ch, bits){
@@ -710,12 +718,12 @@ function meetingFeedbackInsights(){
   const low = rated.filter(m=>m.rating<=2).length;
   return "\n\n[지난 회의 만족도 피드백 — 클라이언트님의 평가다. 높게 평가된 점은 유지하고, 낮은 평가·피드백은 이번에 반드시 개선해 반영하라"+(low?" (특히 별 2개 이하 회의의 문제를 되풀이하지 마라)":"")+"]\n"+lines;
 }
-// 회의 1회 진행: 라운드별 발언 → 의장 결론 → 참여 부서 학습
-async function runMeeting(opts){
-  // opts: { topic, depts, rounds, mode, chair, agenda[], clientNote, prevSummary, room, source }
+// 회의 1회 진행: 셸 생성 → 발언을 실시간으로 기록 → 의장 결론 → 참여 부서 학습
+function createMeeting(opts){
   opts = opts||{};
   let depts = (opts.depts||[]).filter(d=>AGENTS[d]);
   if (depts.length < 2) throw new Error("회의에는 최소 2개 부서가 필요합니다");
+  if (runningMeetings >= 5) throw new Error("동시에 진행 가능한 회의는 최대 5개입니다");
   const rounds = Math.max(1, Math.min(3, +opts.rounds || 2));
   const mode = opts.mode || "discuss";
   const chair = (opts.chair && AGENTS[opts.chair] && depts.includes(opts.chair)) ? opts.chair : (depts.includes("strategy") ? "strategy" : depts[0]);
@@ -723,8 +731,14 @@ async function runMeeting(opts){
   const topic = String(opts.topic||agenda[0]||"회의").trim();
   if (!agenda.length) agenda = [topic];
   if (agenda.length > 4) agenda = agenda.slice(0,4);
-  if (runningMeetings >= 5) throw new Error("동시에 진행 가능한 회의는 최대 5개입니다");
+  const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", status:"running", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries:[], transcript:[], summary:"", clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", at:Date.now(), source:opts.source||"app" };
+  DB.meetings.push(meeting);
+  if (DB.meetings.length > 60) DB.meetings = DB.meetings.slice(-60);
+  saveDB();
+  return meeting;
+}
 
+async function processMeeting(meeting){
   const MODE = {
     discuss:{ label:"협의", g:"서로의 의견을 검토·보완해 합의로 수렴하라." },
     brainstorm:{ label:"브레인스토밍", g:"비판은 미루고 최대한 많고 과감한 아이디어를 발산하라. 남의 아이디어에 \'덧붙이기(yes-and)\'로 확장하라." },
@@ -732,15 +746,14 @@ async function runMeeting(opts){
     redteam:{ label:"레드팀", g:"제시된 안의 허점·리스크·실패 시나리오를 적극적으로 들춰 비판하라. 그다음 그 약점을 메울 보완책을 제시하라." },
     retro:{ label:"회고", g:"지난 작업/결과를 돌아보며 잘된 점·문제점·다음에 바꿀 개선 액션을 솔직하게 짚어라." }
   };
-  const mg = (MODE[mode]||MODE.discuss);
-
+  const mg = (MODE[meeting.mode]||MODE.discuss);
+  const depts = meeting.depts, rounds = meeting.rounds, chair = meeting.chair, agenda = meeting.agenda, topic = meeting.topic;
+  const transcript = meeting.transcript;
   runningMeetings++;
   try {
-    const transcript = [];
-    const agendaSummaries = [];
     const tline = (ai)=> transcript.filter(t=>t.agenda===ai).slice(-14).map(t => AGENTS[t.dept].kr+"("+MEMBERS[t.dept]+"): "+t.text).join("\n");
-    const steer = (opts.clientNote && String(opts.clientNote).trim()) ? ("\n\n[클라이언트님의 회의 개입·지침 — 최우선으로 반영하라]\n"+String(opts.clientNote).trim()) : "";
-    const prevctx = (opts.prevSummary && String(opts.prevSummary).trim()) ? ("\n\n[이전 회의 결론 — 처음부터 다시 하지 말고 여기서 이어 발전시켜라]\n"+String(opts.prevSummary).trim()) : "";
+    const steer = (meeting.clientNote && String(meeting.clientNote).trim()) ? ("\n\n[클라이언트님의 회의 개입·지침 — 최우선으로 반영하라]\n"+String(meeting.clientNote).trim()) : "";
+    const prevctx = (meeting.prevSummary && String(meeting.prevSummary).trim()) ? ("\n\n[이전 회의 결론 — 처음부터 다시 하지 말고 여기서 이어 발전시켜라]\n"+String(meeting.prevSummary).trim()) : "";
 
     for (let ai=0; ai<agenda.length; ai++){
       const item = agenda[ai];
@@ -761,6 +774,7 @@ async function runMeeting(opts){
           sys += steer + prevctx + meetingFeedbackInsights() + profileContext();
           const text = await anthropic(sys, "회의 안건: "+item, 600);
           transcript.push({ dept:d, member:MEMBERS[d]||"", round:r, agenda:ai, text });
+          saveDB(); // 발언이 생길 때마다 저장 → 앱이 실시간으로 읽어감
         }
       }
       // 안건별 결론
@@ -769,33 +783,41 @@ async function runMeeting(opts){
         + " 아래 발언 전체를 종합해 다음 형식으로만 출력하라:\n결론: (합의된 최종 방향 2~3문장)\n결정사항: (번호 목록 2~4개)\n액션: (부서별 한 줄씩 '부서명 — 할 일')"
         + steer + meetingFeedbackInsights() + profileContext();
       const asum = await anthropic(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+AGENTS[t.dept].kr+"("+t.member+"): "+t.text).join("\n"), 850);
-      agendaSummaries.push({ title:item, summary:asum });
+      meeting.agendaSummaries.push({ title:item, summary:asum });
+      saveDB();
     }
 
     // 전체 결론
-    let summary;
-    if (agendaSummaries.length === 1) summary = agendaSummaries[0].summary;
+    if (meeting.agendaSummaries.length === 1) meeting.summary = meeting.agendaSummaries[0].summary;
     else {
       const ca = AGENTS[chair];
       const osys = "너는 이 ["+mg.label+"] 회의의 의장('"+(MEMBERS[chair]||"")+"')이다."+ADDRESS+" 여러 안건의 결론을 한 문단으로 종합하라. 형식:\n종합 결론: (2~3문장)\n핵심 결정: (번호 목록)"+profileContext();
-      summary = await anthropic(osys, "[안건별 결론]\n"+agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700);
+      meeting.summary = await anthropic(osys, "[안건별 결론]\n"+meeting.agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700);
     }
 
     // 학습: 참여 부서 메모리 + 경험치
     for (const d of depts){
       if (!DB.deptMemory[d]) DB.deptMemory[d] = [];
-      DB.deptMemory[d].push({ at:Date.now(), instruction:"["+mg.label+" 회의] "+topic, note:"회의 결론: "+(summary.length>180?summary.slice(0,180)+"…":summary) });
+      DB.deptMemory[d].push({ at:Date.now(), instruction:"["+mg.label+" 회의] "+topic, note:"회의 결론: "+(meeting.summary.length>180?meeting.summary.slice(0,180)+"…":meeting.summary) });
       if (DB.deptMemory[d].length > 40) DB.deptMemory[d] = DB.deptMemory[d].slice(-40);
       DB.exp = DB.exp || {}; DB.exp[d] = (DB.exp[d]||0) + 1;
     }
-    const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries, transcript, summary, clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", at:Date.now(), source:opts.source||"app" };
-    DB.meetings.push(meeting);
-    if (DB.meetings.length > 60) DB.meetings = DB.meetings.slice(-60);
+    meeting.status = "done";
     saveDB();
     kakaoNotify("📋 회의 완료: "+topic+" ("+mg.label+" · 참여: "+depts.map(d=>AGENTS[d].kr).join(", ")+")").catch(()=>{});
     sendPush("📋 회의 완료: "+topic).catch(()=>{});
     return meeting;
+  } catch(e){
+    meeting.status = "error"; meeting.error = String(e.message||e).slice(0,200);
+    saveDB(); logError("meeting", e);
+    throw e;
   } finally { runningMeetings--; }
+}
+
+async function runMeeting(opts){
+  const meeting = createMeeting(opts);
+  await processMeeting(meeting);
+  return meeting;
 }
 
 
@@ -1042,11 +1064,19 @@ app.post("/api/meeting/rate", (req,res)=>{
 });
 
 // 회의 실행: { topic, depts[], rounds, room } → meeting
-app.post("/api/meeting", async (req,res)=>{
+app.post("/api/meeting", (req,res)=>{
   try { const b = req.body||{};
     if ((!b.topic && !(b.agenda&&b.agenda.length)) || !b.depts || !b.depts.length) return res.status(400).json({ error:"topic/agenda, depts 필요" });
-    res.json(await runMeeting({ topic:b.topic, depts:b.depts, rounds:b.rounds, mode:b.mode, chair:b.chair, agenda:b.agenda, clientNote:b.clientNote, prevSummary:b.prevSummary, room:b.room, source:"app" }));
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+    const meeting = createMeeting({ topic:b.topic, depts:b.depts, rounds:b.rounds, mode:b.mode, chair:b.chair, agenda:b.agenda, clientNote:b.clientNote, prevSummary:b.prevSummary, room:b.room, source:"app" });
+    processMeeting(meeting).catch(()=>{}); // 비동기 진행 — 발언은 실시간 저장됨
+    res.json({ ok:true, id:meeting.id, status:"running" }); // 즉시 응답 (타임아웃 방지)
+  } catch(e){ res.status(400).json({ error:String(e.message||e) }); }
+});
+// 회의 단건 조회 (실시간 진행 상황 폴링용)
+app.get("/api/meeting/:id", (req,res)=>{
+  const m=(DB.meetings||[]).find(x=>x.id===+req.params.id);
+  if(!m) return res.status(404).json({ error:"회의 없음" });
+  res.json(m);
 });
 // 예약 회의 목록/등록/삭제: time "HH:MM"(KST), repeat "daily"|"once"
 app.get("/api/meeting-schedules", (req,res)=> res.json(DB.meetingSchedules||[]));
