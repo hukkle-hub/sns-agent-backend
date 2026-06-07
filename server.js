@@ -459,7 +459,7 @@ let TTS_MODEL = TTS_MODELS[0]; // 성공한 모델을 기억해 다음부터 바
 const DEPT_VOICE = {
   strategy:"Kore",         // 한지우 — 침착·단단한 리더 (firm, confident)
   creation:"Leda",         // 이서연 — 발랄·에너지 (youthful, energetic)
-  publishing:"Pulcherrima",// 박하늘 — 시원시원·추진력 (forward, expressive)
+  publishing:"Aoede",      // 박하늘 — 시원시원·추진력, 또렷한 여성톤 (breezy, natural)
   engagement:"Sulafat",    // 정유진 — 다정·따뜻 (warm, welcoming)
   analytics:"Erinome",     // 강민서 — 냉철·또렷 (clear, precise)
   monetization:"Despina",  // 윤소희 — 매끄러운 협상가 (smooth, flowing)
