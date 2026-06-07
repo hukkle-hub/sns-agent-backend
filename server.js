@@ -448,7 +448,13 @@ async function generateVideoReplicate(prompt, token){
   return out;
 }
 // ===== Gemini TTS (진짜 성우 음성) =====
-const TTS_MODEL = process.env.GEMINI_TTS_MODEL || "gemini-2.5-flash-preview-tts";
+const TTS_MODELS = [
+  process.env.GEMINI_TTS_MODEL,                 // 사용자가 지정하면 1순위
+  "gemini-3.1-flash-tts-preview",               // 2026 현행 문서 기준
+  "gemini-2.5-flash-preview-tts",               // 구 명칭(호환)
+  "gemini-2.5-flash-tts"
+].filter(Boolean);
+let TTS_MODEL = TTS_MODELS[0]; // 성공한 모델을 기억해 다음부터 바로 사용
 const DEPT_VOICE = {
   strategy:"Charon", creation:"Puck", publishing:"Fenrir", engagement:"Aoede",
   analytics:"Iapetus", monetization:"Schedar", growth:"Zephyr", ops:"Orus",
@@ -474,20 +480,35 @@ async function ttsGemini(text, voiceName){
   if (!clean) throw new Error("빈 텍스트");
   const ck = voice+"|"+clean;
   if (_ttsCache.has(ck)) return _ttsCache.get(ck);
-  const url = "https://generativelanguage.googleapis.com/v1beta/models/"+TTS_MODEL+":generateContent";
-  const r = await fetch(url, {
-    method:"POST",
-    headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
-    body: JSON.stringify({
-      contents:[{ parts:[{ text: clean }] }],
-      generationConfig:{ responseModalities:["AUDIO"], speechConfig:{ voiceConfig:{ prebuiltVoiceConfig:{ voiceName:voice } } } }
-    })
-  });
-  const d = await r.json();
-  if (d.error) throw new Error("Gemini TTS: "+String(d.error.message||JSON.stringify(d.error)).slice(0,180));
+  // 성공했던 모델 우선, 실패 시 후보 순회
+  const tryList = [TTS_MODEL].concat(TTS_MODELS.filter(m=>m!==TTS_MODEL));
+  let d=null, lastErr=null, usedModel=null;
+  for (const mdl of tryList){
+    try {
+      const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
+      const r = await fetch(url, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
+        body: JSON.stringify({
+          contents:[{ parts:[{ text: clean }] }],
+          generationConfig:{ responseModalities:["AUDIO"], speechConfig:{ voiceConfig:{ prebuiltVoiceConfig:{ voiceName:voice } } } }
+        })
+      });
+      const dj = await r.json();
+      if (dj.error){
+        lastErr = mdl+": "+String(dj.error.message||JSON.stringify(dj.error)).slice(0,160);
+        // 모델 없음/권한 오류면 다음 후보, 그 외(키·쿼터 등)는 즉시 중단
+        if (/not found|not supported|permission|invalid model|404/i.test(String(dj.error.message||""))) continue;
+        throw new Error("Gemini TTS: "+lastErr);
+      }
+      d = dj; usedModel = mdl; break;
+    } catch(e){ lastErr = mdl+": "+String(e.message||e).slice(0,160); if(!/not found|not supported|404/i.test(lastErr)) { logError("tts", e); throw e; } }
+  }
+  if (!d) { const err=new Error("Gemini TTS 모델 호출 실패 — "+(lastErr||"원인 미상")); logError("tts", err); throw err; }
+  if (usedModel && usedModel !== TTS_MODEL) TTS_MODEL = usedModel; // 성공 모델 기억
   const part = (((d.candidates||[])[0]||{}).content||{}).parts||[];
   const inline = part.map(p=>p.inlineData||p.inline_data).filter(Boolean)[0];
-  if (!inline || !inline.data) throw new Error("Gemini TTS: 오디오 응답 없음");
+  if (!inline || !inline.data){ const err=new Error("Gemini TTS: 오디오 응답 없음 (모델 "+usedModel+")"); logError("tts", err); throw err; }
   // 출력 mime 예: audio/L16;rate=24000 → rate 파싱
   const mt = inline.mimeType || inline.mime_type || "audio/L16;rate=24000";
   const mr = /rate=(\d+)/.exec(mt); const rate = mr ? +mr[1] : 24000;
