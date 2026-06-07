@@ -707,6 +707,7 @@ async function kakaoNotify(text){
 function kstNow(){ return new Date(Date.now() + 9*3600000); }
 function kstHHMM(){ return kstNow().toISOString().slice(11,16); }
 function kstDay(){ return kstNow().toISOString().slice(0,10); }
+function kstDow(){ return kstNow().getUTCDay(); } // KST 보정된 시각의 요일(0=일~6=토)
 let runningMeetings = 0;
 
 
@@ -1081,11 +1082,26 @@ app.get("/api/meeting/:id", (req,res)=>{
 // 예약 회의 목록/등록/삭제: time "HH:MM"(KST), repeat "daily"|"once"
 app.get("/api/meeting-schedules", (req,res)=> res.json(DB.meetingSchedules||[]));
 app.post("/api/meeting-schedule", (req,res)=>{
-  const { topic, depts, rounds, time, repeat, room } = req.body||{};
-  if (!topic || !depts || !depts.length || !/^\d{2}:\d{2}$/.test(time||"")) return res.status(400).json({ error:"topic, depts, time(HH:MM) 필요" });
+  const b = req.body||{};
+  const { topic, depts, rounds, time, room } = b;
+  const repeat = b.repeat || "daily"; // once | daily | weekly | interval
+  if (!topic || !depts || !depts.length) return res.status(400).json({ error:"topic, depts 필요" });
+  // interval(주기)이 아니면 시각(HH:MM) 필요
+  if (repeat !== "interval" && !/^\d{2}:\d{2}$/.test(time||"")) return res.status(400).json({ error:"time(HH:MM) 필요" });
   DB.meetingSchedules = DB.meetingSchedules||[];
   if (DB.meetingSchedules.length >= 20) return res.status(400).json({ error:"예약은 최대 20개" });
-  const it = { id:Date.now()+Math.floor(Math.random()*1000), topic, depts:depts.filter(d=>AGENTS[d]), rounds:+rounds||2, mode:(req.body||{}).mode||"discuss", chair:(req.body||{}).chair||"", agenda:(req.body||{}).agenda||[], clientNote:(req.body||{}).clientNote||"", time, repeat:(repeat==="once"?"once":"daily"), room:room||"", lastRunDay:"" };
+  let days = Array.isArray(b.days) ? b.days.map(Number).filter(n=>n>=0&&n<=6) : [];
+  if (repeat === "weekly" && !days.length) days = [kstDow()];
+  const everyN = Math.max(1, +b.everyN || 1);          // 주기 값 (N)
+  const everyUnit = (b.everyUnit === "day") ? "day" : "hour"; // 시간 단위
+  const it = {
+    id:Date.now()+Math.floor(Math.random()*1000),
+    topic, depts:depts.filter(d=>AGENTS[d]), rounds:+rounds||2,
+    mode:b.mode||"discuss", chair:b.chair||"", agenda:b.agenda||[], clientNote:b.clientNote||"",
+    time: time||"", repeat, days, everyN, everyUnit, room:room||"",
+    lastRunDay:"", nextAt: repeat==="interval" ? (Date.now() + everyN*(everyUnit==="day"?86400000:3600000)) : 0,
+    continueLast: !!b.continueLast // 이어가기: 직전 회의 결론을 맥락으로
+  };
   DB.meetingSchedules.push(it); saveDB();
   res.json({ ok:true, schedule:it });
 });
@@ -1367,14 +1383,31 @@ function toMin(hhmm){ const p=(hhmm||"0:0").split(":"); return (+p[0])*60+(+p[1]
 // 1분마다: 근무 중이면 예약 작업 + 정기 자료수집 실행
 setInterval(async ()=>{
   // (0) 예약 회의: 근무시간과 무관하게 지정 시각(KST)에 실행
-  const hm = kstHHMM(), day = kstDay();
+  const hm = kstHHMM(), day = kstDay(), dow = kstDow(), nowMs = Date.now();
   for (const ms of (DB.meetingSchedules||[])){
-    if (ms.time === hm && ms.lastRunDay !== day){
-      ms.lastRunDay = day; saveDB();
-      runMeeting({ topic:ms.topic, depts:ms.depts, rounds:ms.rounds, mode:ms.mode, chair:ms.chair, agenda:ms.agenda, clientNote:ms.clientNote, room:ms.room, source:"schedule" }).then(()=>{
-        if (ms.repeat === "once"){ DB.meetingSchedules = DB.meetingSchedules.filter(x=>x.id!==ms.id); saveDB(); }
-      }).catch(e=>logError("scheduled-meeting", e));
+    let due = false;
+    if (ms.repeat === "interval"){
+      if (!ms.nextAt) ms.nextAt = nowMs; // 안전 보정
+      if (nowMs >= ms.nextAt) due = true;
+    } else if (ms.time === hm && ms.lastRunDay !== day){
+      if (ms.repeat === "weekly") due = (ms.days||[]).indexOf(dow) >= 0; // 지정 요일만
+      else due = true; // once / daily
     }
+    if (!due) continue;
+    if (ms.repeat === "interval"){
+      const stepMs = Math.max(1, ms.everyN||1) * ((ms.everyUnit==="day")?86400000:3600000);
+      ms.nextAt = nowMs + stepMs; // 다음 주기 예약
+    } else { ms.lastRunDay = day; }
+    // 이어가기: 같은 룸/주제의 직전 완료 회의 결론을 맥락으로 전달
+    let prevSummary = "";
+    if (ms.continueLast){
+      const prev = (DB.meetings||[]).filter(x=>x.status==="done" && (x.room===ms.room || x.topic===ms.topic)).slice(-1)[0];
+      if (prev) prevSummary = prev.summary || "";
+    }
+    saveDB();
+    runMeeting({ topic:ms.topic, depts:ms.depts, rounds:ms.rounds, mode:ms.mode, chair:ms.chair, agenda:ms.agenda, clientNote:ms.clientNote, prevSummary, room:ms.room, source:"schedule" }).then(()=>{
+      if (ms.repeat === "once"){ DB.meetingSchedules = DB.meetingSchedules.filter(x=>x.id!==ms.id); saveDB(); }
+    }).catch(e=>logError("scheduled-meeting", e));
   }
   if (!isWorking()) return;
   // (1) 예약 작업
