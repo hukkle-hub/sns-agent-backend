@@ -1019,7 +1019,14 @@ app.post("/api/instruct", (req,res)=>{
     const shell = { id:Date.now()+Math.floor(Math.random()*1000), type:"instruct", instruction, source:source||"app", at:Date.now(), status:"running" };
     DB.jobs.push(shell); saveDB();
     handleInstruction(instruction, source, images, history, shell)
-      .then(()=>saveDB())
+      .then((ret)=>{
+        // 어떤 종료 경로로 끝나든 결과를 셸에 반영하고 반드시 done 처리 (중간 return로 status 누락 방지)
+        if (ret && typeof ret==="object" && ret!==shell){
+          ["results","depts","plan","discussion","opinions","reply","deliberate","candidates","note"].forEach(function(k){ if(ret[k]!==undefined && shell[k]===undefined) shell[k]=ret[k]; });
+        }
+        if (shell.status==="running") shell.status="done";
+        saveDB();
+      })
       .catch(e=>{ shell.status="error"; shell.error=String(e.message||e).slice(0,200); saveDB(); logError("instruct", e); });
     res.json({ ok:true, id:shell.id, status:"running" });
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
