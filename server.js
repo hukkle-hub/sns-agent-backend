@@ -49,9 +49,9 @@ const ALLOWED_KAKAO = (process.env.ALLOWED_KAKAO_IDS || "").split(",").map(s=>s.
 // ===== 간단 파일 DB (운영 시 PostgreSQL 등으로 교체) =====
 const DATA_DIR = process.env.DATA_DIR || "./data";
 const DB_FILE = path.join(DATA_DIR, "db.json");
-const SUPA_URL = process.env.SUPABASE_URL || "";
-const SUPA_KEY = process.env.SUPABASE_KEY || "";          // service_role 키 권장(서버 전용)
-const SUPA_TABLE = process.env.SUPABASE_TABLE || "agent_state";
+const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");      // 끝 슬래시·공백 제거
+const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
+const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
 function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
