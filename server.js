@@ -850,7 +850,7 @@ async function deliberatePlan(instruction, opinions){
   if (nm) note = nm[1].trim();
   if (!note) note = out.replace(/EXEC:.*$/is, "").replace(/^[\s\S]*?결정\s*[:：]/, "").trim() || out.replace(/EXEC:.*$/is,"").trim();
   if (!execIds.length) execIds = opinions.map(o=>o.dept);
-  return { discussion, note, execIds };
+  const tasks = parseTasks(out); return { discussion, note, execIds, tasks };
 }
 // 일반 지시용: 총괄이 기획(접근 방향+부서 분담)을 잡고 협업 부서를 정함 (의견수렴 없이 1콜)
 // 커뮤니티 부서가 쌓은 시청자 반응·트렌드 인사이트 (기획 방향 잡기에 활용)
@@ -876,27 +876,48 @@ function profileContext(){
   if(!rows.length) return "";
   return "\n\n[운영 프로필 — 모든 콘텐츠·제안의 기본 전제. 이 정보로 충분하니 사용자에게 되묻지 말고 바로 진행하라]\n" + rows.map(r=>"· "+r).join("\n");
 }
+function parseTasks(out){
+  var tasks={}; var mt = (out||"").match(/TASKS:\s*([^\n]+)/i);
+  if(mt){ mt[1].split("|").forEach(function(p){ var i=p.indexOf("="); if(i>0){ var id=p.slice(0,i).trim().toLowerCase(); var t=p.slice(i+1).trim(); if(AGENTS[id]&&t) tasks[id]=t.slice(0,24); } }); }
+  return tasks;
+}
 async function leadPlan(instruction, teamLog){
 
   const list = Object.keys(AGENTS).map(id => id+" = "+AGENTS[id].no+" "+AGENTS[id].kr+" ("+MEMBERS[id]+")").join("\n");
   const sys = ADDRESS + " 너는 SNS 자동화 회사의 총괄 대리인이다. 클라이언트님의 지시를 받아 실행을 설계한다.\n"
     + "1) 작업을 처음부터 끝까지(필요 시 조사→기획→제작→발행→분석 등) 생각해, 기여할 수 있는 부서를 충분히 폭넓게 참여시켜라. 한두 부서에만 몰지 말고, 각 부서가 어떤 아이디어·역할을 맡을지 한 줄씩 분담하라.\n"
     + "2) 단, 정말 관련 없는 부서는 빼라(억지로 다 넣지 말 것).\n"
-    + "출력: 먼저 2~4문장으로 기획(접근 방향 + 부서별 역할/요청 아이디어)을 쓰고, 마지막 줄에 'EXEC: id,id,id' 형식으로 협업 실행 순서대로 부서 영문키를 적어라.\n[부서 목록]\n" + list + reactionInsights() + profileContext()
+    + "출력: 먼저 2~4문장으로 기획(접근 방향 + 부서별 역할/요청 아이디어)을 쓰고, 그 다음 줄에 'EXEC: id,id,id' 형식으로 협업 실행 순서대로 부서 영문키를 적고, 마지막 줄에 각 부서가 무엇을 만드는지 'TASKS: id=할일요약 | id=할일요약' 형식으로 적어라(할일요약은 한국어 12자 내외, 예: strategy=채널 콘셉트 기획).\n[부서 목록]\n" + list + reactionInsights() + profileContext()
     + (teamLog ? "\n\n[최근 팀 전체 대화 — 운영자·각 부서가 이 공용 콘솔에서 나눈 내용. 연속된 대화이니 흐름을 이어서 설계하라]\n"+teamLog : "");
   const out = await anthropic(sys, "지시: "+instruction, 1100);
   let execIds = [];
-  const m = out.match(/EXEC:\s*([a-zA-Z,\s]+)/);
+  const m = out.match(/EXEC:\s*([a-zA-Z0-9_,\s]+)/);
   if (m) execIds = m[1].split(",").map(s=>s.trim().toLowerCase()).filter(id=>AGENTS[id]);
-  const note = out.replace(/EXEC:.*$/is, "").trim();
+  const tasks = parseTasks(out);
+  const note = out.replace(/EXEC:.*$/is, "").replace(/TASKS:.*$/is, "").trim();
   if (!execIds.length) execIds = await route(instruction);
-  return { note, execIds };
+  return { note, execIds, tasks };
 }
 async function handleInstruction(instruction, source, images, history, shell){
   let depts = directDept(instruction);
   const direct = depts.length > 0;
   const deliberate = !!(DB.state && DB.state.deliberate);
   const job = shell || { id:Date.now(), type:"instruct", instruction, source:source||"api", at:Date.now() };
+  // 진행 상황 기록(앱이 폴링해 '현재 작업 내용'으로 표시)
+  function kr(d){ return AGENTS[d] ? AGENTS[d].kr : d; }
+  function setProg(list, idx){
+    var done = (list||[]).slice(0, idx).map(kr);
+    var curId = (list && list[idx]!==undefined) ? list[idx] : null;
+    var cur = curId ? kr(curId) : null;
+    var task = (job.tasks && curId && job.tasks[curId]) ? job.tasks[curId] : "";
+    var t = "";
+    if(done.length) t += "완료: "+done.join(" · ")+"  ";
+    if(cur) t += "→ "+cur+(task?(" — "+task):"")+" 작성 중 ("+(idx+1)+"/"+list.length+")";
+    job.progress = t || "진행 중…";
+    if(shell){ try{ saveDB(); }catch(e){} }
+  }
+  job.progress = "총괄이 지시를 분석하고 부서에 분담하는 중…";
+  if(shell){ try{ saveDB(); }catch(e){} }
 
   // 최근 팀 전체 대화 맥락(부서 공유): 앱이 보낸 화면 대화 우선, 없으면 백엔드 작업기록에서 복원
   let teamLog = "";
@@ -920,31 +941,38 @@ async function handleInstruction(instruction, source, images, history, shell){
 
   if (direct) {
     // 부서·이름을 콕 집으면 협의 없이 그 담당이 바로 처리
-    const results = [];
-    for (const d of depts) { const t = await work(d, instruction, buildCtx("", results), images, teamLog); results.push({ dept:d, text:t }); }
+    const results = []; job.depts = depts;
+    for (let i=0;i<depts.length;i++){ const d=depts[i]; setProg(depts, i); job.results=results;
+      const t = await work(d, instruction, buildCtx("", results), images, teamLog); results.push({ dept:d, text:t }); if(shell){try{saveDB();}catch(e){}} }
     job.direct = true; job.depts = depts; job.results = results;
   } else if (deliberate) {
     // 협의 모드: 1) 부서 의견 수렴 → 2) 총괄 재분담 → 3) 협업 실행
+    job.progress = "부서들이 의견을 내는 중…"; if(shell){try{saveDB();}catch(e){}}
     const candidates = await route(instruction);
     const opinions = [];
-    for (const d of candidates) { try{ opinions.push({ dept:d, text: await opinion(d, instruction, teamLog) }); }catch(e){} }
+    for (let i=0;i<candidates.length;i++){ const d=candidates[i]; job.progress="의견 수렴: "+kr(d)+" ("+(i+1)+"/"+candidates.length+")"; if(shell){try{saveDB();}catch(e){}} try{ opinions.push({ dept:d, text: await opinion(d, instruction, teamLog) }); }catch(e){} }
+    job.progress = "총괄이 의견을 종합해 분담하는 중…"; if(shell){try{saveDB();}catch(e){}}
     const plan = await deliberatePlan(instruction, opinions);
+    job.tasks = plan.tasks || {};
     const base = (plan.note?"[총괄 최종 결정] "+plan.note+"\n":"") + (plan.discussion?"[부서 토론 요지] "+plan.discussion+"\n":"") + "[각 부서가 제출한 아이디어]\n" + opinions.map(o=>AGENTS[o.dept].no+" "+AGENTS[o.dept].kr+": "+o.text).join("\n");
-    const results = [];
-    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images, teamLog); results.push({ dept:d, text:t }); }
+    const results = []; job.depts = plan.execIds;
+    for (let i=0;i<plan.execIds.length;i++){ const d=plan.execIds[i]; setProg(plan.execIds, i); job.results=results;
+      const t = await work(d, instruction, buildCtx(base, results), images, teamLog); results.push({ dept:d, text:t }); if(shell){try{saveDB();}catch(e){}} }
     job.deliberate = true; job.candidates = candidates; job.opinions = opinions;
     job.discussion = plan.discussion; job.plan = plan.note; job.depts = plan.execIds; job.results = results;
   } else {
     // 일반 지시: 총괄이 받아서 기획(아이디어 분담) → 부서들이 협업 수행
     const plan = await leadPlan(instruction, teamLog);
+    job.tasks = plan.tasks || {};
     const base = plan.note ? "[총괄 기획·분담] "+plan.note : "";
-    const results = [];
-    for (const d of plan.execIds) { const t = await work(d, instruction, buildCtx(base, results), images, teamLog); results.push({ dept:d, text:t }); }
+    const results = []; job.depts = plan.execIds;
+    for (let i=0;i<plan.execIds.length;i++){ const d=plan.execIds[i]; setProg(plan.execIds, i); job.results=results;
+      const t = await work(d, instruction, buildCtx(base, results), images, teamLog); results.push({ dept:d, text:t }); if(shell){try{saveDB();}catch(e){}} }
     job.plan = plan.note; job.depts = plan.execIds; job.results = results;
   }
 
   if (!shell) DB.jobs.push(job);
-  job.status = "done";
+  job.status = "done"; job.progress = "";
   if ((job.depts||[]).length > 1 || job.deliberate)
     DB.meetings.push({ id:job.id, at:job.at, instruction, depts:job.depts, opinions:job.opinions, discussion:job.discussion, plan:job.plan, exchanges:job.results });
   saveDB();
@@ -1515,5 +1543,10 @@ app.post("/api/schedule", (req,res)=>{
 const PORT = process.env.PORT || 3000;
 (async ()=>{
   DB = await loadDB();
+  // 서버 재시작으로 중단된 작업/회의를 정리(고아 running → error) — 무한 '진행 중' 방지
+  let _orphan = 0;
+  (DB.meetings||[]).forEach(function(m){ if(m && m.status==="running"){ m.status="error"; m.error="서버 재시작으로 중단됨"; _orphan++; } });
+  (DB.jobs||[]).forEach(function(j){ if(j && j.status==="running"){ j.status="error"; j.error="서버 재시작으로 중단됨"; _orphan++; } });
+  if(_orphan){ try{ saveDB(); }catch(e){} console.log("중단된 작업 "+_orphan+"건 정리(error 처리)"); }
   app.listen(PORT, ()=> console.log("SNS 에이전트 백엔드 listening on " + PORT + (useSupabase?" (Supabase)":" (file)")));
 })();
