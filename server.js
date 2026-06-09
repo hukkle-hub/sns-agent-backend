@@ -71,6 +71,28 @@ async function supaSave(data){
     body: JSON.stringify([{ id:"main", data, updated_at:Date.now() }])
   });
 }
+// 영구저장 라이브 점검: 실제로 테이블을 읽어 연결·권한·테이블 존재를 확인
+async function supaProbe(){
+  if(!useSupabase) return { ok:false, note:"미설정 — 재배포 시 데이터 유실 가능" };
+  try{
+    const r = await fetch(SUPA_URL+"/rest/v1/"+SUPA_TABLE+"?id=eq.main&select=id,updated_at", {
+      headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY }
+    });
+    if(!r.ok){
+      const t = (await r.text()||"").slice(0,120);
+      let hint = "";
+      if(r.status===401||r.status===403) hint = " (키 권한 확인: service_role 권장)";
+      else if(r.status===404) hint = " (테이블 '"+SUPA_TABLE+"' 없음 — SQL로 생성 필요)";
+      return { ok:false, note:"연결 실패 HTTP "+r.status+hint+(t?(" · "+t):"") };
+    }
+    const rows = await r.json();
+    if(Array.isArray(rows)){
+      const row = rows[0];
+      return { ok:true, note: row ? ("읽기/쓰기 정상 · 최종 저장 "+new Date(row.updated_at||0).toLocaleString("ko-KR")) : "테이블 정상 · 아직 저장된 데이터 없음" };
+    }
+    return { ok:false, note:"예상치 못한 응답 형식" };
+  }catch(e){ return { ok:false, note:String(e.message||e).slice(0,120) }; }
+}
 function loadDBFile(){
   try { return JSON.parse(fs.readFileSync(DB_FILE, "utf8")); }
   catch (e) { return emptyDB(); }
@@ -1255,7 +1277,8 @@ app.get("/api/selfcheck", async (req,res)=>{
   add("DB 구조", true, repaired? ("누락 항목 "+repaired+"개 자동 복구") : "정상");
   try { fs.mkdirSync(DATA_DIR, { recursive:true }); fs.writeFileSync(path.join(DATA_DIR,".selfcheck"), String(Date.now())); add("디스크 저장", true, DATA_DIR); }
   catch(e){ add("디스크 저장", false, String(e.message||e)); }
-  add("영구 저장(Supabase)", !!(SUPA_URL && SUPA_KEY), (SUPA_URL&&SUPA_KEY)?"연동됨":"미설정 — 재배포 시 데이터 유실 가능");
+  try { const sp = await supaProbe(); add("영구 저장(Supabase)", sp.ok, sp.note); }
+  catch(e){ add("영구 저장(Supabase)", false, String(e.message||e).slice(0,100)); }
   add("카카오 알림", !!KAKAO_TOKEN, KAKAO_TOKEN?"연동됨":"미설정(선택)");
   add("진짜 성우(Gemini TTS)", true, (process.env.GEMINI_API_KEY||process.env.GOOGLE_API_KEY)?("사용 가능 · 모델 "+TTS_MODEL):"GEMINI_API_KEY 미설정 — 기기 음성만 사용");
 
