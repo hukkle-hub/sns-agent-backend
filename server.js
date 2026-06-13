@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -152,11 +152,20 @@ async function anthropic(system, user, maxTokens = 1500, images){
   let needSpace = false;
   // 토큰 한도로 답변이 중간에 끊기면, 끊긴 지점부터 이어서 작성하도록 최대 3번까지 연결
   for (let attempt=0; attempt<4; attempt++){
-    const r = await fetch("https://api.anthropic.com/v1/messages", {
-      method:"POST",
-      headers:{ "Content-Type":"application/json", "x-api-key":API_KEY, "anthropic-version":"2023-06-01" },
-      body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system:system||"", messages:messages })
-    });
+    const _ctrl = new AbortController();
+    const _to = setTimeout(()=>{ try{ _ctrl.abort(); }catch(_){}}, 90000); // 90초 안에 응답 없으면 중단
+    let r;
+    try {
+      r = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json", "x-api-key":API_KEY, "anthropic-version":"2023-06-01" },
+        body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system:system||"", messages:messages }),
+        signal: _ctrl.signal
+      });
+    } catch(e){
+      if (e && e.name==="AbortError") throw new Error("AI 응답 시간 초과(90초)");
+      throw e;
+    } finally { clearTimeout(_to); }
     const data = await r.json();
     if (data.error) throw new Error(data.error.message || "API 오류");
     if (data.usage) {
@@ -264,6 +273,43 @@ async function route(instruction){
 
 // ===== 부서 처리 (학습 메모리 주입 + 누적) =====
 // 모든 부서가 최근 기록한 내용을 한데 모아 공유 (자기 부서는 제외)
+// 지시와 '비슷한 과거 작업·수집 자료'를 관련도(키워드 겹침)로 찾아 재활용 → 재조사 없이 더 빠르고 정확
+function _tok(str){ return String(str||"").toLowerCase().replace(/[^0-9a-z\uac00-\ud7a3\s]/g," ").split(/\s+/).filter(w=>w.length>=2); }
+function relevantContext(dept, query, limit){
+  const qt = new Set(_tok(query)); if(!qt.size) return "";
+  function score(text){ const seen=new Set(); let n=0; for(const w of _tok(text)){ if(qt.has(w)&&!seen.has(w)){ n++; seen.add(w); } } return n; }
+  const cand = [];
+  (DB.deptMemory[dept]||[]).forEach(x=>{ const sc=score((x.instruction||"")+" "+(x.note||"")); if(sc>=2) cand.push({sc, when:x.at||0, label:x.instruction||"", text:String(x.note||"")}); });
+  (DB.collections||[]).filter(c=>c.dept===dept).forEach(c=>{ const sc=score((c.topic||"")+" "+(c.text||"")); if(sc>=2) cand.push({sc, when:c.at||0, label:c.topic||"", text:String(c.text||"")}); });
+  cand.sort((a,b)=> (b.sc-a.sc) || (b.when-a.when));
+  const top = cand.slice(0, limit||3);
+  if(!top.length) return "";
+  return top.map(x=>"· "+(x.label?("["+x.label+"] "):"")+x.text.slice(0,600)).join("\n");
+}
+// 부서의 '축적 전문성(지식 베이스)'을 가져와 프롬프트에 주입할 텍스트
+function knowledgeText(dept){
+  const k = DB.deptKnowledge && DB.deptKnowledge[dept];
+  return (k && k.text) ? k.text : "";
+}
+function deptLevel(dept){ return Math.floor(((DB.exp&&DB.exp[dept])||0)/5)+1; }
+// 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
+async function distillKnowledge(dept){
+  try{
+    const a=AGENTS[dept]; if(!a) return;
+    const arr=DB.deptMemory[dept]||[];
+    if(arr.length<3) return;
+    const prior=knowledgeText(dept);
+    const recent=arr.slice(-12).map(x=>"· "+(x.instruction?("["+x.instruction+"] "):"")+String(x.note||"").slice(0,220)).join("\n");
+    const sys="너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서의 지식 관리자다. 역할: "+a.role
+      +" 이 부서가 그동안 수행·학습한 기록을 통합해 '이 부서의 축적 전문성'을 갱신하라. 기존 전문성에 새 기록을 합치되 중복은 통합하고 더 정교하게 다듬어, 앞으로 모든 작업에 즉시 적용할 핵심 노하우로 만들라."
+      +" 한국어로만, 아래 형식으로 14줄 이내로 압축 출력(설명·서론 금지):\n핵심 전문성: (이 부서가 잘하게 된 것 3~5개)\n검증된 원칙·노하우: (반복해서 통한 방식 3~5개)\n피해야 할 것: (실패·비효율 1~3개)\n타깃·시장 인사이트: (고객/시장에 대해 알게 된 것 2~4개)"
+      +profileContext();
+    const out=await anthropic(sys, "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[새로 쌓인 최근 기록]\n"+recent, 1100);
+    DB.deptKnowledge=DB.deptKnowledge||{};
+    DB.deptKnowledge[dept]={ text:out, at:Date.now(), basis:arr.length, exp:(DB.exp&&DB.exp[dept])||0 };
+    saveDB();
+  }catch(e){ logError("distill:"+dept, e); }
+}
 function crossDeptMemory(exceptDept){
   const lines = [];
   for (const id of Object.keys(AGENTS)){
@@ -297,8 +343,13 @@ async function work(dept, instruction, context, images, teamLog){
   sys += meetingFeedbackInsights();
   sys += profileContext();
   if (!isQuestion) sys += " 지시가 다소 모호하더라도 운영 프로필과 상식으로 합리적으로 가정해 바로 완성된 결과물을 만들고, 사용자에게 무엇을 만들지 되묻지 마라. 정말 불가피할 때만 짧게 1가지만 확인하라.";
+  const _kb = knowledgeText(dept); const _lv = deptLevel(dept);
+  sys += " 너는 현재 Lv"+_lv+" 숙련도의 부서다." + (_lv>=3 ? " 그동안 축적한 전문성을 바탕으로 더 깊고 차별화된 결과를 내라." : " 기본기를 지키며 일관되게 수행하라.");
+  if (_kb) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 모든 판단·작성의 기반으로 반드시 적용하라]\n" + _kb;
+  const _rel = relevantContext(dept, instruction, 3);
+  if (_rel) sys += "\n\n[이번 지시와 비슷한 과거 작업·수집 자료 — 처음부터 다시 조사하지 말고 이걸 재활용·갱신해 더 빠르고 정확하게 처리하라]\n" + _rel;
   const mem = DB.deptMemory[dept] || [];
-  if (mem.length) sys += "\n\n[이 부서가 쌓은 경험·학습 기록 — 제안과 답변에 적극 활용]\n" + mem.slice(-6).map(x=>"· "+x.note).join("\n");
+  if (mem.length) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem.slice(-6).map(x=>"· "+x.note).join("\n");
   const crossMem = crossDeptMemory(dept);
   if (crossMem) sys += "\n\n[다른 부서들이 최근 기록·작성한 내용 — 팀 전체가 공유한다. 관련되면 참조하고, 문제·빈틈이 보이면 보완하라]\n" + crossMem;
   if (teamLog) sys += "\n\n[최근 팀 전체 대화 — 운영자와 다른 부서들이 이 공용 콘솔에서 나눈 내용. 이미 너에게 공유된 맥락이다. 여기에 이어서 답하고, 관련 있으면 앞 대화를 구체적으로 참조하라]\n" + teamLog;
@@ -311,10 +362,11 @@ async function work(dept, instruction, context, images, teamLog){
   }
   const text = await anthropic(sys, instruction, maxTok, images);
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
-  DB.deptMemory[dept].push({ at:Date.now(), instruction, note: text.length>140 ? text.slice(0,140)+"…" : text });
+  DB.deptMemory[dept].push({ at:Date.now(), instruction, note: text.length>500 ? text.slice(0,500)+"…" : text });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
   saveDB();
+  if (DB.exp[dept] % 4 === 0) { try{ await distillKnowledge(dept); }catch(e){} } // 4회 활동마다 전문성 압축·발전
   return text;
 }
 
@@ -745,11 +797,18 @@ function meetingFeedbackInsights(){
 function createMeeting(opts){
   opts = opts||{};
   let depts = (opts.depts||[]).filter(d=>AGENTS[d]);
+  // 상시 참여 에이전트(팀장 등) 항상 합류
+  const always = (opts.alwaysJoin||[]).filter(d=>AGENTS[d]);
+  always.forEach(d=>{ if(!depts.includes(d)) depts.push(d); });
+  // 중복 제거
+  depts = depts.filter((d,i)=>depts.indexOf(d)===i);
   if (depts.length < 2) throw new Error("회의에는 최소 2개 부서가 필요합니다");
   if (runningMeetings >= 5) throw new Error("동시에 진행 가능한 회의는 최대 5개입니다");
   const rounds = Math.max(1, Math.min(3, +opts.rounds || 2));
   const mode = opts.mode || "discuss";
-  const chair = (opts.chair && AGENTS[opts.chair] && depts.includes(opts.chair)) ? opts.chair : (depts.includes("strategy") ? "strategy" : depts[0]);
+  // 의장(진행): 지정 > 상시참여 팀장(ops) > 상시참여 첫번째 > strategy > 첫 부서
+  const chair = (opts.chair && AGENTS[opts.chair] && depts.includes(opts.chair)) ? opts.chair
+    : (always.includes("ops") ? "ops" : (always[0] || (depts.includes("strategy") ? "strategy" : depts[0])));
   let agenda = Array.isArray(opts.agenda) ? opts.agenda.filter(x=>String(x||"").trim()).map(x=>String(x).trim()) : [];
   const topic = String(opts.topic||agenda[0]||"회의").trim();
   if (!agenda.length) agenda = [topic];
@@ -783,6 +842,7 @@ async function processMeeting(meeting){
       for (let r=1; r<=rounds; r++){
         for (const d of depts){
           const a = AGENTS[d];
+          const kbm = knowledgeText(d);
           const mem = (DB.deptMemory[d]||[]).slice(-4).map(x=>"· "+x.note).join("\n");
           let sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS
             + " 너의 담당 매니저는 '"+(MEMBERS[d]||"")+"'이며 성격은 ["+(PERSONA[d]||"")+"] 이 성격·말투를 자연스럽게 반영하라."
@@ -791,11 +851,17 @@ async function processMeeting(meeting){
             + (agenda.length>1 ? " 현재 안건: \""+item+"\". 이 안건에 집중하라." : "")
             + (r===1 ? " 1라운드: 핵심 의견·제안·우려를 3~5문장으로 간결히 제시하라."
                      : " "+r+"라운드: 앞선 발언들을 구체적으로 짚어 동의·반박·보완하고, 합의로 수렴할 안을 3~5문장으로 제시하라. 이미 나온 말 반복 금지.");
-          if (mem) sys += "\n\n[네 경험·학습 기록]\n"+mem;
+          if (kbm) sys += "\n\n[네 부서가 축적한 전문성(지식 베이스) — 이 회의에서 적극 활용하라]\n"+kbm;
+          if (mem) sys += "\n\n[네 최근 기록]\n"+mem;
           const log = tline(ai);
           if (log) sys += "\n\n[이 안건의 지금까지 발언]\n"+log;
           sys += steer + prevctx + meetingFeedbackInsights() + profileContext();
-          const text = await anthropic(sys, "회의 안건: "+item, 600);
+          let text;
+          try { text = await anthropic(sys, "회의 안건: "+item, 600); }
+          catch(e1){
+            try { await new Promise(r=>setTimeout(r,1500)); text = await anthropic(sys, "회의 안건: "+item, 600); } // 1회 재시도
+            catch(e2){ text = "(이 발언은 일시 오류로 건너뜀)"; logError("meeting-stmt", e2); }
+          }
           transcript.push({ dept:d, member:MEMBERS[d]||"", round:r, agenda:ai, text });
           saveDB(); // 발언이 생길 때마다 저장 → 앱이 실시간으로 읽어감
         }
@@ -805,7 +871,9 @@ async function processMeeting(meeting){
       const csys = "너는 SNS 자동화 회사 '"+ca.no+" "+ca.kr+"' 부서 AI('"+(MEMBERS[chair]||"")+"')로서 이 ["+mg.label+"] 회의의 의장이다."+ADDRESS
         + " 아래 발언 전체를 종합해 다음 형식으로만 출력하라:\n결론: (합의된 최종 방향 2~3문장)\n결정사항: (번호 목록 2~4개)\n액션: (부서별 한 줄씩 '부서명 — 할 일')"
         + steer + meetingFeedbackInsights() + profileContext();
-      const asum = await anthropic(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+AGENTS[t.dept].kr+"("+t.member+"): "+t.text).join("\n"), 850);
+      let asum;
+      try { asum = await anthropic(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+AGENTS[t.dept].kr+"("+t.member+"): "+t.text).join("\n"), 850); }
+      catch(e){ asum = "결론: (요약 생성 일시 오류 — 발언 기록을 참고하세요)"; logError("meeting-sum", e); }
       meeting.agendaSummaries.push({ title:item, summary:asum });
       saveDB();
     }
@@ -815,7 +883,8 @@ async function processMeeting(meeting){
     else {
       const ca = AGENTS[chair];
       const osys = "너는 이 ["+mg.label+"] 회의의 의장('"+(MEMBERS[chair]||"")+"')이다."+ADDRESS+" 여러 안건의 결론을 한 문단으로 종합하라. 형식:\n종합 결론: (2~3문장)\n핵심 결정: (번호 목록)"+profileContext();
-      meeting.summary = await anthropic(osys, "[안건별 결론]\n"+meeting.agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700);
+      try { meeting.summary = await anthropic(osys, "[안건별 결론]\n"+meeting.agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700); }
+      catch(e){ meeting.summary = meeting.agendaSummaries.map(x=>x.title+": "+x.summary).join("\n\n"); logError("meeting-osum", e); }
     }
 
     // 학습: 참여 부서 메모리 + 경험치
@@ -1003,6 +1072,16 @@ async function handleInstruction(instruction, source, images, history, shell){
 
 // ========================= 엔드포인트 =========================
 app.get("/", (req,res)=> res.send("SNS 에이전트 확장 백엔드 작동 중"));
+// 외부 핑(Keep-alive): 서버를 깨우고, 근무 중이고 자율수행이 밀렸으면 그 자리에서 한 사이클 실행 + 상태 보고
+app.get("/api/ping", (req,res)=>{
+  const col = (DB.state && DB.state.collect) || {};
+  const on = col.everyMin > 0;
+  const working = (function(){ try{ return isWorking(); }catch(e){ return true; } })();
+  const sinceMin = DB.lastCollectAt ? Math.round((Date.now()-DB.lastCollectAt)/60000) : null;
+  const due = on && working && (Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000);
+  if (due) { runAutoCycle().catch(e=>logError("ping-autocycle", e)); } // 핑이 트리거가 되어 평소 수행이 이어짐
+  res.json({ ok:true, awake:true, working, autonomy:{ on, everyMin:col.everyMin||0, lastRunMinAgo:sinceMin, ranNow:!!due }, ts:Date.now() });
+});
 
 // ===== 로그인 · 권한 =====
 import crypto from "crypto";
@@ -1102,6 +1181,7 @@ app.get("/api/sync", (req,res)=>{
     jobs: DB.jobs.filter(j=>j.at>since && j.status!=="running"),
     meetings: DB.meetings.filter(m=>m.at>since),
     deptMemory: DB.deptMemory,
+    deptKnowledge: DB.deptKnowledge || {},
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -1113,6 +1193,23 @@ app.post("/api/state", (req,res)=>{ DB.state = req.body||null; saveDB(); res.jso
 
 // 조회
 app.get("/api/memory/:dept", (req,res)=> res.json(DB.deptMemory[req.params.dept] || []));
+// 부서별 학습 현황 요약(확인용): 부서마다 건수·경험치·레벨·최근 학습 시각/내용
+app.get("/api/learning", (req,res)=>{
+  const out = Object.keys(AGENTS).map(d=>{
+    const arr = DB.deptMemory[d] || [];
+    const last = arr[arr.length-1];
+    const e = (DB.exp&&DB.exp[d]) || 0;
+    return {
+      dept:d, name:AGENTS[d].kr, count:arr.length, exp:e, level:Math.floor(e/5)+1,
+      lastAt: last? last.at : null,
+      lastKind: last? (last.instruction||"") : "",
+      lastNote: last? String(last.note||"").slice(0,120) : "",
+      knowledge: (DB.deptKnowledge&&DB.deptKnowledge[d]&&DB.deptKnowledge[d].text) ? DB.deptKnowledge[d].text : "",
+      knowledgeAt: (DB.deptKnowledge&&DB.deptKnowledge[d]) ? DB.deptKnowledge[d].at : null
+    };
+  });
+  res.json({ total: out.reduce((a,b)=>a+b.count,0), depts: out });
+});
 app.get("/api/meetings", (req,res)=> res.json(DB.meetings.slice(-50)));
 
 // 회의 만족도 평가: { id, rating(1~5), feedback? } → 회의에 기록 + 참여 부서 학습
@@ -1134,11 +1231,22 @@ app.post("/api/meeting/rate", (req,res)=>{
   res.json({ ok:true, rating:r });
 });
 
+// 회의 기록 삭제: { id } 또는 { ids:[...] }
+app.post("/api/meeting/delete", (req,res)=>{
+  const b = req.body||{};
+  const ids = (b.ids && b.ids.length) ? b.ids.map(Number) : (b.id!==undefined ? [Number(b.id)] : []);
+  if(!ids.length) return res.status(400).json({ error:"id 필요" });
+  const before = (DB.meetings||[]).length;
+  DB.meetings = (DB.meetings||[]).filter(m=> ids.indexOf(m.id)<0 );
+  saveDB();
+  res.json({ ok:true, removed: before-(DB.meetings||[]).length });
+});
+
 // 회의 실행: { topic, depts[], rounds, room } → meeting
 app.post("/api/meeting", (req,res)=>{
   try { const b = req.body||{};
     if ((!b.topic && !(b.agenda&&b.agenda.length)) || !b.depts || !b.depts.length) return res.status(400).json({ error:"topic/agenda, depts 필요" });
-    const meeting = createMeeting({ topic:b.topic, depts:b.depts, rounds:b.rounds, mode:b.mode, chair:b.chair, agenda:b.agenda, clientNote:b.clientNote, prevSummary:b.prevSummary, room:b.room, source:"app" });
+    const meeting = createMeeting({ topic:b.topic, depts:b.depts, rounds:b.rounds, mode:b.mode, chair:b.chair, agenda:b.agenda, clientNote:b.clientNote, prevSummary:b.prevSummary, room:b.room, alwaysJoin:b.alwaysJoin, source:"app" });
     processMeeting(meeting).catch(()=>{}); // 비동기 진행 — 발언은 실시간 저장됨
     res.json({ ok:true, id:meeting.id, status:"running" }); // 즉시 응답 (타임아웃 방지)
   } catch(e){ res.status(400).json({ error:String(e.message||e) }); }
@@ -1240,13 +1348,16 @@ app.post("/api/ops/review", async (req,res)=>{
     const rows = Object.keys(AGENTS).filter(d=>d!=="ops").map(d=>{
       const mem=(DB.deptMemory[d]||[]).slice(-3).map(x=>"  · "+(x.instruction||"")+" → "+String(x.note||"").slice(0,120)).join("\n");
       const dir=(DB.state&&DB.state.deptDirective&&DB.state.deptDirective[d])||"";
-      return AGENTS[d].no+" "+AGENTS[d].kr+"("+MEMBERS[d]+") — 경험치 "+((DB.exp||{})[d]||0)+"회"
+      const kb=knowledgeText(d); const lv=deptLevel(d); const cnt=(DB.deptMemory[d]||[]).length;
+      return AGENTS[d].no+" "+AGENTS[d].kr+"("+MEMBERS[d]+") — Lv"+lv+" · 경험치 "+((DB.exp||{})[d]||0)+"회 · 학습 "+cnt+"건"
         +(dir?" / 현재 자율지시: "+dir:" / 자율지시 없음")
-        +(mem?"\n"+mem:"\n  · 최근 기록 없음");
+        +(kb?"\n  [축적 전문성]\n  "+kb.replace(/\n/g,"\n  "):"\n  [축적 전문성] 아직 없음")
+        +(mem?"\n  [최근 기록]\n"+mem:"");
     }).join("\n\n");
     const sys = "너는 이 플랫폼의 팀장 '08 플랫폼 운영(오세라)' AI다."+ADDRESS
       + " 아래 각 부서의 경험치·최근 자율수행/학습 기록·현재 지시를 보고 팀장으로서 평가하라.\n"
-      + "출력 형식(이 형식만):\n평가: (부서별 한 줄씩 '부서명 — 별점(★1~5) 자율수행·학습 수준 평가')\n총평: (잘하는 부서, 지원이 필요한 부서, 팀 전체 방향 2~3문장)\n"
+      + " 각 부서의 레벨·축적 전문성·학습량을 근거로 '성장도'를 진단하라.\n"
+      + "출력 형식(이 형식만):\n성장 진단: (부서별 한 줄씩 '부서명 — Lv·별점(★1~5) · 강점 한마디 · 다음에 키울 점 한마디')\n총평: (가장 빠르게 성장한 부서, 정체된 부서, 팀 전체 성장 방향 2~3문장)\n"
       + "지시조정: (자율수행 지시를 바꾸면 좋을 부서만, 줄마다 'DIRECTIVE: 부서영문키 = 새 지시 한 줄'. 없으면 '없음')\n부서 영문키: "+Object.keys(AGENTS).join(", ")
       + profileContext();
     const out = await anthropic(sys, "[부서 현황]\n"+rows, 1800);
@@ -1265,6 +1376,54 @@ app.post("/api/ops/review", async (req,res)=>{
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
+// ③+⑤ 부서 간 지식 공유·성장 회의: 고레벨 부서가 가르치고, 각 부서가 서로에게서 배워 함께 성장
+app.post("/api/knowledge-share", async (req,res)=>{
+  try {
+    const ids = Object.keys(AGENTS);
+    // 가르칠 자료가 있는 부서(지식 or 경험)만 참여
+    const parts = ids.filter(d => knowledgeText(d) || ((DB.exp||{})[d]||0) > 0);
+    if (parts.length < 2) return res.json({ ok:true, report:"아직 공유할 전문성이 부족해요. 부서들이 작업·자율수행으로 학습을 더 쌓으면 지식 공유가 가능해져요.", learnings:[] });
+    // 교육 보드: 각 부서의 레벨 + 축적 전문성(없으면 최근 학습 요약)
+    const board = parts.map(d=>{
+      const lv=deptLevel(d); const kb=knowledgeText(d);
+      const fallback=(DB.deptMemory[d]||[]).slice(-3).map(x=>"· "+String(x.note||"").slice(0,120)).join("\n");
+      return AGENTS[d].no+" "+AGENTS[d].kr+" (Lv"+lv+")\n"+(kb||fallback||"(기록 적음)");
+    }).join("\n\n");
+    const topLv = Math.max.apply(null, parts.map(d=>deptLevel(d)));
+    const teachers = parts.filter(d=>deptLevel(d)===topLv).map(d=>AGENTS[d].kr).join(", ");
+    const sys = "너는 이 플랫폼의 팀장 '08 플랫폼 운영(오세라)'이며 팀 성장 퍼실리테이터다."+ADDRESS
+      + " 아래는 각 부서의 레벨과 축적 전문성이다. 지금 '부서 간 지식 공유·성장 세션'을 진행한다. "
+      + "고레벨 부서(현재 최고 Lv"+topLv+": "+teachers+")가 다른 부서를 가르치는 관점으로, 각 부서가 '다른 부서의 전문성에서 배워 자기 업무에 적용할 점' 1~3가지를 구체적으로 정하라. 누구에게 배우는지 근거를 포함하라.\n"
+      + "출력 형식(이 형식만):\n"
+      + "줄마다 'LEARN: 부서영문키 | (어느 부서의 어떤 전문성에서) 배워 적용할 점 — 한 문장'\n"
+      + "마지막에 '코칭: (최고 레벨 부서 관점에서 팀 전체에 주는 성장 조언 2~3문장)'\n"
+      + "부서 영문키: " + ids.join(", ") + profileContext();
+    const out = await anthropic(sys, "[부서 전문성 보드]\n"+board, 2000);
+    // LEARN 파싱 → 각 부서 학습에 반영(서로 가르침)
+    const learnings = [];
+    out.replace(/LEARN:\s*([a-z]+)\s*\|\s*(.+)/g, (mm,d,t)=>{
+      if (AGENTS[d]) {
+        const note = "[지식 공유] "+t.trim();
+        if (!DB.deptMemory[d]) DB.deptMemory[d]=[];
+        DB.deptMemory[d].push({ at:Date.now(), instruction:"[지식 공유 세션]", note });
+        if (DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+        DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+        learnings.push({ dept:d, name:AGENTS[d].kr, learn:t.trim() });
+      }
+      return mm;
+    });
+    // 세션 기록 보관
+    DB.collections = DB.collections||[];
+    DB.collections.push({ id:Date.now(), topic:"[부서 간 지식 공유·성장 세션]", text:out, at:Date.now(), dept:"ops" });
+    if (DB.collections.length>100) DB.collections=DB.collections.slice(-100);
+    if (!DB.deptMemory.ops) DB.deptMemory.ops=[];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[지식 공유 진행]", note:"부서 간 지식 공유 세션 진행 — "+learnings.length+"개 부서가 상호 학습" });
+    DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
+    saveDB();
+    res.json({ ok:true, report:out, learnings });
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
 // 자체 점검: 서버 상태 진단 + DB 구조 자가 보완
 app.get("/api/selfcheck", async (req,res)=>{
   const checks = [];
@@ -1279,12 +1438,20 @@ app.get("/api/selfcheck", async (req,res)=>{
   catch(e){ add("디스크 저장", false, String(e.message||e)); }
   try { const sp = await supaProbe(); add("영구 저장(Supabase)", sp.ok, sp.note); }
   catch(e){ add("영구 저장(Supabase)", false, String(e.message||e).slice(0,100)); }
+  try {
+    const col=(DB.state&&DB.state.collect)||{};
+    const on = col.everyMin>0;
+    const last = DB.lastCollectAt ? new Date(DB.lastCollectAt).toLocaleString("ko-KR") : "아직 없음";
+    add("자율수행", on, on ? ("주기 "+col.everyMin+"분 · 근무 "+(isWorking()?"중(작동)":"외(대기)")+" · 마지막 실행 "+last) : "꺼짐 — 설정 › 자율수행 주기에서 분을 설정하세요");
+  } catch(e){ add("자율수행", false, String(e.message||e).slice(0,80)); }
   add("카카오 알림", !!KAKAO_TOKEN, KAKAO_TOKEN?"연동됨":"미설정(선택)");
   add("진짜 성우(Gemini TTS)", true, (process.env.GEMINI_API_KEY||process.env.GOOGLE_API_KEY)?("사용 가능 · 모델 "+TTS_MODEL):"GEMINI_API_KEY 미설정 — 기기 음성만 사용");
 
   add("작업 기록", true, "작업 "+(DB.jobs||[]).length+"건 · 회의 "+(DB.meetings||[]).length+"건 · 자료 "+((DB.collections||[]).length)+"건");
   const memN = Object.values(DB.deptMemory||{}).reduce((a,b)=>a+(b||[]).length,0);
-  add("부서 학습 메모리", true, memN+"개 기록");
+  const perDept = Object.keys(AGENTS).map(d=>{ const n=(DB.deptMemory[d]||[]).length; const e=(DB.exp&&DB.exp[d])||0; return AGENTS[d].kr+" "+n+"건(Lv"+(Math.floor(e/5)+1)+")"; }).join(" · ");
+  const zero = Object.keys(AGENTS).filter(d=>!((DB.deptMemory[d]||[]).length)).map(d=>AGENTS[d].kr);
+  add("부서별 학습", memN>0, "총 "+memN+"건 · "+perDept + (zero.length? ("  ※ 아직 학습 0건: "+zero.join(", ")) : ""));
   const errs = (DB.errors||[]).slice(-10);
   add("최근 오류", errs.length===0, errs.length? (errs.length+"건 (마지막: "+(errs[errs.length-1].where||"")+")") : "없음");
   add("가동 시간", true, Math.floor(process.uptime()/60)+"분");
@@ -1453,6 +1620,24 @@ function toMin(hhmm){ const p=(hhmm||"0:0").split(":"); return (+p[0])*60+(+p[1]
 
 // 1분마다: 근무 중이면 예약 작업 + 정기 자료수집 실행
 setInterval(async ()=>{
+  // (감시) 너무 오래 '진행 중'인 회의·작업 자동 마감(끊긴 처리로 갇힘 방지)
+  try {
+    const STUCK = 12*60*1000; // 12분 이상 진행 중이면 끊긴 것으로 간주(개별 호출 90초 타임아웃이 이미 있어 정상 회의엔 영향 없음)
+    let fixed = 0; const t0 = Date.now();
+    for (const mt of (DB.meetings||[])){
+      if (mt && mt.status==="running"){
+        const started = mt.at || 0;
+        if (started && (t0 - started) > STUCK){ mt.status = "error"; mt.error = "처리가 지연돼 자동 중단됨(서버 지연/끊김)"; fixed++; }
+      }
+    }
+    for (const jb of (DB.jobs||[])){
+      if (jb && jb.status==="running"){
+        const started = jb.at || 0;
+        if (started && (t0 - started) > STUCK){ jb.status = "error"; jb.progress = ""; jb.error = "처리가 지연돼 자동 중단됨"; fixed++; }
+      }
+    }
+    if (fixed){ saveDB(); console.log("워치독: 멈춘 작업 "+fixed+"건 자동 마감"); }
+  } catch(e){ /* 감시 실패는 무시 */ }
   // (0) 예약 회의: 근무시간과 무관하게 지정 시각(KST)에 실행
   const hm = kstHHMM(), day = kstDay(), dow = kstDow(), nowMs = Date.now();
   for (const ms of (DB.meetingSchedules||[])){
@@ -1506,23 +1691,7 @@ setInterval(async ()=>{
   // (2) 자율수행: 지시가 있는 부서는 매 주기 각자 동시 수행 + 지시 없는 부서는 한 부서씩 돌아가며 트렌드 학습
   const col = DB.state && DB.state.collect;
   if (col && col.everyMin > 0 && Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000) {
-    try {
-      const dir = (DB.state && DB.state.deptDirective) || {};
-      const allIds = Object.keys(AGENTS);
-      const dirDepts = allIds.filter(d => dir[d] && String(dir[d]).trim());
-      const noDir = allIds.filter(d => !(dir[d] && String(dir[d]).trim()));
-      // 지시 있는 부서들: 각자 자기 지시를 동시(이번 주기 내 전부) 수행
-      for (const d of dirDepts) { await autoRunDept(d, String(dir[d]).trim()); }
-      // 지시 없는 부서: 한 부서씩 순환하며 자율 학습/반응 수집
-      if (noDir.length) {
-        DB.learnIdx = (DB.learnIdx||0) % noDir.length;
-        const d = noDir[DB.learnIdx];
-        DB.learnIdx = (DB.learnIdx + 1) % noDir.length;
-        await autoRunDept(d, "");
-      }
-      DB.lastCollectAt = Date.now();
-      saveDB();
-    } catch(e){ console.error("auto-learn error", e); }
+    try { await runAutoCycle(); } catch(e){ console.error("auto-cycle error", e); }
   }
 }, 60000);
 
@@ -1543,16 +1712,48 @@ async function autoRunDept(dept, directive){
     sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
       + " 지금은 평상시 자율 학습 시간이다. '"+baseFocus+"'에 관해 네 부서 업무에 바로 쓸 최신 인사이트·트렌드·아이디어를 2~3가지로 아주 간결히 정리하라. 다음에 제안에 활용할 핵심만." + profileContext();
   }
+  // 학습된 내용을 실제로 활용해 수행 (이 부서 경험 + 타 부서 공유 기록)
+  const _kb2 = knowledgeText(dept); const _lv2 = deptLevel(dept);
+  sys += " (현재 Lv"+_lv2+" 숙련도)";
+  if (_kb2) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 이걸 기반으로 더 발전된 결과를 내라]\n" + _kb2;
+  if (directive){ const _rel2 = relevantContext(dept, directive, 3); if (_rel2) sys += "\n\n[이 지시와 비슷한 과거 작업·자료 — 재활용·갱신해 빠르게 처리]\n" + _rel2; }
+  const mem = (DB.deptMemory[dept]||[]).slice(-6).map(x=>"· "+(x.instruction?("["+x.instruction+"] "):"")+x.note).join("\n");
+  if (mem) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem;
+  const cross = crossDeptMemory(dept);
+  if (cross) sys += "\n\n[다른 부서들이 최근 학습·작성한 내용 — 관련되면 활용·보완하라]\n" + cross;
   const tag = directive ? "[자율 지시] " : (dept==="engagement" ? "[반응 수집] " : "[자율 학습] ");
-  const note = await anthropic(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), 900);
+  const note = await anthropic(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), directive ? 1300 : 900);
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:tag+baseFocus, note });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
+  if (DB.exp[dept] % 4 === 0) { try{ await distillKnowledge(dept); }catch(e){} }
   DB.collections.push({ id:Date.now()+Math.floor(Math.random()*1000), topic:"["+a.kr+"] "+baseFocus, text:note, at:Date.now(), dept });
   if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
   saveDB();
   kakaoNotify("📚 "+a.kr+(directive?" 자율 지시 수행 +1 (경험치 ":(dept==="engagement"?" 반응 수집 +1 (경험치 ":" 자율 학습 +1 (경험치 "))+DB.exp[dept]+")").catch(()=>{});
+}
+
+// 지금 자율수행 1회 실행(수동 트리거) — 무료 서버 슬립으로 주기가 안 돌 때 직접 실행
+app.post("/api/autorun", (req,res)=>{
+  (async ()=>{ try{ await runAutoCycle(); }catch(e){ logError("autorun", e); } })();
+  res.json({ ok:true, status:"running" });
+});
+
+// 자율수행 1회 사이클: 지시 있는 부서는 각자 지시 수행(학습 활용), 지시 없는 부서는 1개씩 순환 학습
+async function runAutoCycle(){
+  const dir = (DB.state && DB.state.deptDirective) || {};
+  const allIds = Object.keys(AGENTS);
+  const dirDepts = allIds.filter(d => dir[d] && String(dir[d]).trim());
+  const noDir = allIds.filter(d => !(dir[d] && String(dir[d]).trim()));
+  for (const d of dirDepts) { try { await autoRunDept(d, String(dir[d]).trim()); } catch(e){ logError("auto-dir:"+d, e); } }
+  if (noDir.length) {
+    DB.learnIdx = (DB.learnIdx||0) % noDir.length;
+    const d = noDir[DB.learnIdx];
+    DB.learnIdx = (DB.learnIdx + 1) % noDir.length;
+    try { await autoRunDept(d, ""); } catch(e){ logError("auto-learn:"+d, e); }
+  }
+  DB.lastCollectAt = Date.now(); saveDB();
 }
 
 // 예약 작업 등록: { instruction, runAt(ms) }
@@ -1572,4 +1773,11 @@ const PORT = process.env.PORT || 3000;
   (DB.jobs||[]).forEach(function(j){ if(j && j.status==="running"){ j.status="error"; j.error="서버 재시작으로 중단됨"; _orphan++; } });
   if(_orphan){ try{ saveDB(); }catch(e){} console.log("중단된 작업 "+_orphan+"건 정리(error 처리)"); }
   app.listen(PORT, ()=> console.log("SNS 에이전트 백엔드 listening on " + PORT + (useSupabase?" (Supabase)":" (file)")));
+  // 서버가 깨어나면(콜드스타트 포함) 밀린 자율수행을 한 번 따라잡아 '평소 수행'이 이어지게
+  try {
+    const col = DB.state && DB.state.collect;
+    if (col && col.everyMin > 0 && (Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000) && isWorking()) {
+      setTimeout(()=>{ runAutoCycle().then(()=>console.log("부팅 후 밀린 자율수행 1회 실행")).catch(e=>logError("boot-autocycle", e)); }, 8000);
+    }
+  } catch(e){}
 })();
