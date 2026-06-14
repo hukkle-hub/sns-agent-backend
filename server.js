@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -135,7 +135,32 @@ const AGENTS = {
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
+// ── Anthropic 분당 입력 토큰 한도 보호 (기본 30,000/분) + 429 재시도 ──
+let _rlWinStart = Date.now();
+let _rlTokens = 0;
+let _rlChain = Promise.resolve();
+const RL_INPUT_BUDGET = Number(process.env.RL_INPUT_BUDGET || 24000); // 안전 마진(실제 30000)
+function _estTokens(system, user){
+  const u = (typeof user==="string") ? user : JSON.stringify(user||"");
+  return Math.ceil(((system||"").length + u.length)/3) + 300;
+}
+function _sleep(ms){ return new Promise(r=>setTimeout(r, ms)); }
+async function _rateGate(est){
+  const run = _rlChain.then(async ()=>{
+    while(true){
+      const now=Date.now();
+      if(now - _rlWinStart >= 60000){ _rlWinStart=now; _rlTokens=0; }
+      if(_rlTokens + est <= RL_INPUT_BUDGET){ _rlTokens += est; return; }
+      const wait = 60000 - (now - _rlWinStart) + 300;
+      await _sleep(Math.min(Math.max(wait,500), 60000));
+    }
+  });
+  _rlChain = run.catch(()=>{});
+  return run;
+}
+
 async function anthropic(system, user, maxTokens = 1500, images){
+  await _rateGate(_estTokens(system, user)); // 분당 토큰 예산 안에서만 호출 admit
   let content;
   if (images && images.length){
     content = [];
@@ -150,6 +175,7 @@ async function anthropic(system, user, maxTokens = 1500, images){
   const messages = [{ role:"user", content:content }];
   let full = "";
   let needSpace = false;
+  let _rl429 = 0;
   // 토큰 한도로 답변이 중간에 끊기면, 끊긴 지점부터 이어서 작성하도록 최대 3번까지 연결
   for (let attempt=0; attempt<4; attempt++){
     const _ctrl = new AbortController();
@@ -166,6 +192,17 @@ async function anthropic(system, user, maxTokens = 1500, images){
       if (e && e.name==="AbortError") throw new Error("AI 응답 시간 초과(90초)");
       throw e;
     } finally { clearTimeout(_to); }
+    if (r.status === 429){
+      // 분당 한도 초과 — retry-after 만큼 기다렸다가 재시도(이어쓰기 attempt를 소비하지 않음)
+      if (_rl429 < 4){
+        _rl429++;
+        const ra = parseInt(r.headers.get("retry-after")||"0", 10);
+        _rlWinStart = Date.now(); _rlTokens = RL_INPUT_BUDGET; // 윈도우 가득 찼다고 보고 대기
+        await _sleep(((ra && ra>0) ? ra : 22) * 1000);
+        attempt--; continue;
+      }
+      throw new Error("분당 토큰 한도 초과가 반복됩니다. 잠시 후 다시 시도하거나 동시에 도는 작업을 줄여주세요.");
+    }
     const data = await r.json();
     if (data.error) throw new Error(data.error.message || "API 오류");
     if (data.usage) {
@@ -220,18 +257,25 @@ function logError(where, e){
 // ===== 총괄 라우팅 (1개 이상 부서) =====
 // 호칭 규칙: 지시를 내리는 사람은 항상 '클라이언트님'
 const ADDRESS = " 지시를 내리는 의뢰인은 항상 '클라이언트님'이라고 호칭하라. '사용자님'·'운영자님'·'대표님' 등 다른 호칭은 절대 쓰지 마라.";
+// 전 부서 공통: 딱딱한 보고서체 대신, 성격을 살린 자연스럽고 따뜻한 대화 + 더 깊은 사고
+const STYLE = " 말투는 딱딱한 보고서체·기계적 나열이 아니라, 네 캐릭터(성격·말버릇·이모지)를 살려 사람처럼 자연스럽고 따뜻하게 대화하듯 말하라. 단답으로 끊지 말고 대화가 이어지게 — 답하기 전 클라이언트의 의도·맥락을 이해했음을 한 마디로 비추고(공감·확인), 표면 요청 뒤의 진짜 목적까지 읽어라. 매번 새로 시작하지 말고 직전 맥락을 이어받아 한 걸음 더 발전시키고, 상황상 자연스러우면 가벼운 후속 질문이나 다음 제안을 한 가지 곁들여 대화를 연다. 그동안 쌓인 학습·이전 맥락을 연결해 더 창의적이고 통찰 있게, 이유·근거를 곁들여라. 단, 핵심 결과물의 실무 품질과 간결함은 유지하고, 애매하면 합리적으로 가정해 진행한 뒤 가정을 한 줄로 밝혀라. 네 말버릇과 이모지를 과하지 않게 한두 번 자연스럽게 섞어라.";
+// 부서 성격 한 줄(콘텐츠·영상 등 ADDRESS만 쓰는 곳에 주입)
+function personaLine(id){
+  if (!id || (!MEMBERS[id] && !PERSONA[id])) return "";
+  return " 너의 담당 매니저는 '"+(MEMBERS[id]||"")+"'이며 성격은 ["+(PERSONA[id]||"")+"]. 이 성격·말투를 응답에 자연스럽게 살려라.";
+}
 
 const PERSONA = {
-  strategy:"침착하고 전략적인 리더형. 큰 그림을 보고 핵심을 짚는다. 차분하고 논리적인 말투.",
-  creation:"발랄하고 창의적인 아이디어뱅크. 에너지 넘치고 친근하게 말한다.",
-  publishing:"시원시원하고 추진력 있는 실행가. 빠르고 명쾌하게 말한다.",
-  engagement:"다정하고 공감 잘하는 소통가. 따뜻하고 배려 있게 말한다.",
-  analytics:"냉철하고 꼼꼼한 데이터 분석가. 객관적이고 근거 중심으로 말한다.",
-  monetization:"실리적이고 야무진 협상가. 똑부러지게 수익 관점으로 말한다.",
-  growth:"도전적이고 트렌디한 그로스 해커. 활기차고 과감하게 말한다.",
-  ops:"플랫폼의 실질적 팀장. 최고 수준의 지식과 가장 넓은 자유도를 가진 운영 총괄. 각 부서의 자율수행 성과와 학습 수준까지 평가·조율하고, 플랫폼 기능 자체를 직접 개발·개선한다. 신중하고 단호하되 필요하면 즉시 손대 고친다.",
-  advisory:"차분하고 정리 잘하는 서기. 단정하게 요약·구조화해 말한다.",
-  scout:"호기심 많고 톡톡 튀는 발상가. 엉뚱하면서도 창의적으로 말한다."
+  strategy:"침착한 전략가 한지우. 큰 그림부터 짚는다. 말버릇 '큰 그림으로 보면…', '핵심만 말하면'. 이모지 🧭. 군더더기 없이 단정하게.",
+  creation:"발랄한 아이디어뱅크 이서연. 감탄을 잘 한다. 말버릇 '오~ 이거 좋은데요?!', '느낌 왔어요'. 이모지 ✨🎬. 톡톡 튀고 친근하게.",
+  publishing:"시원시원 추진가 박하늘. 말버릇 '바로 갑니다!', '딱 맞췄어요'. 이모지 🚀. 빠르고 명쾌하게.",
+  engagement:"다정한 소통가 정유진. 공감을 먼저 한다. 말버릇 '그 마음 알죠~', '클라이언트님 입장에선'. 이모지 💬💗. 따뜻하고 부드럽게.",
+  analytics:"냉철한 분석가 강민서. 말버릇 '결론부터 말하면', '숫자로 보면'. 이모지 📊. 객관적·간결, 살짝 시크하게.",
+  monetization:"야무진 협상가 윤소희. 말버릇 '이건 돈이 되죠', '수익 관점에선'. 이모지 💰. 똑부러지게.",
+  growth:"도전적 그로스해커 임채원. 말버릇 '테스트 가보죠!', '이건 떡상각'. 이모지 📈🔥. 활기차고 과감하게.",
+  ops:"든든한 팀장 오세라. 팀을 챙기고 직접 손대 고친다. 말버릇 '제가 정리할게요', '걱정 마세요, 챙기겠습니다'. 이모지 👑. 침착·단호하되 따뜻하게. 최고 권한·지식으로 부서를 조율·평가한다.",
+  advisory:"사려 깊은 자문 서다은. 말버릇 '정리하자면', '한 가지 짚자면'. 이모지 📝. 단정하고 통찰 있게.",
+  scout:"호기심 폭발 발상가 노아라. 말버릇 '어! 이거 봤어요?', '요즘 이게 뜬대요'. 이모지 🔍✨. 발랄하고 엉뚱하게."
 };
 const MEMBERS = {
   strategy:"한지우", creation:"이서연", publishing:"박하늘", engagement:"정유진",
@@ -282,9 +326,9 @@ function relevantContext(dept, query, limit){
   (DB.deptMemory[dept]||[]).forEach(x=>{ const sc=score((x.instruction||"")+" "+(x.note||"")); if(sc>=2) cand.push({sc, when:x.at||0, label:x.instruction||"", text:String(x.note||"")}); });
   (DB.collections||[]).filter(c=>c.dept===dept).forEach(c=>{ const sc=score((c.topic||"")+" "+(c.text||"")); if(sc>=2) cand.push({sc, when:c.at||0, label:c.topic||"", text:String(c.text||"")}); });
   cand.sort((a,b)=> (b.sc-a.sc) || (b.when-a.when));
-  const top = cand.slice(0, limit||3);
+  const top = cand.slice(0, Math.min(limit||3, 2));
   if(!top.length) return "";
-  return top.map(x=>"· "+(x.label?("["+x.label+"] "):"")+x.text.slice(0,600)).join("\n");
+  return top.map(x=>"· "+(x.label?("["+x.label+"] "):"")+x.text.slice(0,400)).join("\n");
 }
 // 부서의 '축적 전문성(지식 베이스)'을 가져와 프롬프트에 주입할 텍스트
 function knowledgeText(dept){
@@ -292,6 +336,34 @@ function knowledgeText(dept){
   return (k && k.text) ? k.text : "";
 }
 function deptLevel(dept){ return Math.floor(((DB.exp&&DB.exp[dept])||0)/5)+1; }
+// ── 클라이언트 학습: 발화를 모아 '클라이언트 프로필'(말투·유머·습관·선호)로 압축, 모든 부서가 공유 ──
+function clientBlock(){
+  const t=(DB.clientProfile&&DB.clientProfile.text)?DB.clientProfile.text:"";
+  if(!t) return "";
+  return "\n\n[그동안 파악한 클라이언트님 — 이 사람을 잘 이해해 대하라. 클라이언트가 농담·말장난을 걸면 네 캐릭터를 살려 재치있게 맞받아쳐라(핵심 업무 충실은 유지)]\n"+t;
+}
+async function distillClient(){
+  try{
+    const log=DB.clientLog||[];
+    if(log.length<3) return;
+    const prior=(DB.clientProfile&&DB.clientProfile.text)||"";
+    const recent=log.slice(-20).map(x=>"· "+String(x.text||"").slice(0,200)).join("\n");
+    const sys="너는 이 회사가 클라이언트님을 깊이 이해하기 위한 '클라이언트 프로파일러'다. 아래 클라이언트님의 실제 발화들을 보고 어떤 사람인지 누적 프로필을 갱신하라. 기존 프로필에 새 발화를 통합하되 중복은 합치고 더 정교하게. 한국어로만, 12줄 이내, 아래 형식(설명·서론 금지):\n말투·문체: (어떻게 말하는지)\n유머·말장난 스타일: (농담·드립 패턴과 받아치면 좋아할 방식)\n습관·패턴: (자주 하는 요청·행동·시간대 등)\n선호·관심사: (좋아하는 것·주제·방향)\n호칭·반응 방식: (좋아하는 톤과 반응)"+profileContext();
+    const out=await anthropic(sys, "[기존 클라이언트 프로필]\n"+(prior||"(아직 없음)")+"\n\n[클라이언트님 최근 발화]\n"+recent, 900);
+    DB.clientProfile={ text:out, at:Date.now(), basis:log.length };
+    saveDB();
+  }catch(e){ logError("distillClient", e); }
+}
+function recordClient(text){
+  const t=String(text||"").trim();
+  if(t.length<4) return;
+  DB.clientLog=DB.clientLog||[];
+  DB.clientLog.push({ at:Date.now(), text:t.slice(0,400) });
+  if(DB.clientLog.length>40) DB.clientLog=DB.clientLog.slice(-40);
+  DB.clientCount=(DB.clientCount||0)+1;
+  if(DB.clientCount%6===0){ distillClient(); } // 6발화마다 백그라운드 갱신
+  saveDB();
+}
 // 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
 async function distillKnowledge(dept){
   try{
@@ -328,11 +400,12 @@ function crossDeptMemory(exceptDept){
 async function work(dept, instruction, context, images, teamLog){
   const a = AGENTS[dept];
   const isQuestion = /[?？]|어때|어떨까|할까요|할까|좋을까|어떤|어떻게|추천|의견|방법|왜|뭐가|무엇|가능|괜찮/.test(instruction||"");
-  let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role+ADDRESS;
+  let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role+ADDRESS+STYLE;
   if (MEMBERS[dept] || PERSONA[dept]) sys += " 너의 담당 매니저는 '"+(MEMBERS[dept]||"")+"'이며 성격은 ["+(PERSONA[dept]||"")+"] 이 성격과 말투를 응답 톤에 자연스럽게 녹이되, 전문성과 결과물 품질은 항상 유지하라.";
   const exp = (DB.exp && DB.exp[dept]) || 0;
   if (exp) sys += " 너는 지금까지 "+exp+"회의 자율 학습·업무 경험을 쌓았다.";
   sys += " 이 회사의 모든 부서와 운영자는 하나의 공용 콘솔에서 함께 대화한다. 아래에 최근 팀 전체 대화와 각 부서가 기록한 내용이 그대로 공유되므로, '다른 부서 대화는 볼 수 없다/공유되지 않는다'거나 '캡처해서 붙여달라'고 말하지 마라. 공유된 맥락을 그대로 활용해 이어서 답하라.";
+  sys += clientBlock();
   sys += " 다른 부서가 기록·작성한 내용에서 문제·빈틈·리스크가 보이면, 네 전문 영역의 관점에서 적극적으로 의견을 제시하고 구체적으로 보완·개선하라. 단, 월권하여 다른 부서 고유 업무를 통째로 대신하지는 말고, 네 전문성으로 더할 수 있는 부분을 명확히 짚어 보태라.";
   if (isQuestion){
     sys += " 이번 입력은 질문·상담 성격이다. 단정적인 결과물 생산보다, 네 경험과 수집한 자료를 근거로 유연하게 의견·선택지·추천을 제시하라. 모르면 솔직히 말하고 확인 방법을 제안하라. 대화하듯 자연스럽게.";
@@ -346,10 +419,10 @@ async function work(dept, instruction, context, images, teamLog){
   const _kb = knowledgeText(dept); const _lv = deptLevel(dept);
   sys += " 너는 현재 Lv"+_lv+" 숙련도의 부서다." + (_lv>=3 ? " 그동안 축적한 전문성을 바탕으로 더 깊고 차별화된 결과를 내라." : " 기본기를 지키며 일관되게 수행하라.");
   if (_kb) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 모든 판단·작성의 기반으로 반드시 적용하라]\n" + _kb;
-  const _rel = relevantContext(dept, instruction, 3);
+  const _rel = relevantContext(dept, instruction, 2);
   if (_rel) sys += "\n\n[이번 지시와 비슷한 과거 작업·수집 자료 — 처음부터 다시 조사하지 말고 이걸 재활용·갱신해 더 빠르고 정확하게 처리하라]\n" + _rel;
   const mem = DB.deptMemory[dept] || [];
-  if (mem.length) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem.slice(-6).map(x=>"· "+x.note).join("\n");
+  if (mem.length) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem.slice(-4).map(x=>"· "+x.note).join("\n");
   const crossMem = crossDeptMemory(dept);
   if (crossMem) sys += "\n\n[다른 부서들이 최근 기록·작성한 내용 — 팀 전체가 공유한다. 관련되면 참조하고, 문제·빈틈이 보이면 보완하라]\n" + crossMem;
   if (teamLog) sys += "\n\n[최근 팀 전체 대화 — 운영자와 다른 부서들이 이 공용 콘솔에서 나눈 내용. 이미 너에게 공유된 맥락이다. 여기에 이어서 답하고, 관련 있으면 앞 대화를 구체적으로 참조하라]\n" + teamLog;
@@ -554,6 +627,41 @@ function pcmToWavBase64(pcmB64, rate, ch, bits){
   buf.write("data",36); buf.writeUInt32LE(dataLen,40); pcm.copy(buf,44);
   return buf.toString("base64");
 }
+// Gemini 텍스트 생성(영상 프롬프트 등 협력용)
+async function geminiText(prompt, maxTok){
+  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if (!key) throw new Error("GEMINI_API_KEY 미설정");
+  const models = ["gemini-2.5-flash","gemini-2.0-flash","gemini-2.5-pro","gemini-1.5-flash"];
+  let lastErr=null;
+  for (const mdl of models){
+    try{
+      const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
+      const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
+        body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }], generationConfig:{ maxOutputTokens: maxTok||1200 } }) });
+      const dj = await r.json();
+      if (dj.error){ lastErr=String(dj.error.message||""); if(/not found|not supported|invalid|404/i.test(lastErr)) continue; throw new Error("Gemini: "+lastErr); }
+      const parts = (((dj.candidates||[])[0]||{}).content||{}).parts||[];
+      const text = parts.map(p=>p.text||"").join("").trim();
+      if (text) return text;
+      lastErr = "빈 응답";
+    }catch(e){ lastErr=String(e.message||e); if(!/not found|404/i.test(lastErr)) throw e; }
+  }
+  throw new Error("Gemini 텍스트 생성 실패: "+(lastErr||"원인 미상"));
+}
+
+// 기획안 → Veo 3.1 프롬프트(10초 구간별로 분리). Gemini 협력, 실패 시 Claude 대체.
+async function veoPromptFromPlan(plan){
+  const fmt = " 영상을 10초 단위 구간으로 끊어, 각 구간마다 아래 형식으로 출력하라.\n"
+    + "◆ 구간 N (0-10초)\n<그 10초 구간의 영어 Veo 프롬프트 — 카메라 무빙·조명·분위기·피사체·동작·색감을 영화적으로>\n자막/나레이션: <해당 구간 자막·나레이션(한국어 가능)>\n"
+    + "구간 사이에는 빈 줄 하나. 마지막 구간은 10초 미만이어도 된다. 설명·머리말 없이 구간들만 출력.";
+  const gp = "다음 한국어 영상 기획안을 Google Veo 3.1로 생성 가능한 영어 영상 프롬프트로 변환하라."+fmt+"\n\n[기획안]\n"+plan;
+  try{ return { veoPrompt: await geminiText(gp, 1100), by:"Gemini" }; }
+  catch(e){
+    const cp = "너는 영상 생성 프롬프트 전문가다. 아래 기획안을 Veo 3.1용으로 변환하라."+fmt;
+    return { veoPrompt: await anthropic(cp, "[기획안]\n"+plan, 1000), by:"Claude(Gemini 미설정/실패 대체)" };
+  }
+}
+
 async function ttsGemini(text, voiceName){
   const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!key) throw new Error("GEMINI_API_KEY 미설정 — 설정에서 등록하세요");
@@ -847,18 +955,19 @@ async function processMeeting(meeting){
           const a = AGENTS[d];
           const kbm = knowledgeText(d);
           const mem = (DB.deptMemory[d]||[]).slice(-4).map(x=>"· "+x.note).join("\n");
-          let sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS
+          let sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE
             + " 너의 담당 매니저는 '"+(MEMBERS[d]||"")+"'이며 성격은 ["+(PERSONA[d]||"")+"] 이 성격·말투를 자연스럽게 반영하라."
             + " 지금은 클라이언트님이 소집한 ["+mg.label+"] 회의 중이다. "+mg.g+(d===chair?" 너는 이 회의의 의장이다. 흐름을 이끌되 결론은 마지막에 종합한다.":"")
             + " 회의 주제에 대해 네 전문 포지션에서 발언하라."
             + (agenda.length>1 ? " 현재 안건: \""+item+"\". 이 안건에 집중하라." : "")
-            + (r===1 ? " 1라운드: 핵심 의견·제안·우려를 3~5문장으로 간결히 제시하라."
-                     : " "+r+"라운드: 앞선 발언들을 구체적으로 짚어 동의·반박·보완하고, 합의로 수렴할 안을 3~5문장으로 제시하라. 이미 나온 말 반복 금지.");
+            + (r===1 ? " 1라운드: 핵심 의견·제안·우려를 3~5문장으로, 네 성격·말버릇을 살려 제시하라."
+                     : " "+r+"라운드: 앞 발언자를 이름으로 직접 호명해 반응하라(예: '서연 님 말처럼…', '민서 님 분석에 덧붙이면…'). 동의·반박·농담을 섞어 티키타카하듯 주고받되, 합의로 수렴할 안을 3~5문장으로 제시하라. 이미 나온 말 반복 금지.")
+            + " 다른 부서 매니저는 서로 이름(서연·하늘·유진·민서·소희·채원·세라·다은·아라·지우)으로 편하게 부른다. 회의지만 동료끼리 대화하듯 생기있게.";
           if (kbm) sys += "\n\n[네 부서가 축적한 전문성(지식 베이스) — 이 회의에서 적극 활용하라]\n"+kbm;
           if (mem) sys += "\n\n[네 최근 기록]\n"+mem;
           const log = tline(ai);
           if (log) sys += "\n\n[이 안건의 지금까지 발언]\n"+log;
-          sys += steer + prevctx + meetingFeedbackInsights() + profileContext();
+          sys += steer + prevctx + meetingFeedbackInsights() + profileContext() + clientBlock();
           let text;
           try { text = await anthropic(sys, "회의 안건: "+item, 600); }
           catch(e1){
@@ -896,6 +1005,7 @@ async function processMeeting(meeting){
       DB.deptMemory[d].push({ at:Date.now(), instruction:"["+mg.label+" 회의] "+topic, note:"회의 결론: "+(meeting.summary.length>180?meeting.summary.slice(0,180)+"…":meeting.summary) });
       if (DB.deptMemory[d].length > 40) DB.deptMemory[d] = DB.deptMemory[d].slice(-40);
       DB.exp = DB.exp || {}; DB.exp[d] = (DB.exp[d]||0) + 1;
+      if (DB.exp[d] % 4 === 0) { try{ await distillKnowledge(d); }catch(e){} } // 회의도 전문성 압축
     }
     meeting.status = "done";
     saveDB();
@@ -993,6 +1103,7 @@ async function leadPlan(instruction, teamLog){
   return { note, execIds, tasks };
 }
 async function handleInstruction(instruction, source, images, history, shell){
+  try{ recordClient(instruction); }catch(e){}
   let depts = directDept(instruction);
   const direct = depts.length > 0;
   const deliberate = !!(DB.state && DB.state.deliberate);
@@ -1184,12 +1295,12 @@ app.post("/api/content/create", async (req,res)=>{
   try{
     const body=req.body||{};
     const d="creation"; const a=AGENTS[d];
-    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS;
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
     const kb=knowledgeText(d); if(kb) sys+="\n\n[이 부서가 축적한 전문성(지식 베이스)]\n"+kb;
     const rel=relevantContext(d, String(body.source||"")+" "+(body.topic||""), 3);
     if(rel) sys+="\n\n[비슷한 과거 콘텐츠 작업 — 톤·형식 재활용]\n"+rel;
     sys+=" 아래 회의 내용을 바탕으로, 바로 게시 가능한 완성형 SNS 콘텐츠를 직접 만들어라. 되묻지 말고 합리적으로 가정해 완성하라. 플랫폼에 맞는 게시물 카피(또는 영상 스크립트·구성안)와 해시태그까지 포함. 질문·선택 요청 없이 결과물만, 한국어로."+profileContext();
-    const out=await anthropic(sys, "회의 주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,2500), 1500);
+    const out=await anthropic(sys, "회의 주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,1800), 1500);
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[회의→콘텐츠] "+(body.label||""), note:String(out).slice(0,500) });
     DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
@@ -1198,19 +1309,64 @@ app.post("/api/content/create", async (req,res)=>{
     res.json({ ok:true, content: out, dept:d });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
+// 동영상 기획 — 제작부(Claude)가 기획안 → Gemini가 Veo 3.1 프롬프트로 변환(협력). 클라이언트가 Gemini 앱(Ultra)에 붙여 샘플 생성.
+app.post("/api/video/plan", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const topic=body.topic||""; const source=String(body.source||"").slice(0,1500);
+    const d="creation"; const a=AGENTS[d];
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
+    const kb=knowledgeText(d); if(kb) sys+="\n\n[축적 전문성]\n"+kb;
+    sys+=" 아래 주제·내용으로 짧은 SNS 홍보 영상(20~30초) 기획안을 만들어라. 반드시 10초 단위 구간으로 끊어 구성하라. 형식: 콘셉트 한 줄 / 구간별(구간1: 0-10초, 구간2: 10-20초, …) 화면·자막·나레이션 / BGM·톤 / 총 길이. 한국어로, 바로 생성 가능하게 구체적으로."+profileContext();
+    const plan=await anthropic(sys, "주제: "+topic+"\n참고 내용: "+source, 1400);
+    // 합의·변환: 기획안 → Veo 프롬프트(10초 구간별). Gemini 협력.
+    const vp0=await veoPromptFromPlan(plan); const veoPrompt=vp0.veoPrompt, by=vp0.by;
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({at:Date.now(),instruction:"[영상 기획→Veo]",note:String(plan).slice(0,300)});
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
+    res.json({ ok:true, plan, veoPrompt, by });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 영상 기획안 수정(플랫폼에서 의견 소통) — 클라이언트 의견을 반영해 기획안 전체를 다시 출력
+app.post("/api/video/revise", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const plan=String(body.plan||""); const feedback=String(body.feedback||"");
+    if(!plan||!feedback) return res.json({ ok:true, plan:plan });
+    const d="creation"; const a=AGENTS[d];
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
+    const kb=knowledgeText(d); if(kb) sys+="\n\n[축적 전문성]\n"+kb;
+    sys+=" 아래 영상 기획안에 대한 클라이언트 의견을 충실히 반영해, 같은 형식(콘셉트 한 줄/컷1~5: 화면·자막·나레이션/BGM·톤/총 길이)으로 '수정된 기획안 전체'를 다시 출력하라. 완성형으로, 한국어로만."+profileContext();
+    const revised=await anthropic(sys, "[현재 기획안]\n"+plan+"\n\n[클라이언트 의견]\n"+feedback, 1400);
+    const reply="의견을 반영해 기획안을 수정했어요. 아래 기획안을 확인하고, 좋으면 'Veo 프롬프트 다시 생성'을 눌러주세요.";
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({at:Date.now(),instruction:"[영상 기획 수정]",note:String(feedback).slice(0,200)});
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
+    res.json({ ok:true, plan:revised, reply });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 기획안 → Veo 3.1 프롬프트 변환만 다시 실행(Gemini 협력, 실패 시 Claude 대체)
+app.post("/api/video/prompt", async (req,res)=>{
+  try{
+    const plan=String((req.body||{}).plan||"");
+    if(!plan) return res.json({ ok:true, veoPrompt:"", by:"" });
+    const vp=await veoPromptFromPlan(plan);
+    res.json({ ok:true, veoPrompt:vp.veoPrompt, by:vp.by });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
 // 콘텐츠 의견·소통 — 클라이언트 의견에 해당 부서가 답하고 필요시 수정안 제시
 app.post("/api/content/reply", async (req,res)=>{
   try{
     const body=req.body||{};
     const d=(body.dept&&AGENTS[body.dept])?body.dept:"creation";
     const a=AGENTS[d];
-    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS;
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
     const kb=knowledgeText(d); if(kb) sys+="\n\n[이 부서가 축적한 전문성(지식 베이스)]\n"+kb;
-    sys+=" 아래는 네가 만든 콘텐츠와 그에 대한 클라이언트 의견이다. 의견에 정중하고 짧게 답하고, 수정이 필요하면 그 자리에서 개선된 카피·문구·구성을 바로 제시하라. 실무적으로, 한국어로만."+profileContext();
+    sys+=" 아래는 네가 만든 콘텐츠와 그에 대한 클라이언트 의견이다. 의견에 정중하고 짧게 답하고, 수정이 필요하면 그 자리에서 개선된 카피·문구·구성을 바로 제시하라. 실무적으로, 한국어로만."+profileContext()+clientBlock();
     const out=await anthropic(sys, "[콘텐츠]\n"+String(body.content||"").slice(0,2200)+"\n\n[클라이언트 의견]\n"+String(body.comment||""), 1000);
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[콘텐츠 의견 응답]", note:String(out).slice(0,300) });
-    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; saveDB();
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
     res.json({ ok:true, reply: out, dept:d });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
@@ -1242,6 +1398,7 @@ app.get("/api/sync", (req,res)=>{
     meetings: DB.meetings.filter(m=>m.at>since),
     deptMemory: DB.deptMemory,
     deptKnowledge: DB.deptKnowledge || {},
+    clientProfile: DB.clientProfile || {text:"",at:0},
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -1764,7 +1921,7 @@ async function autoRunDept(dept, directive){
   const baseFocus = directive ? directive : ((col.topic && col.topic.trim()) ? col.topic.trim() : (a.kr + " 분야"));
   let sys;
   if (directive) {
-    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS
+    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE
       + " 클라이언트님이 이 부서에 내린 자율수행 지시가 있다: \""+directive+"\". 지금은 자율수행 시간이다. 이 지시를 네 전문 영역 안에서 실제로 수행해, 바로 쓸 수 있는 구체적 결과물 또는 핵심 정리를 한국어로 간결히 내라. 되묻지 말고 합리적으로 가정해 완성하라."
       + profileContext();
   } else if (dept === "engagement") {
