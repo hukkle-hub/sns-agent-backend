@@ -833,10 +833,13 @@ async function processMeeting(meeting){
   const transcript = meeting.transcript;
   runningMeetings++;
   try {
-    const tline = (ai)=> transcript.filter(t=>t.agenda===ai).slice(-14).map(t => AGENTS[t.dept].kr+"("+MEMBERS[t.dept]+"): "+t.text).join("\n");
-    const steer = (meeting.clientNote && String(meeting.clientNote).trim()) ? ("\n\n[클라이언트님의 회의 개입·지침 — 최우선으로 반영하라]\n"+String(meeting.clientNote).trim()) : "";
+    const spk = (dp)=> AGENTS[dp] ? (AGENTS[dp].kr+"("+MEMBERS[dp]+")") : "클라이언트(운영자)";
+    const tline = (ai)=> transcript.filter(t=>t.agenda===ai).slice(-14).map(t => spk(t.dept)+": "+t.text).join("\n");
+    const _cn = (meeting.clientNote && String(meeting.clientNote).trim()) ? String(meeting.clientNote).trim() : "";
+    const steer = _cn ? ("\n\n[운영자(클라이언트)가 이 회의에서 직접 발언했다 — 최우선으로 존중하고, 네 발언에서 이 내용을 직접 가리키며 반영·응답하라]\n\""+_cn+"\"") : "";
     const prevctx = (meeting.prevSummary && String(meeting.prevSummary).trim()) ? ("\n\n[이전 회의 결론 — 처음부터 다시 하지 말고 여기서 이어 발전시켜라]\n"+String(meeting.prevSummary).trim()) : "";
 
+    if (_cn){ transcript.push({ dept:"client", member:"클라이언트", round:0, agenda:0, text:_cn }); saveDB(); }
     for (let ai=0; ai<agenda.length; ai++){
       const item = agenda[ai];
       for (let r=1; r<=rounds; r++){
@@ -872,7 +875,7 @@ async function processMeeting(meeting){
         + " 아래 발언 전체를 종합해 다음 형식으로만 출력하라:\n결론: (합의된 최종 방향 2~3문장)\n결정사항: (번호 목록 2~4개)\n액션: (부서별 한 줄씩 '부서명 — 할 일')"
         + steer + meetingFeedbackInsights() + profileContext();
       let asum;
-      try { asum = await anthropic(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+AGENTS[t.dept].kr+"("+t.member+"): "+t.text).join("\n"), 850); }
+      try { asum = await anthropic(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+spk(t.dept)+": "+t.text).join("\n"), 850); }
       catch(e){ asum = "결론: (요약 생성 일시 오류 — 발언 기록을 참고하세요)"; logError("meeting-sum", e); }
       meeting.agendaSummaries.push({ title:item, summary:asum });
       saveDB();
@@ -1005,7 +1008,8 @@ async function handleInstruction(instruction, source, images, history, shell){
     if(done.length) t += "완료: "+done.join(" · ")+"  ";
     if(cur) t += "→ "+cur+(task?(" — "+task):"")+" 작성 중 ("+(idx+1)+"/"+list.length+")";
     job.progress = t || "진행 중…";
-    if(shell){ try{ saveDB(); }catch(e){} }
+    job.progAt = Date.now();
+    if(shell){ shell.progAt = Date.now(); try{ saveDB(); }catch(e){} }
   }
   job.progress = "총괄이 지시를 분석하고 부서에 분담하는 중…";
   if(shell){ try{ saveDB(); }catch(e){} }
@@ -1159,6 +1163,12 @@ app.post("/api/instruct", (req,res)=>{
       .catch(e=>{ shell.status="error"; shell.error=String(e.message||e).slice(0,200); saveDB(); logError("instruct", e); });
     res.json({ ok:true, id:shell.id, status:"running" });
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 작업 취소(멈춘 '수행 중'을 운영자가 직접 종료)
+app.post("/api/instruct/:id/cancel", (req,res)=>{
+  const j=(DB.jobs||[]).find(x=>x.id===+req.params.id);
+  if(j && j.status==="running"){ j.status="error"; j.error="운영자가 취소함"; j.progress=""; saveDB(); }
+  res.json({ ok:true });
 });
 // 지시 작업 단건 조회 (백그라운드 진행 폴링용)
 app.get("/api/instruct/:id", (req,res)=>{
@@ -1622,7 +1632,8 @@ function toMin(hhmm){ const p=(hhmm||"0:0").split(":"); return (+p[0])*60+(+p[1]
 setInterval(async ()=>{
   // (감시) 너무 오래 '진행 중'인 회의·작업 자동 마감(끊긴 처리로 갇힘 방지)
   try {
-    const STUCK = 12*60*1000; // 12분 이상 진행 중이면 끊긴 것으로 간주(개별 호출 90초 타임아웃이 이미 있어 정상 회의엔 영향 없음)
+    const STUCK = 8*60*1000;   // 8분 이상 진행 중이면 끊긴 것으로 간주
+    const STALL = 6*60*1000;   // 또는 6분간 진행(progAt) 변화가 없으면 멈춘 것으로 간주
     let fixed = 0; const t0 = Date.now();
     for (const mt of (DB.meetings||[])){
       if (mt && mt.status==="running"){
@@ -1633,7 +1644,8 @@ setInterval(async ()=>{
     for (const jb of (DB.jobs||[])){
       if (jb && jb.status==="running"){
         const started = jb.at || 0;
-        if (started && (t0 - started) > STUCK){ jb.status = "error"; jb.progress = ""; jb.error = "처리가 지연돼 자동 중단됨"; fixed++; }
+        const beat = jb.progAt || jb.at || 0;
+        if ((started && (t0 - started) > STUCK) || (beat && (t0 - beat) > STALL)){ jb.status = "error"; jb.progress = ""; jb.error = "처리가 지연돼 자동 중단됨"; fixed++; }
       }
     }
     if (fixed){ saveDB(); console.log("워치독: 멈춘 작업 "+fixed+"건 자동 마감"); }
