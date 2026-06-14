@@ -1748,8 +1748,22 @@ async function autoRunDept(dept, directive){
 
 // 지금 자율수행 1회 실행(수동 트리거) — 무료 서버 슬립으로 주기가 안 돌 때 직접 실행
 app.post("/api/autorun", (req,res)=>{
-  (async ()=>{ try{ await runAutoCycle(); }catch(e){ logError("autorun", e); } })();
-  res.json({ ok:true, status:"running" });
+  const body = req.body || {};
+  const dept = body.dept, directive = body.directive;
+  (async ()=>{
+    try{
+      if (dept && AGENTS[dept]){
+        // 특정 부서의 지시를 즉시 1회 수행 (지시 적용 직후 바로 일하게)
+        const dir = (directive && String(directive).trim()) || ((DB.state&&DB.state.deptDirective&&DB.state.deptDirective[dept])||"");
+        if (dir){ DB.state=DB.state||{}; DB.state.deptDirective=DB.state.deptDirective||{}; DB.state.deptDirective[dept]=dir; saveDB(); }
+        await autoRunDept(dept, String(dir||"").trim());
+        DB.lastCollectAt = Date.now(); saveDB();
+      } else {
+        await runAutoCycle();
+      }
+    }catch(e){ logError("autorun", e); }
+  })();
+  res.json({ ok:true, status:"running", dept: dept||null });
 });
 
 // 자율수행 1회 사이클: 지시 있는 부서는 각자 지시 수행(학습 활용), 지시 없는 부서는 1개씩 순환 학습
