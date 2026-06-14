@@ -1164,6 +1164,56 @@ app.post("/api/instruct", (req,res)=>{
     res.json({ ok:true, id:shell.id, status:"running" });
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
+// 회의 미결 항목 추천안 — '미결/확인 필요' 항목마다 채택 가능한 구체안 제시
+app.post("/api/meeting/suggest-unresolved", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const mt=(DB.meetings||[]).find(x=>x.id===+body.id);
+    const topic=(mt&&mt.topic)||body.topic||"";
+    const summary=(mt&&mt.summary)||body.summary||"";
+    if(!summary) return res.json({ ok:true, text:"" });
+    const sys="너는 이 회사의 전략·운영 총괄이다."+ADDRESS
+      +" 아래 회의 결론에는 '미결' 또는 '클라이언트 확인 필요'로 남은 항목이 있다. 각 미결/확인 항목마다 클라이언트가 바로 채택할 수 있는 '구체적 추천안'을 한 줄씩 제시하라."
+      +" 형식: 줄마다 '· 항목: 추천안 (근거 한마디)'. 결정 가능한 값(숫자·시점·방식)으로, 군더더기 없이. 한국어로만."+profileContext();
+    const out=await anthropic(sys, "회의 주제: "+topic+"\n\n[회의 결론]\n"+summary, 1300);
+    res.json({ ok:true, text: out });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 회의 내용 → 콘텐츠 직접 생성(라우터 거치지 않고 제작부가 완성형 콘텐츠 반환 → 콘텐츠 탭에 바로 표시)
+app.post("/api/content/create", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const d="creation"; const a=AGENTS[d];
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS;
+    const kb=knowledgeText(d); if(kb) sys+="\n\n[이 부서가 축적한 전문성(지식 베이스)]\n"+kb;
+    const rel=relevantContext(d, String(body.source||"")+" "+(body.topic||""), 3);
+    if(rel) sys+="\n\n[비슷한 과거 콘텐츠 작업 — 톤·형식 재활용]\n"+rel;
+    sys+=" 아래 회의 내용을 바탕으로, 바로 게시 가능한 완성형 SNS 콘텐츠를 직접 만들어라. 되묻지 말고 합리적으로 가정해 완성하라. 플랫폼에 맞는 게시물 카피(또는 영상 스크립트·구성안)와 해시태그까지 포함. 질문·선택 요청 없이 결과물만, 한국어로."+profileContext();
+    const out=await anthropic(sys, "회의 주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,2500), 1500);
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[회의→콘텐츠] "+(body.label||""), note:String(out).slice(0,500) });
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+    if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} }
+    saveDB();
+    res.json({ ok:true, content: out, dept:d });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 콘텐츠 의견·소통 — 클라이언트 의견에 해당 부서가 답하고 필요시 수정안 제시
+app.post("/api/content/reply", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const d=(body.dept&&AGENTS[body.dept])?body.dept:"creation";
+    const a=AGENTS[d];
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS;
+    const kb=knowledgeText(d); if(kb) sys+="\n\n[이 부서가 축적한 전문성(지식 베이스)]\n"+kb;
+    sys+=" 아래는 네가 만든 콘텐츠와 그에 대한 클라이언트 의견이다. 의견에 정중하고 짧게 답하고, 수정이 필요하면 그 자리에서 개선된 카피·문구·구성을 바로 제시하라. 실무적으로, 한국어로만."+profileContext();
+    const out=await anthropic(sys, "[콘텐츠]\n"+String(body.content||"").slice(0,2200)+"\n\n[클라이언트 의견]\n"+String(body.comment||""), 1000);
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[콘텐츠 의견 응답]", note:String(out).slice(0,300) });
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; saveDB();
+    res.json({ ok:true, reply: out, dept:d });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
 // 작업 취소(멈춘 '수행 중'을 운영자가 직접 종료)
 app.post("/api/instruct/:id/cancel", (req,res)=>{
   const j=(DB.jobs||[]).find(x=>x.id===+req.params.id);
