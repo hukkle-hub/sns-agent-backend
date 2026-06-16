@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -327,14 +327,64 @@ async function route(instruction){
 function _tok(str){ return String(str||"").toLowerCase().replace(/[^0-9a-z\uac00-\ud7a3\s]/g," ").split(/\s+/).filter(w=>w.length>=2); }
 function relevantContext(dept, query, limit){
   const qt = new Set(_tok(query)); if(!qt.size) return "";
-  function score(text){ const seen=new Set(); let n=0; for(const w of _tok(text)){ if(qt.has(w)&&!seen.has(w)){ n++; seen.add(w); } } return n; }
-  const cand = [];
-  (DB.deptMemory[dept]||[]).forEach(x=>{ const sc=score((x.instruction||"")+" "+(x.note||"")); if(sc>=2) cand.push({sc, when:x.at||0, label:x.instruction||"", text:String(x.note||"")}); });
-  (DB.collections||[]).filter(c=>c.dept===dept).forEach(c=>{ const sc=score((c.topic||"")+" "+(c.text||"")); if(sc>=2) cand.push({sc, when:c.at||0, label:c.topic||"", text:String(c.text||"")}); });
+  const corpus=[];
+  (DB.deptMemory[dept]||[]).forEach(x=>corpus.push((x.instruction||"")+" "+(x.note||"")));
+  (DB.collections||[]).filter(c=>c.dept===dept).forEach(c=>corpus.push((c.topic||"")+" "+(c.text||"")));
+  const df={}; corpus.forEach(t=>{ const seen=new Set(_tok(t)); seen.forEach(w=>{ if(qt.has(w)) df[w]=(df[w]||0)+1; }); });
+  const N=Math.max(1, corpus.length);
+  const weight=w=> Math.log((N+1)/((df[w]||0)+1))+0.3; // idf 유사 가중(드문 단어일수록 큼)
+  const nowT=Date.now();
+  function score(text, when){ const seen=new Set(); let s=0; for(const w of _tok(text)){ if(qt.has(w)&&!seen.has(w)){ s+=weight(w); seen.add(w); } }
+    if(s<=0) return 0; const ageDays=(nowT-(when||0))/86400000; return s*(1+Math.max(0, 0.5-ageDays/120)); } // 최근 자료 소폭 가중
+  const cand=[];
+  (DB.deptMemory[dept]||[]).forEach(x=>{ const sc=score((x.instruction||"")+" "+(x.note||""), x.at); if(sc>0.6) cand.push({sc, when:x.at||0, label:x.instruction||"", text:String(x.note||"")}); });
+  (DB.collections||[]).filter(c=>c.dept===dept).forEach(c=>{ const sc=score((c.topic||"")+" "+(c.text||""), c.at); if(sc>0.6) cand.push({sc, when:c.at||0, label:c.topic||"", text:String(c.text||"")}); });
   cand.sort((a,b)=> (b.sc-a.sc) || (b.when-a.when));
-  const top = cand.slice(0, Math.min(limit||3, 2));
+  const top = cand.slice(0, Math.min(limit||3, 3));
   if(!top.length) return "";
   return top.map(x=>"· "+(x.label?("["+x.label+"] "):"")+x.text.slice(0,400)).join("\n");
+}
+// ── 임베딩 의미검색: 키워드 한계 극복. Gemini 임베딩(기존 키) + 인메모리 LRU 캐시, 실패 시 키워드 폴백 ──
+const EMB = new Map(); const EMB_CAP = 1500;
+function _embGet(k){ if(!EMB.has(k)) return null; const v=EMB.get(k); EMB.delete(k); EMB.set(k,v); return v; } // LRU 갱신
+function _embSet(k,v){ EMB.set(k,v); if(EMB.size>EMB_CAP){ EMB.delete(EMB.keys().next().value); } }
+async function geminiEmbed(text){
+  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  if(!key) return null;
+  const t = String(text||"").slice(0,1600); if(!t.trim()) return null;
+  const cached = _embGet(t); if(cached) return cached;
+  try{
+    const url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent";
+    const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
+      body: JSON.stringify({ content:{ parts:[{ text:t }] }, outputDimensionality:256 }) });
+    const dj = await r.json();
+    const vals = dj && dj.embedding && dj.embedding.values;
+    if(Array.isArray(vals) && vals.length){ _embSet(t, vals); return vals; }
+    return null;
+  }catch(e){ return null; }
+}
+function _cosine(a,b){ let dot=0,na=0,nb=0; const n=Math.min(a.length,b.length); for(let i=0;i<n;i++){ dot+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; } if(!na||!nb) return 0; return dot/(Math.sqrt(na)*Math.sqrt(nb)); }
+let _semanticOff = false; // 임베딩이 반복 실패하면 잠시 키워드로
+async function relevantSmart(dept, query, limit){
+  limit = limit||3;
+  if(_semanticOff || (DB.state && DB.state.semanticSearch===false)) return relevantContext(dept, query, limit);
+  const qv = await geminiEmbed(query);
+  if(!qv){ _semanticOff = true; setTimeout(()=>{ _semanticOff=false; }, 10*60000); return relevantContext(dept, query, limit); } // 10분 후 재시도
+  const items = [];
+  (DB.deptMemory[dept]||[]).slice(-30).forEach(x=>items.push({ label:x.instruction||"", text:String(x.note||""), when:x.at||0 }));
+  (DB.collections||[]).filter(c=>c.dept===dept).slice(-30).forEach(c=>items.push({ label:c.topic||"", text:String(c.text||""), when:c.at||0 }));
+  let budget = 16; // 한 번에 새로 임베딩할 최대 문서 수(비용·지연 제한)
+  const scored = [];
+  for(const it of items){
+    const txt = (it.label?it.label+" ":"")+it.text; if(!txt.trim()) continue;
+    let dv = _embGet(txt.slice(0,1600));
+    if(!dv){ if(budget<=0) continue; budget--; dv = await geminiEmbed(txt); }
+    if(dv) scored.push({ it, sc:_cosine(qv,dv) });
+  }
+  scored.sort((a,b)=> b.sc-a.sc);
+  const top = scored.filter(x=>x.sc>0.55).slice(0, limit);
+  if(!top.length) return relevantContext(dept, query, limit); // 의미상 유사 없음 → 키워드 보강
+  return top.map(x=>"· "+(x.it.label?("["+x.it.label+"] "):"")+x.it.text.slice(0,400)).join("\n");
 }
 // 부서의 '축적 전문성(지식 베이스)'을 가져와 프롬프트에 주입할 텍스트
 function knowledgeText(dept){
@@ -371,20 +421,28 @@ function recordClient(text){
   saveDB();
 }
 // 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
-async function distillKnowledge(dept){
+async function distillKnowledge(dept, forceDeep){
   try{
     const a=AGENTS[dept]; if(!a) return;
     const arr=DB.deptMemory[dept]||[];
     if(arr.length<3) return;
+    const exp=(DB.exp&&DB.exp[dept])||0;
+    const deep = forceDeep || (exp>0 && exp%10===0); // 10활동마다 또는 강제 시 '심화 정리'(전체 재검토)
     const prior=knowledgeText(dept);
-    const recent=arr.slice(-12).map(x=>"· "+(x.instruction?("["+x.instruction+"] "):"")+String(x.note||"").slice(0,220)).join("\n");
+    const win = deep ? 26 : 16;
+    const recent=arr.slice(-win).map(x=>"· "+(x.instruction?("["+x.instruction+"] "):"")+String(x.note||"").slice(0,240)).join("\n");
+    // 피드백(회의 평가·팀장 평가)을 우선 학습 신호로 강조
+    const fb=arr.filter(x=>/\[(회의 피드백|팀장 평가|콘텐츠 의견)\]/.test(x.instruction||"")).slice(-6)
+      .map(x=>"· "+(x.instruction||"")+" → "+String(x.note||"").slice(0,160)).join("\n");
     const sys="너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서의 지식 관리자다. 역할: "+a.role
-      +" 이 부서가 그동안 수행·학습한 기록을 통합해 '이 부서의 축적 전문성'을 갱신하라. 기존 전문성에 새 기록을 합치되 중복은 통합하고 더 정교하게 다듬어, 앞으로 모든 작업에 즉시 적용할 핵심 노하우로 만들라."
-      +" 한국어로만, 아래 형식으로 14줄 이내로 압축 출력(설명·서론 금지):\n핵심 전문성: (이 부서가 잘하게 된 것 3~5개)\n검증된 원칙·노하우: (반복해서 통한 방식 3~5개)\n피해야 할 것: (실패·비효율 1~3개)\n타깃·시장 인사이트: (고객/시장에 대해 알게 된 것 2~4개)"
+      +" 이 부서가 수행·학습·피드백받은 기록을 통합해 '이 부서의 축적 전문성'을 갱신하라. 기존 전문성에 새 기록을 합치되 중복은 통합하고, 실제로 통한 방식은 원칙으로 굳히고, 실패·낮은 평가는 '피해야 할 것'으로 명확히 새겨라. 앞으로 모든 작업에 즉시 적용할, 다른 작업에도 전이 가능한 핵심 노하우로 만들라."
+      +(deep?" [심화 정리] 지금은 전체 전문성을 처음부터 재검토하는 시간이다. 낡거나 약한 항목은 과감히 버리고, 가장 가치 있는 노하우만 더 날카롭게 다듬어라.":"")
+      +" 한국어로만, 아래 형식으로 "+(deep?16:14)+"줄 이내로 압축 출력(설명·서론 금지):\n핵심 전문성: (이 부서가 잘하게 된 것 3~5개)\n검증된 원칙·노하우: (반복해서 통한 방식 3~5개, 가능하면 재사용 공식/템플릿으로)\n피해야 할 것: (실패·비효율·낮은 평가에서 배운 것 1~3개)\n타깃·시장 인사이트: (고객/시장에 대해 알게 된 것 2~4개)\n최근 성장: (예전 대비 나아진 점 1줄)"
       +profileContext();
-    const out=await anthropic(sys, "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[새로 쌓인 최근 기록]\n"+recent, 1100);
+    const ctx="[기존 축적 전문성]\n"+(prior||"(아직 없음)")+(fb?"\n\n[중요: 받은 피드백 — 반드시 반영]\n"+fb:"")+"\n\n[새로 쌓인 최근 기록]\n"+recent;
+    const out=await genText(sys, ctx, deep?1500:1100, "gemini"); // 학습은 자동·무료(Gemini)
     DB.deptKnowledge=DB.deptKnowledge||{};
-    DB.deptKnowledge[dept]={ text:out, at:Date.now(), basis:arr.length, exp:(DB.exp&&DB.exp[dept])||0 };
+    DB.deptKnowledge[dept]={ text:out, at:Date.now(), basis:arr.length, exp, deep: !!deep };
     saveDB();
   }catch(e){ logError("distill:"+dept, e); }
 }
@@ -425,7 +483,7 @@ async function work(dept, instruction, context, images, teamLog){
   const _kb = knowledgeText(dept); const _lv = deptLevel(dept);
   sys += " 너는 현재 Lv"+_lv+" 숙련도의 부서다." + (_lv>=3 ? " 그동안 축적한 전문성을 바탕으로 더 깊고 차별화된 결과를 내라." : " 기본기를 지키며 일관되게 수행하라.");
   if (_kb) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 모든 판단·작성의 기반으로 반드시 적용하라]\n" + _kb;
-  const _rel = relevantContext(dept, instruction, 2);
+  const _rel = await relevantSmart(dept, instruction, 2);
   if (_rel) sys += "\n\n[이번 지시와 비슷한 과거 작업·수집 자료 — 처음부터 다시 조사하지 말고 이걸 재활용·갱신해 더 빠르고 정확하게 처리하라]\n" + _rel;
   const mem = DB.deptMemory[dept] || [];
   if (mem.length) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem.slice(-4).map(x=>"· "+x.note).join("\n");
@@ -445,7 +503,7 @@ async function work(dept, instruction, context, images, teamLog){
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
   saveDB();
-  if (DB.exp[dept] % 4 === 0) { try{ await distillKnowledge(dept); }catch(e){} } // 4회 활동마다 전문성 압축·발전
+  if (DB.exp[dept] % 3 === 0) { try{ await distillKnowledge(dept); }catch(e){} } // 4회 활동마다 전문성 압축·발전
   return text;
 }
 
@@ -656,6 +714,20 @@ async function geminiText(prompt, maxTok){
 }
 
 // 기획안 → Veo 3.1 프롬프트(10초 구간별로 분리). Gemini 협력, 실패 시 Claude 대체.
+// 회의 등에서 엔진 선택: gemini면 Gemini(무료 한도)로 → Claude 크레딧 절약. 실패 시 1회만 Claude 폴백.
+async function genText(system, user, maxTok, engine){
+  const prompt = String(system||"") + "\n\n" + String(user||"");
+  if (engine === "gemini") {
+    try { return await geminiText(prompt, maxTok); }
+    catch(e1){
+      try { await new Promise(r=>setTimeout(r,1200)); return await geminiText(prompt, maxTok); }
+      catch(e2){ logError("genText-gemini", e2); return await anthropic(system, user, maxTok); } // 최후 폴백(드묾)
+    }
+  }
+  return await anthropic(system, user, maxTok);
+}
+
+function workEngine(){ return (DB.state&&DB.state.workEngine==="gemini")?"gemini":"claude"; } // 자율수행·콘텐츠·영상 엔진
 async function veoPromptFromPlan(plan){
   const fmt = " 영상을 10초 단위 구간으로 끊어, 각 구간마다 아래 형식으로 출력하라.\n"
     + "◆ 구간 N (0-10초)\n<그 10초 구간의 영어 Veo 프롬프트 — 카메라 무빙·조명·분위기·피사체·동작·색감을 영화적으로>\n자막/나레이션: <해당 구간 자막·나레이션(한국어 가능)>\n"
@@ -888,6 +960,71 @@ async function kakaoNotify(text){
   return { ok:r.ok, note: r.ok ? "카톡 알림 전송" : "카톡 전송 실패("+r.status+")" };
 }
 
+// ===== 팀장 일일 브리핑 — 오세라가 오늘 각 부서·팀이 한 일을 정리 =====
+// ===== 팀장 브리핑 — 아침(오늘 할 일)·저녁(오늘 한 일)·주간(한 주 종합) =====
+function deptActivityRows(sinceUtc){
+  return Object.keys(AGENTS).filter(d=>d!=="ops").map(d=>{
+    const items = (DB.deptMemory[d]||[]).filter(x=>(x.at||0) >= sinceUtc);
+    const lv = deptLevel(d);
+    const list = items.slice(-5).map(x=>"   · "+(x.instruction||"")+" → "+String(x.note||"").slice(0,90)).join("\n");
+    return AGENTS[d].no+" "+AGENTS[d].kr+"("+MEMBERS[d]+") — Lv"+lv+" · "+items.length+"건"+(list?"\n"+list:"  (기록 없음)");
+  }).join("\n\n");
+}
+async function runBriefing(kind, engine, force){
+  kind = (kind==="morning"||kind==="weekly") ? kind : "evening";
+  const dayKey = kstDay();
+  const a = AGENTS["ops"];
+  let sys = "너는 SNS 자동화 회사의 팀장 '"+a.no+" "+a.kr+"'다. 역할: "+a.role+ADDRESS+STYLE + clientBlock();
+  let ctx="", title="", periodKey="";
+
+  if (kind === "morning") {
+    periodKey = "m:"+dayKey;
+    if (!force && (DB.briefDone&&DB.briefDone.morning)===dayKey) return { ok:true, skipped:true };
+    const lastEve = (DB.briefings||[]).filter(b=>b.kind==="evening").slice(-1)[0];
+    const dirLines = Object.keys(AGENTS).filter(d=>d!=="ops").map(d=>{ const dir=(DB.state&&DB.state.deptDirective&&DB.state.deptDirective[d])||""; return dir?("   · "+AGENTS[d].kr+": "+dir):null; }).filter(Boolean).join("\n");
+    sys += " 지금은 하루를 시작하며 클라이언트님께 '오늘 할 일'을 제안하는 아침 브리핑 시간이다. 어제 마무리와 현재 방향을 보고 오늘 팀이 집중할 일을 제안하라. 형식(이 형식만):\n오늘의 포커스: (오늘 가장 중요한 방향 1문장)\n부서별 할 일: (부서마다 한 줄씩 '부서명 — 오늘 할 구체 작업')\n우선순위: (가장 먼저 처리할 1~2개)\n한마디: (팀에게 건네는 짧은 응원)\n군더더기·서론 없이, 든든하고 따뜻하게, 한국어로만.";
+    ctx = "[어제 마무리 브리핑]\n"+(lastEve?lastEve.text:"(없음)")+"\n\n[현재 부서 자율지시]\n"+(dirLines||"(지정 없음)")+"\n\n[부서 레벨·최근 활동]\n"+deptActivityRows(Date.now()-3*86400000);
+    title = "☀️ 오세라 아침 브리핑 (오늘 할 일)";
+  } else if (kind === "weekly") {
+    const weekUtc = Date.now() - 7*86400000;
+    periodKey = "w:"+dayKey;
+    if (!force && (DB.briefDone&&DB.briefDone.weekly)===weekKey()) return { ok:true, skipped:true };
+    const meets = (DB.meetings||[]).filter(m=>(m.at||0) >= weekUtc);
+    const meetLine = meets.length ? meets.slice(-10).map(m=>"   · ["+(m.topic||"")+"] "+String(m.summary||"진행").slice(0,70)).join("\n") : "   (이번 주 회의 없음)";
+    sys += " 지금은 한 주를 마무리하는 주간 종합 브리핑 시간이다. 지난 7일간 각 부서의 성장·성과와 회의를 종합해 팀장으로서 정리하라. 형식(이 형식만):\n이번 주 한 줄: (한 주 전체 요약 1문장)\n부서별 성과: (부서마다 한 줄씩 '부서명 — 한 주 성과·성장')\n팀 성장 진단: (가장 성장한 부서·정체된 부서·전체 방향 2~3문장)\n다음 주 포커스: (다음 주 먼저 할 일 2~3개)\n든든하고 따뜻하게, 한국어로만.";
+    ctx = "[지난 7일 부서 활동]\n"+deptActivityRows(weekUtc)+"\n\n[이번 주 회의]\n"+meetLine;
+    title = "📅 오세라 주간 종합 브리핑";
+  } else {
+    periodKey = "e:"+dayKey;
+    if (!force && (DB.briefDone&&DB.briefDone.evening)===dayKey) return { ok:true, skipped:true };
+    const kstMidnightUtc = Date.parse(dayKey+"T00:00:00Z") - 9*3600000;
+    const meets = (DB.meetings||[]).filter(m=>(m.at||0) >= kstMidnightUtc);
+    const meetLine = meets.length ? meets.map(m=>"   · ["+(m.topic||"")+"] "+String(m.summary||"진행").slice(0,80)).join("\n") : "   (오늘 회의 없음)";
+    sys += " 지금은 하루를 마무리하며 클라이언트님께 오늘의 팀 브리핑을 드리는 시간이다. 오늘 각 부서의 활동과 회의를 보고 팀장으로서 따뜻하고 명료하게 브리핑하라. 형식(이 형식만):\n오늘의 한 줄: (팀 전체 하루 요약 1문장)\n부서별: (활동이 있던 부서만 한 줄씩 '부서명 — 무엇을 했고 어떤 성과/배움')\n팀 하이라이트: (가장 잘된 점 1~2개)\n내일 제안: (내일 먼저 하면 좋을 일 1~2개)\n군더더기·서론 없이, 든든하고 따뜻하게, 한국어로만.";
+    ctx = "[오늘 부서 활동]\n"+deptActivityRows(kstMidnightUtc)+"\n\n[오늘 회의]\n"+meetLine;
+    title = "🌙 오세라 저녁 브리핑 (오늘 한 일)";
+  }
+
+  const out = await genText(sys, ctx, 1300, engine||"gemini"); // 자동 = 무료(Gemini)
+  const brief = { date:dayKey, kind, text:out, at:Date.now() };
+  DB.briefings = DB.briefings||[]; DB.briefings.push(brief);
+  if (DB.briefings.length > 40) DB.briefings = DB.briefings.slice(-40);
+  DB.briefDone = DB.briefDone || {};
+  if (kind==="morning") DB.briefDone.morning = dayKey;
+  else if (kind==="weekly") DB.briefDone.weekly = weekKey();
+  else { DB.briefDone.evening = dayKey; DB.lastBriefDay = dayKey; }
+  saveDB();
+  kakaoNotify(title+"\n\n"+String(out).slice(0,900)).catch(()=>{});
+  return { ok:true, briefing:brief };
+}
+function weekKey(){ const n=kstNow(); const onejan=new Date(Date.UTC(n.getUTCFullYear(),0,1)); const wk=Math.ceil((((n-onejan)/86400000)+onejan.getUTCDay()+1)/7); return n.getUTCFullYear()+"-W"+wk; }
+async function runDailyBriefing(engine, force){ return runBriefing("evening", engine, force); } // 하위호환
+app.post("/api/ops/briefing", async (req,res)=>{
+  try{ const b=req.body||{}; const r=await runBriefing(b.kind||"evening", b.engine, b.force!==false ? true : false); res.json(r); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/briefings", (req,res)=> res.json(DB.briefings||[]));
+
 // ===== 통합 지시 처리 (서버 오케스트레이션) =====
 // 협의 모드 1단계: 각 부서가 자기 관점의 의견·아이디어만 짧게 제시 (실행 X)
 
@@ -927,7 +1064,7 @@ function createMeeting(opts){
   const topic = String(opts.topic||agenda[0]||"회의").trim();
   if (!agenda.length) agenda = [topic];
   if (agenda.length > 4) agenda = agenda.slice(0,4);
-  const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", status:"running", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries:[], transcript:[], summary:"", clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", at:Date.now(), source:opts.source||"app" };
+  const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", status:"running", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries:[], transcript:[], summary:"", clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", at:Date.now(), source:opts.source||"app", engine:(((opts.engine || (DB.state&&DB.state.meetingEngine))==="gemini") ? "gemini" : "claude") };
   DB.meetings.push(meeting);
   if (DB.meetings.length > 60) DB.meetings = DB.meetings.slice(-60);
   saveDB();
@@ -945,6 +1082,7 @@ async function processMeeting(meeting){
   const mg = (MODE[meeting.mode]||MODE.discuss);
   const depts = meeting.depts, rounds = meeting.rounds, chair = meeting.chair, agenda = meeting.agenda, topic = meeting.topic;
   const transcript = meeting.transcript;
+  const eng = (meeting.engine==="gemini") ? "gemini" : "claude"; // 회의 AI 엔진
   runningMeetings++;
   try {
     const spk = (dp)=> AGENTS[dp] ? (AGENTS[dp].kr+"("+MEMBERS[dp]+")") : "클라이언트(운영자)";
@@ -975,9 +1113,9 @@ async function processMeeting(meeting){
           if (log) sys += "\n\n[이 안건의 지금까지 발언]\n"+log;
           sys += steer + prevctx + meetingFeedbackInsights() + profileContext() + clientBlock();
           let text;
-          try { text = await anthropic(sys, "회의 안건: "+item, 600); }
+          try { text = await genText(sys, "회의 안건: "+item, 600, eng); }
           catch(e1){
-            try { await new Promise(r=>setTimeout(r,1500)); text = await anthropic(sys, "회의 안건: "+item, 600); } // 1회 재시도
+            try { await new Promise(r=>setTimeout(r,1500)); text = await genText(sys, "회의 안건: "+item, 600, eng); } // 1회 재시도
             catch(e2){ text = "(이 발언은 일시 오류로 건너뜀)"; logError("meeting-stmt", e2); }
           }
           transcript.push({ dept:d, member:MEMBERS[d]||"", round:r, agenda:ai, text });
@@ -990,7 +1128,7 @@ async function processMeeting(meeting){
         + " 아래 발언 전체를 종합해 다음 형식으로만 출력하라:\n결론: (합의된 최종 방향 2~3문장)\n결정사항: (번호 목록 2~4개)\n액션: (부서별 한 줄씩 '부서명 — 할 일')"
         + steer + meetingFeedbackInsights() + profileContext();
       let asum;
-      try { asum = await anthropic(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+spk(t.dept)+": "+t.text).join("\n"), 850); }
+      try { asum = await genText(csys, "회의 안건: "+item+"\n\n[발언 전체]\n"+transcript.filter(t=>t.agenda===ai).map(t=>"["+t.round+"R] "+spk(t.dept)+": "+t.text).join("\n"), 850, eng); }
       catch(e){ asum = "결론: (요약 생성 일시 오류 — 발언 기록을 참고하세요)"; logError("meeting-sum", e); }
       meeting.agendaSummaries.push({ title:item, summary:asum });
       saveDB();
@@ -1001,7 +1139,7 @@ async function processMeeting(meeting){
     else {
       const ca = AGENTS[chair];
       const osys = "너는 이 ["+mg.label+"] 회의의 의장('"+(MEMBERS[chair]||"")+"')이다."+ADDRESS+" 여러 안건의 결론을 한 문단으로 종합하라. 형식:\n종합 결론: (2~3문장)\n핵심 결정: (번호 목록)"+profileContext();
-      try { meeting.summary = await anthropic(osys, "[안건별 결론]\n"+meeting.agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700); }
+      try { meeting.summary = await genText(osys, "[안건별 결론]\n"+meeting.agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700, eng); }
       catch(e){ meeting.summary = meeting.agendaSummaries.map(x=>x.title+": "+x.summary).join("\n\n"); logError("meeting-osum", e); }
     }
 
@@ -1011,7 +1149,7 @@ async function processMeeting(meeting){
       DB.deptMemory[d].push({ at:Date.now(), instruction:"["+mg.label+" 회의] "+topic, note:"회의 결론: "+(meeting.summary.length>180?meeting.summary.slice(0,180)+"…":meeting.summary) });
       if (DB.deptMemory[d].length > 40) DB.deptMemory[d] = DB.deptMemory[d].slice(-40);
       DB.exp = DB.exp || {}; DB.exp[d] = (DB.exp[d]||0) + 1;
-      if (DB.exp[d] % 4 === 0) { try{ await distillKnowledge(d); }catch(e){} } // 회의도 전문성 압축
+      if (DB.exp[d] % 3 === 0) { try{ await distillKnowledge(d); }catch(e){} } // 회의도 전문성 압축
     }
     meeting.status = "done";
     saveDB();
@@ -1303,14 +1441,14 @@ app.post("/api/content/create", async (req,res)=>{
     const d="creation"; const a=AGENTS[d];
     let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
     const kb=knowledgeText(d); if(kb) sys+="\n\n[이 부서가 축적한 전문성(지식 베이스)]\n"+kb;
-    const rel=relevantContext(d, String(body.source||"")+" "+(body.topic||""), 3);
+    const rel=await relevantSmart(d, String(body.source||"")+" "+(body.topic||""), 3);
     if(rel) sys+="\n\n[비슷한 과거 콘텐츠 작업 — 톤·형식 재활용]\n"+rel;
     sys+=" 아래 회의 내용을 바탕으로, 바로 게시 가능한 완성형 SNS 콘텐츠를 직접 만들어라. 되묻지 말고 합리적으로 가정해 완성하라. 플랫폼에 맞는 게시물 카피(또는 영상 스크립트·구성안)와 해시태그까지 포함. 질문·선택 요청 없이 결과물만, 한국어로."+profileContext();
-    const out=await anthropic(sys, "회의 주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,1800), 1500);
+    const out=await genText(sys, "회의 주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,1800), 1500, (body.engine||workEngine()));
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[회의→콘텐츠] "+(body.label||""), note:String(out).slice(0,500) });
     DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
-    if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} }
+    if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
     saveDB();
     res.json({ ok:true, content: out, dept:d });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
@@ -1324,12 +1462,12 @@ app.post("/api/video/plan", async (req,res)=>{
     let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
     const kb=knowledgeText(d); if(kb) sys+="\n\n[축적 전문성]\n"+kb;
     sys+=" 아래 주제·내용으로 짧은 SNS 홍보 영상(20~30초) 기획안을 만들어라. 반드시 10초 단위 구간으로 끊어 구성하라. 형식: 콘셉트 한 줄 / 구간별(구간1: 0-10초, 구간2: 10-20초, …) 화면·자막·나레이션 / BGM·톤 / 총 길이. 한국어로, 바로 생성 가능하게 구체적으로."+profileContext();
-    const plan=await anthropic(sys, "주제: "+topic+"\n참고 내용: "+source, 1400);
+    const plan=await genText(sys, "주제: "+topic+"\n참고 내용: "+source, 1400, (body.engine||workEngine()));
     // 합의·변환: 기획안 → Veo 프롬프트(10초 구간별). Gemini 협력.
     const vp0=await veoPromptFromPlan(plan); const veoPrompt=vp0.veoPrompt, by=vp0.by;
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({at:Date.now(),instruction:"[영상 기획→Veo]",note:String(plan).slice(0,300)});
-    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
     res.json({ ok:true, plan, veoPrompt, by });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
@@ -1343,11 +1481,11 @@ app.post("/api/video/revise", async (req,res)=>{
     let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
     const kb=knowledgeText(d); if(kb) sys+="\n\n[축적 전문성]\n"+kb;
     sys+=" 아래 영상 기획안에 대한 클라이언트 의견을 충실히 반영해, 같은 형식(콘셉트 한 줄/컷1~5: 화면·자막·나레이션/BGM·톤/총 길이)으로 '수정된 기획안 전체'를 다시 출력하라. 완성형으로, 한국어로만."+profileContext();
-    const revised=await anthropic(sys, "[현재 기획안]\n"+plan+"\n\n[클라이언트 의견]\n"+feedback, 1400);
+    const revised=await genText(sys, "[현재 기획안]\n"+plan+"\n\n[클라이언트 의견]\n"+feedback, 1400, (body.engine||workEngine()));
     const reply="의견을 반영해 기획안을 수정했어요. 아래 기획안을 확인하고, 좋으면 'Veo 프롬프트 다시 생성'을 눌러주세요.";
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({at:Date.now(),instruction:"[영상 기획 수정]",note:String(feedback).slice(0,200)});
-    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
     res.json({ ok:true, plan:revised, reply });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
@@ -1358,6 +1496,31 @@ app.post("/api/video/prompt", async (req,res)=>{
     if(!plan) return res.json({ ok:true, veoPrompt:"", by:"" });
     const vp=await veoPromptFromPlan(plan);
     res.json({ ok:true, veoPrompt:vp.veoPrompt, by:vp.by });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 팀장(오세라) 평가 — 특정 부서 답변을 팀장 관점에서 평가·의견 제시
+app.post("/api/ops/evaluate", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const d="ops"; const a=AGENTS[d];
+    const target=body.dept&&AGENTS[body.dept]?AGENTS[body.dept].kr:"담당 부서";
+    let sys="너는 SNS 자동화 회사의 팀장 '"+a.no+" "+a.kr+"'다. 역할: "+a.role+ADDRESS+STYLE;
+    sys+=clientBlock();
+    sys+=" 아래는 '"+target+"'의 업무 결과다. 팀장으로서 짧고 명확하게 평가하라. 형식: 잘한 점 / 아쉬운 점 / 개선 제안(구체적으로) / 한 줄 총평. 군더더기 없이, 네 성격(든든하고 단호하되 따뜻하게)을 살려. 한국어로만.";
+    const out=await anthropic(sys, "[부서: "+target+"]\n\n[업무 결과]\n"+String(body.content||"").slice(0,2200), 1000);
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[팀장 평가] "+target, note:String(out).slice(0,300) });
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
+    // 평가받은 부서도 이 피드백을 학습(개선점을 다음에 반영)
+    const tdept=body.dept;
+    if(tdept && AGENTS[tdept] && tdept!=="ops"){
+      if(!DB.deptMemory[tdept]) DB.deptMemory[tdept]=[];
+      DB.deptMemory[tdept].push({ at:Date.now(), instruction:"[팀장 평가] 받은 피드백", note:"오세라 평가: "+String(out).slice(0,260) });
+      if(DB.deptMemory[tdept].length>40) DB.deptMemory[tdept]=DB.deptMemory[tdept].slice(-40);
+      distillKnowledge(tdept).catch(()=>{}); // 피드백 즉시 학습 반영
+    }
+    saveDB();
+    res.json({ ok:true, evaluation: out });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 콘텐츠 의견·소통 — 클라이언트 의견에 해당 부서가 답하고 필요시 수정안 제시
@@ -1372,7 +1535,7 @@ app.post("/api/content/reply", async (req,res)=>{
     const out=await anthropic(sys, "[콘텐츠]\n"+String(body.content||"").slice(0,2200)+"\n\n[클라이언트 의견]\n"+String(body.comment||""), 1000);
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[콘텐츠 의견 응답]", note:String(out).slice(0,300) });
-    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%4===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
     res.json({ ok:true, reply: out, dept:d });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
@@ -1405,6 +1568,8 @@ app.get("/api/sync", (req,res)=>{
     deptMemory: DB.deptMemory,
     deptKnowledge: DB.deptKnowledge || {},
     clientProfile: DB.clientProfile || {text:"",at:0},
+    briefings: (DB.briefings||[]).filter(b=>b.at>since),
+    leadDirectives: (DB.leadDirectives||[]).filter(x=>x.at>since),
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -1449,9 +1614,19 @@ app.post("/api/meeting/rate", (req,res)=>{
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[회의 피드백] "+(m.topic||""), note });
     if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+    distillKnowledge(d).catch(()=>{}); // 평가를 즉시 학습에 반영
   });
   saveDB();
   res.json({ ok:true, rating:r });
+});
+// 전 부서 전문성 '심화 정리'(강제 deep distill) — 학습력 끌어올리기. 무료(Gemini).
+app.post("/api/ops/consolidate", async (req,res)=>{
+  try{
+    const depts = Object.keys(AGENTS).filter(d=>(DB.deptMemory[d]||[]).length>=3);
+    const done=[];
+    for(const d of depts){ try{ await distillKnowledge(d, true); done.push(AGENTS[d].kr); }catch(e){ logError("consolidate:"+d, e); } }
+    res.json({ ok:true, consolidated:done });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
 // 회의 기록 삭제: { id } 또는 { ids:[...] }
@@ -1469,7 +1644,7 @@ app.post("/api/meeting/delete", (req,res)=>{
 app.post("/api/meeting", (req,res)=>{
   try { const b = req.body||{};
     if ((!b.topic && !(b.agenda&&b.agenda.length)) || !b.depts || !b.depts.length) return res.status(400).json({ error:"topic/agenda, depts 필요" });
-    const meeting = createMeeting({ topic:b.topic, depts:b.depts, rounds:b.rounds, mode:b.mode, chair:b.chair, agenda:b.agenda, clientNote:b.clientNote, prevSummary:b.prevSummary, room:b.room, alwaysJoin:b.alwaysJoin, source:"app" });
+    const meeting = createMeeting({ topic:b.topic, depts:b.depts, rounds:b.rounds, mode:b.mode, chair:b.chair, agenda:b.agenda, clientNote:b.clientNote, prevSummary:b.prevSummary, room:b.room, alwaysJoin:b.alwaysJoin, engine:(b.engine || (DB.state&&DB.state.meetingEngine) || "claude"), source:"app" });
     processMeeting(meeting).catch(()=>{}); // 비동기 진행 — 발언은 실시간 저장됨
     res.json({ ok:true, id:meeting.id, status:"running" }); // 즉시 응답 (타임아웃 방지)
   } catch(e){ res.status(400).json({ error:String(e.message||e) }); }
@@ -1581,11 +1756,16 @@ app.post("/api/ops/review", async (req,res)=>{
       + " 아래 각 부서의 경험치·최근 자율수행/학습 기록·현재 지시를 보고 팀장으로서 평가하라.\n"
       + " 각 부서의 레벨·축적 전문성·학습량을 근거로 '성장도'를 진단하라.\n"
       + "출력 형식(이 형식만):\n성장 진단: (부서별 한 줄씩 '부서명 — Lv·별점(★1~5) · 강점 한마디 · 다음에 키울 점 한마디')\n총평: (가장 빠르게 성장한 부서, 정체된 부서, 팀 전체 성장 방향 2~3문장)\n"
-      + "지시조정: (자율수행 지시를 바꾸면 좋을 부서만, 줄마다 'DIRECTIVE: 부서영문키 = 새 지시 한 줄'. 없으면 '없음')\n부서 영문키: "+Object.keys(AGENTS).join(", ")
+      + "지시조정: (자율수행 지시를 바꾸면 좋을 부서만, 줄마다 'DIRECTIVE: 부서영문키 = 새 지시 한 줄'. 없으면 '없음')\n"
+      + "실행제안: (지금 바로 진행하면 좋을 구체 작업 2~4개, 줄마다 'ACTION: 부서영문키 = 바로 진행할 작업 한 줄'. 팀장으로서 다음 할 일을 제안하라.)\n부서 영문키: "+Object.keys(AGENTS).join(", ")
       + profileContext();
     const out = await anthropic(sys, "[부서 현황]\n"+rows, 1800);
     const suggestions = [];
     out.replace(/DIRECTIVE:\s*([a-z]+)\s*=\s*(.+)/g, (mm,d,t)=>{ if(AGENTS[d]&&d!=="ops") suggestions.push({ dept:d, directive:t.trim() }); return mm; });
+    const proposals = [];
+    out.replace(/ACTION:\s*([a-z]+)\s*=\s*(.+)/g, (mm,d,t)=>{ if(AGENTS[d]) proposals.push({ dept:d, action:t.trim() }); return mm; });
+    // 화면에는 raw 지시/액션 줄은 정리
+    const reportClean = out.replace(/^\s*(DIRECTIVE|ACTION):.*$/gm, "").replace(/^\s*(지시조정|실행제안)\s*:\s*$/gm, "").replace(/\n{3,}/g, "\n\n").trim();
     const report = out.replace(/지시조정:[\s\S]*$/,"").trim();
     DB.collections = DB.collections||[];
     DB.collections.push({ id:Date.now(), topic:"[오세라 팀 평가]", text:out, at:Date.now(), dept:"ops" });
@@ -1595,56 +1775,57 @@ app.post("/api/ops/review", async (req,res)=>{
     if (DB.deptMemory.ops.length>40) DB.deptMemory.ops=DB.deptMemory.ops.slice(-40);
     DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
     saveDB();
-    res.json({ ok:true, report:out, suggestions });
+    res.json({ ok:true, report:reportClean, suggestions, proposals });
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
 // ③+⑤ 부서 간 지식 공유·성장 회의: 고레벨 부서가 가르치고, 각 부서가 서로에게서 배워 함께 성장
+// 부서 간 지식 공유·성장 세션 — 서로 가르치며 함께 성장. 수동/자동 공용.
+async function runKnowledgeShare(engine){
+  const ids = Object.keys(AGENTS);
+  const parts = ids.filter(d => knowledgeText(d) || ((DB.exp||{})[d]||0) > 0);
+  if (parts.length < 2) return { ok:true, report:"아직 공유할 전문성이 부족해요. 부서들이 작업·자율수행으로 학습을 더 쌓으면 지식 공유가 가능해져요.", learnings:[] };
+  const board = parts.map(d=>{
+    const lv=deptLevel(d); const kb=knowledgeText(d);
+    const fallback=(DB.deptMemory[d]||[]).slice(-3).map(x=>"· "+String(x.note||"").slice(0,120)).join("\n");
+    return AGENTS[d].no+" "+AGENTS[d].kr+" (Lv"+lv+")\n"+(kb||fallback||"(기록 적음)");
+  }).join("\n\n");
+  const topLv = Math.max.apply(null, parts.map(d=>deptLevel(d)));
+  const teachers = parts.filter(d=>deptLevel(d)===topLv).map(d=>AGENTS[d].kr).join(", ");
+  const sys = "너는 이 플랫폼의 팀장 '08 플랫폼 운영(오세라)'이며 팀 성장 퍼실리테이터다."+ADDRESS
+    + " 아래는 각 부서의 레벨과 축적 전문성이다. 지금 '부서 간 지식 공유·성장 세션'을 진행한다. "
+    + "고레벨 부서(현재 최고 Lv"+topLv+": "+teachers+")가 다른 부서를 가르치는 관점으로, 각 부서가 '다른 부서의 전문성에서 배워 자기 업무에 적용할 점' 1~3가지를 구체적으로 정하라. 누구에게 배우는지 근거를 포함하라.\n"
+    + "출력 형식(이 형식만):\n"
+    + "줄마다 'LEARN: 부서영문키 | (어느 부서의 어떤 전문성에서) 배워 적용할 점 — 한 문장'\n"
+    + "마지막에 '코칭: (최고 레벨 부서 관점에서 팀 전체에 주는 성장 조언 2~3문장)'\n"
+    + "부서 영문키: " + ids.join(", ") + profileContext();
+  const out = await genText(sys, "[부서 전문성 보드]\n"+board, 2000, engine||"gemini"); // 자동 = 무료(Gemini)
+  const learnings = [];
+  out.replace(/LEARN:\s*([a-z]+)\s*\|\s*(.+)/g, (mm,d,t)=>{
+    if (AGENTS[d]) {
+      const note = "[지식 공유] "+t.trim();
+      if (!DB.deptMemory[d]) DB.deptMemory[d]=[];
+      DB.deptMemory[d].push({ at:Date.now(), instruction:"[지식 공유 세션]", note });
+      if (DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+      DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+      learnings.push({ dept:d, name:AGENTS[d].kr, learn:t.trim() });
+    }
+    return mm;
+  });
+  // 공유로 새로 배운 내용을 각 부서 전문성에 즉시 반영
+  for (const lg of learnings){ try{ await distillKnowledge(lg.dept); }catch(e){} }
+  DB.collections = DB.collections||[];
+  DB.collections.push({ id:Date.now(), topic:"[부서 간 지식 공유·성장 세션]", text:out, at:Date.now(), dept:"ops" });
+  if (DB.collections.length>100) DB.collections=DB.collections.slice(-100);
+  if (!DB.deptMemory.ops) DB.deptMemory.ops=[];
+  DB.deptMemory.ops.push({ at:Date.now(), instruction:"[지식 공유 진행]", note:"부서 간 지식 공유 세션 진행 — "+learnings.length+"개 부서가 상호 학습" });
+  DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
+  DB.lastKShareAt = Date.now(); saveDB();
+  return { ok:true, report:out, learnings };
+}
 app.post("/api/knowledge-share", async (req,res)=>{
-  try {
-    const ids = Object.keys(AGENTS);
-    // 가르칠 자료가 있는 부서(지식 or 경험)만 참여
-    const parts = ids.filter(d => knowledgeText(d) || ((DB.exp||{})[d]||0) > 0);
-    if (parts.length < 2) return res.json({ ok:true, report:"아직 공유할 전문성이 부족해요. 부서들이 작업·자율수행으로 학습을 더 쌓으면 지식 공유가 가능해져요.", learnings:[] });
-    // 교육 보드: 각 부서의 레벨 + 축적 전문성(없으면 최근 학습 요약)
-    const board = parts.map(d=>{
-      const lv=deptLevel(d); const kb=knowledgeText(d);
-      const fallback=(DB.deptMemory[d]||[]).slice(-3).map(x=>"· "+String(x.note||"").slice(0,120)).join("\n");
-      return AGENTS[d].no+" "+AGENTS[d].kr+" (Lv"+lv+")\n"+(kb||fallback||"(기록 적음)");
-    }).join("\n\n");
-    const topLv = Math.max.apply(null, parts.map(d=>deptLevel(d)));
-    const teachers = parts.filter(d=>deptLevel(d)===topLv).map(d=>AGENTS[d].kr).join(", ");
-    const sys = "너는 이 플랫폼의 팀장 '08 플랫폼 운영(오세라)'이며 팀 성장 퍼실리테이터다."+ADDRESS
-      + " 아래는 각 부서의 레벨과 축적 전문성이다. 지금 '부서 간 지식 공유·성장 세션'을 진행한다. "
-      + "고레벨 부서(현재 최고 Lv"+topLv+": "+teachers+")가 다른 부서를 가르치는 관점으로, 각 부서가 '다른 부서의 전문성에서 배워 자기 업무에 적용할 점' 1~3가지를 구체적으로 정하라. 누구에게 배우는지 근거를 포함하라.\n"
-      + "출력 형식(이 형식만):\n"
-      + "줄마다 'LEARN: 부서영문키 | (어느 부서의 어떤 전문성에서) 배워 적용할 점 — 한 문장'\n"
-      + "마지막에 '코칭: (최고 레벨 부서 관점에서 팀 전체에 주는 성장 조언 2~3문장)'\n"
-      + "부서 영문키: " + ids.join(", ") + profileContext();
-    const out = await anthropic(sys, "[부서 전문성 보드]\n"+board, 2000);
-    // LEARN 파싱 → 각 부서 학습에 반영(서로 가르침)
-    const learnings = [];
-    out.replace(/LEARN:\s*([a-z]+)\s*\|\s*(.+)/g, (mm,d,t)=>{
-      if (AGENTS[d]) {
-        const note = "[지식 공유] "+t.trim();
-        if (!DB.deptMemory[d]) DB.deptMemory[d]=[];
-        DB.deptMemory[d].push({ at:Date.now(), instruction:"[지식 공유 세션]", note });
-        if (DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
-        DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
-        learnings.push({ dept:d, name:AGENTS[d].kr, learn:t.trim() });
-      }
-      return mm;
-    });
-    // 세션 기록 보관
-    DB.collections = DB.collections||[];
-    DB.collections.push({ id:Date.now(), topic:"[부서 간 지식 공유·성장 세션]", text:out, at:Date.now(), dept:"ops" });
-    if (DB.collections.length>100) DB.collections=DB.collections.slice(-100);
-    if (!DB.deptMemory.ops) DB.deptMemory.ops=[];
-    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[지식 공유 진행]", note:"부서 간 지식 공유 세션 진행 — "+learnings.length+"개 부서가 상호 학습" });
-    DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
-    saveDB();
-    res.json({ ok:true, report:out, learnings });
-  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+  try { const r = await runKnowledgeShare((req.body||{}).engine); res.json(r); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
 // 자체 점검: 서버 상태 진단 + DB 구조 자가 보완
@@ -1868,6 +2049,44 @@ setInterval(async ()=>{
   } catch(e){ /* 감시 실패는 무시 */ }
   // (0) 예약 회의: 근무시간과 무관하게 지정 시각(KST)에 실행
   const hm = kstHHMM(), day = kstDay(), dow = kstDow(), nowMs = Date.now();
+  // (0-b) 팀장 브리핑: 아침(오늘 할 일)·저녁(오늘 한 일)·주간(한 주 종합) — 자동이므로 무료(Gemini)
+  try {
+    const st = DB.state || {};
+    const morningHour = Number.isFinite(+st.morningHour) ? +st.morningHour : 9;
+    const eveningHour = Number.isFinite(+st.briefHour) ? +st.briefHour : 21;
+    const weeklyDow = Number.isFinite(+st.weeklyDow) ? +st.weeklyDow : 0; // 0=일
+    const morningOn = st.morningBrief !== false, eveningOn = st.eveningBrief !== false, weeklyOn = st.weeklyBrief !== false;
+    const kstHour = kstNow().getUTCHours();
+    DB.briefDone = DB.briefDone || { morning:"", evening:"", weekly:"" };
+    // 아침
+    if (morningOn && kstHour >= morningHour && DB.briefDone.morning !== day) {
+      DB.briefDone.morning = day; saveDB();
+      runBriefing("morning","gemini",true).then(()=>console.log("아침 브리핑 완료")).catch(e=>logError("brief-morning", e));
+    }
+    // 주간 (지정 요일 + 저녁 시각 이후, 주 1회) — 저녁보다 먼저 체크
+    else if (weeklyOn && dow === weeklyDow && kstHour >= eveningHour && DB.briefDone.weekly !== weekKey()) {
+      DB.briefDone.weekly = weekKey(); saveDB();
+      runBriefing("weekly","gemini",true).then(()=>console.log("주간 브리핑 완료")).catch(e=>logError("brief-weekly", e));
+    }
+    // 저녁
+    else if (eveningOn && kstHour >= eveningHour && DB.briefDone.evening !== day) {
+      DB.briefDone.evening = day; DB.lastBriefDay = day; saveDB();
+      runBriefing("evening","gemini",true).then(()=>console.log("저녁 브리핑 완료")).catch(e=>logError("brief-evening", e));
+    }
+  } catch(e){ /* 브리핑 실패 무시 */ }
+  // (0-c) 24시간+ 자율수행 정체 부서: 팀장이 감지해 학습 기반으로 재지시 (자동·무료)
+  checkStaleDepts().catch(e=>logError("stale-check", e));
+  // (0-d) 부서 간 지식 공유·성장 세션: 주기 자동 진행(기본 48시간마다) — 자동·무료
+  try {
+    const st2 = DB.state || {};
+    if (st2.kShareOn !== false) {
+      const everyH = Number.isFinite(+st2.kShareEveryH) ? Math.max(6, +st2.kShareEveryH) : 48;
+      if (Date.now() - (DB.lastKShareAt||0) >= everyH*3600000) {
+        DB.lastKShareAt = Date.now(); saveDB(); // 선점
+        runKnowledgeShare("gemini").then(r=>{ try{ kakaoNotify("🤝 부서 지식 공유 세션 완료 — "+((r.learnings||[]).length)+"개 부서가 서로 배움"); }catch(_){} console.log("자동 지식 공유 완료"); }).catch(e=>logError("auto-kshare", e));
+      }
+    }
+  } catch(e){ /* 지식공유 실패 무시 */ }
   for (const ms of (DB.meetingSchedules||[])){
     let due = false;
     if (ms.repeat === "interval"){
@@ -1889,7 +2108,7 @@ setInterval(async ()=>{
       if (prev) prevSummary = prev.summary || "";
     }
     saveDB();
-    runMeeting({ topic:ms.topic, depts:ms.depts, rounds:ms.rounds, mode:ms.mode, chair:ms.chair, agenda:ms.agenda, clientNote:ms.clientNote, prevSummary, room:ms.room, source:"schedule" }).then(()=>{
+    runMeeting({ topic:ms.topic, depts:ms.depts, rounds:ms.rounds, mode:ms.mode, chair:ms.chair, agenda:ms.agenda, clientNote:ms.clientNote, prevSummary, room:ms.room, engine:"gemini", source:"schedule" }).then(()=>{
       if (ms.repeat === "once"){ DB.meetingSchedules = DB.meetingSchedules.filter(x=>x.id!==ms.id); saveDB(); }
     }).catch(e=>logError("scheduled-meeting", e));
   }
@@ -1944,18 +2163,18 @@ async function autoRunDept(dept, directive){
   const _kb2 = knowledgeText(dept); const _lv2 = deptLevel(dept);
   sys += " (현재 Lv"+_lv2+" 숙련도)";
   if (_kb2) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 이걸 기반으로 더 발전된 결과를 내라]\n" + _kb2;
-  if (directive){ const _rel2 = relevantContext(dept, directive, 3); if (_rel2) sys += "\n\n[이 지시와 비슷한 과거 작업·자료 — 재활용·갱신해 빠르게 처리]\n" + _rel2; }
+  if (directive){ const _rel2 = await relevantSmart(dept, directive, 3); if (_rel2) sys += "\n\n[이 지시와 비슷한 과거 작업·자료 — 재활용·갱신해 빠르게 처리]\n" + _rel2; }
   const mem = (DB.deptMemory[dept]||[]).slice(-6).map(x=>"· "+(x.instruction?("["+x.instruction+"] "):"")+x.note).join("\n");
   if (mem) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem;
   const cross = crossDeptMemory(dept);
   if (cross) sys += "\n\n[다른 부서들이 최근 학습·작성한 내용 — 관련되면 활용·보완하라]\n" + cross;
   const tag = directive ? "[자율 지시] " : (dept==="engagement" ? "[반응 수집] " : "[자율 학습] ");
-  const note = await anthropic(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), directive ? 1300 : 900);
+  const note = await genText(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), directive ? 1300 : 900, "gemini"); // 자동 주기 = 항상 무료(Gemini)
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:tag+baseFocus, note });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
-  if (DB.exp[dept] % 4 === 0) { try{ await distillKnowledge(dept); }catch(e){} }
+  if (DB.exp[dept] % 3 === 0) { try{ await distillKnowledge(dept); }catch(e){} }
   DB.collections.push({ id:Date.now()+Math.floor(Math.random()*1000), topic:"["+a.kr+"] "+baseFocus, text:note, at:Date.now(), dept });
   if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
   saveDB();
@@ -1983,6 +2202,44 @@ app.post("/api/autorun", (req,res)=>{
 });
 
 // 자율수행 1회 사이클: 지시 있는 부서는 각자 지시 수행(학습 활용), 지시 없는 부서는 1개씩 순환 학습
+// 정체 부서에 팀장이 학습 기반 지시를 생성
+async function leaderDirectiveFor(dept){
+  const a=AGENTS[dept], lead=AGENTS["ops"]; if(!a) return "";
+  const kb=knowledgeText(dept);
+  const recent=(DB.deptMemory[dept]||[]).slice(-5).map(x=>"· "+(x.instruction||"")+" → "+String(x.note||"").slice(0,100)).join("\n");
+  const sys="너는 SNS 자동화 회사 팀장 '"+lead.no+" "+lead.kr+"'다."+ADDRESS+STYLE+clientBlock()
+    +" '"+a.kr+"("+MEMBERS[dept]+")' 부서가 24시간 넘게 새로운 자율수행이 없어 정체돼 있다. 이 부서가 축적한 전문성과 최근 기록을 바탕으로, 지금 바로 자율수행할 '구체적이고 실행 가능한 한 줄 지시'를 내려라. 부서 전문성을 한 단계 끌어올릴 방향으로. 한 줄만, 한국어로, 따옴표·머리말 없이 지시문만.";
+  const ctx="[부서 축적 전문성]\n"+(kb||"(아직 적음)")+"\n\n[최근 기록]\n"+(recent||"(없음)");
+  const out=await genText(sys, ctx, 300, "gemini"); // 자동 = 무료
+  return String(out||"").trim().replace(/^["'\s]+|["'\s]+$/g,"").slice(0,200);
+}
+// 24시간+ 정체된 부서를 팀장이 감지해 재지시
+async function checkStaleDepts(){
+  const now=Date.now(), DAY=24*3600000;
+  DB.leadDirectives=DB.leadDirectives||[]; DB.staleHandled=DB.staleHandled||{};
+  let handled=0;
+  for(const d of Object.keys(AGENTS)){
+    if(d==="ops") continue;
+    const arr=DB.deptMemory[d]||[]; if(!arr.length) continue;
+    const lastAt=arr[arr.length-1].at||0;
+    if(now-lastAt <= DAY) continue;                          // 최근 활동 있음 → 정상
+    if(DB.staleHandled[d] && now-DB.staleHandled[d] < DAY) continue; // 이미 처리됨
+    if(handled>=2) break;                                    // 한 틱 최대 2부서
+    try{
+      const dir=await leaderDirectiveFor(d);
+      if(dir){
+        DB.state=DB.state||{}; DB.state.deptDirective=DB.state.deptDirective||{}; DB.state.deptDirective[d]=dir;
+        DB.leadDirectives.push({ dept:d, directive:dir, reason:"24시간+ 자율수행 정체 — 팀장이 학습 기반으로 재지시", at:now, lastActiveAt:lastAt });
+        if(DB.leadDirectives.length>40) DB.leadDirectives=DB.leadDirectives.slice(-40);
+        DB.staleHandled[d]=now; saveDB();
+        kakaoNotify("🧭 팀장 재지시 — "+AGENTS[d].kr+": "+dir).catch(()=>{});
+        autoRunDept(d, dir).catch(()=>{}); // 즉시 1회 수행해 정체 해소
+        handled++;
+      }
+    }catch(e){ logError("stale:"+d, e); }
+  }
+  if(handled) saveDB();
+}
 async function runAutoCycle(){
   const dir = (DB.state && DB.state.deptDirective) || {};
   const allIds = Object.keys(AGENTS);
