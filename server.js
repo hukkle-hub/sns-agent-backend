@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -210,6 +210,12 @@ async function anthropic(system, user, maxTokens = 1500, images){
       DB.usage.in += data.usage.input_tokens || 0;
       DB.usage.out += data.usage.output_tokens || 0;
       DB.usage.calls += 1;
+      // 하루 누적(날짜가 바뀌면 자동 리셋)
+      const _today = todayStr();
+      if (!DB.usageDaily || DB.usageDaily.date !== _today) DB.usageDaily = { date:_today, in:0, out:0, calls:0 };
+      DB.usageDaily.in += data.usage.input_tokens || 0;
+      DB.usageDaily.out += data.usage.output_tokens || 0;
+      DB.usageDaily.calls += 1;
     }
     let part = (data.content || []).filter(b=>b.type==="text").map(b=>b.text).join("");
     if (needSpace && part && !/^\s/.test(part)) part = " " + part;  // 이음새 공백 복원(중복 방지)
@@ -1773,7 +1779,10 @@ app.get("/api/usage", (req,res)=>{
   const costUsd = (u.in/1e6)*inRate + (u.out/1e6)*outRate;
   const today = todayStr();
   const pubToday = (DB.jobs||[]).filter(j=>j.type==="publish" && j.ok && new Date(j.at).toISOString().slice(0,10)===today).reduce((a,j)=>a+(j.count||1),0);
-  res.json({ tokensIn:u.in, tokensOut:u.out, calls:u.calls, estCostUsd:+costUsd.toFixed(4), publishesToday:pubToday });
+  const ud = (DB.usageDaily && DB.usageDaily.date===today) ? DB.usageDaily : { in:0, out:0, calls:0 };
+  const costToday = (ud.in/1e6)*inRate + (ud.out/1e6)*outRate;
+  res.json({ tokensIn:u.in, tokensOut:u.out, calls:u.calls, estCostUsd:+costUsd.toFixed(4), publishesToday:pubToday,
+    tokensInToday:ud.in, tokensOutToday:ud.out, callsToday:ud.calls, estCostUsdToday:+costToday.toFixed(4) });
 });
 
 // 에러 로그 조회
