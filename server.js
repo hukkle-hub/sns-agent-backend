@@ -1357,7 +1357,17 @@ app.get("/api/ping", (req,res)=>{
   const sinceMin = DB.lastCollectAt ? Math.round((Date.now()-DB.lastCollectAt)/60000) : null;
   const due = on && working && (Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000);
   if (due) { runAutoCycle().catch(e=>logError("ping-autocycle", e)); } // 핑이 트리거가 되어 평소 수행이 이어짐
+  checkStaleDepts().catch(e=>logError("ping-stale", e)); // 서버가 깰 때마다 24h+ 정체 부서를 팀장이 점검·재지시
   res.json({ ok:true, awake:true, working, autonomy:{ on, everyMin:col.everyMin||0, lastRunMinAgo:sinceMin, ranNow:!!due }, ts:Date.now() });
+});
+// 수동: 팀장이 지금 정체 부서를 점검해 재지시 (오피스 버튼)
+app.post("/api/ops/check-stale", async (req,res)=>{
+  try{
+    const before = (DB.leadDirectives||[]).length;
+    await checkStaleDepts(10);
+    const added = (DB.leadDirectives||[]).slice(before);
+    res.json({ ok:true, newDirectives: added, total:(DB.leadDirectives||[]).length });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
 // ===== 로그인 · 권한 =====
@@ -2232,8 +2242,8 @@ async function leaderDirectiveFor(dept){
   return String(out||"").trim().replace(/^["'\s]+|["'\s]+$/g,"").slice(0,200);
 }
 // 24시간+ 정체된 부서를 팀장이 감지해 재지시
-async function checkStaleDepts(){
-  const now=Date.now(), DAY=24*3600000;
+async function checkStaleDepts(maxHandle){
+  const now=Date.now(), DAY=24*3600000; const CAP = maxHandle||2;
   DB.leadDirectives=DB.leadDirectives||[]; DB.staleHandled=DB.staleHandled||{};
   let handled=0;
   for(const d of Object.keys(AGENTS)){
@@ -2242,7 +2252,7 @@ async function checkStaleDepts(){
     const lastAt=arr[arr.length-1].at||0;
     if(now-lastAt <= DAY) continue;                          // 최근 활동 있음 → 정상
     if(DB.staleHandled[d] && now-DB.staleHandled[d] < DAY) continue; // 이미 처리됨
-    if(handled>=2) break;                                    // 한 틱 최대 2부서
+    if(handled>=CAP) break;                                  // 기본 한 틱 2부서(수동 점검은 더 많이)
     try{
       const dir=await leaderDirectiveFor(d);
       if(dir){
