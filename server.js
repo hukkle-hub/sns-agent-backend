@@ -695,20 +695,38 @@ function pcmToWavBase64(pcmB64, rate, ch, bits){
 async function geminiText(prompt, maxTok){
   const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
-  const models = ["gemini-2.5-flash","gemini-2.0-flash","gemini-2.5-pro","gemini-1.5-flash"];
+  // 1순위 Gemini 3.5 Flash. 확장(extended) 사고 사용. 사고가 출력 토큰을 먹어 답변이 잘리지 않게 여유 토큰 확보.
+  const models = ["gemini-3.5-flash","gemini-2.5-flash","gemini-2.0-flash","gemini-1.5-flash"];
+  const want = maxTok || 1200;
   let lastErr=null;
   for (const mdl of models){
-    try{
-      const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
-      const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
-        body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }], generationConfig:{ maxOutputTokens: maxTok||1200 } }) });
-      const dj = await r.json();
-      if (dj.error){ lastErr=String(dj.error.message||""); if(/not found|not supported|invalid|404/i.test(lastErr)) continue; throw new Error("Gemini: "+lastErr); }
-      const parts = (((dj.candidates||[])[0]||{}).content||{}).parts||[];
-      const text = parts.map(p=>p.text||"").join("").trim();
-      if (text) return text;
-      lastErr = "빈 응답";
-    }catch(e){ lastErr=String(e.message||e); if(!/not found|404/i.test(lastErr)) throw e; }
+    // 모델별 '확장 사고' 설정 (3.x: thinkingLevel, 2.5: thinkingBudget 동적)
+    let thinkCfg=null;
+    if (/gemini-3/.test(mdl)) thinkCfg = { thinkingLevel: "high" };  // 3.x: 확장 사고
+    else if (/2\.5/.test(mdl)) thinkCfg = { thinkingBudget: -1 };     // 2.5: 동적(확장) 사고
+    for (let attempt=0; attempt<2; attempt++){   // 0: 사고설정 포함 / 1: 필드 거부 대비 설정 빼고 재시도
+      try{
+        const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
+        const genCfg = { maxOutputTokens: want + (thinkCfg?3000:0) }; // 확장 사고용 여유 토큰 → 답변 잘림 방지
+        if (thinkCfg && attempt===0) genCfg.thinkingConfig = thinkCfg;
+        const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
+          body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }], generationConfig: genCfg }) });
+        const dj = await r.json();
+        if (dj.error){
+          lastErr=String(dj.error.message||"");
+          if (attempt===0 && thinkCfg && /think/i.test(lastErr)) continue; // 사고설정 거부 → 같은 모델, 설정 빼고 재시도
+          break;                                                            // 그 외 오류 → 다음 모델
+        }
+        const parts = (((dj.candidates||[])[0]||{}).content||{}).parts||[];
+        const text = parts.map(p=>p.text||"").join("").trim();
+        if (text) return text;
+        lastErr = "빈 응답"; break;
+      }catch(e){
+        lastErr=String(e.message||e);
+        if (attempt===0 && thinkCfg && /think/i.test(lastErr)) continue;
+        break;
+      }
+    }
   }
   throw new Error("Gemini 텍스트 생성 실패: "+(lastErr||"원인 미상"));
 }
@@ -1113,9 +1131,9 @@ async function processMeeting(meeting){
           if (log) sys += "\n\n[이 안건의 지금까지 발언]\n"+log;
           sys += steer + prevctx + meetingFeedbackInsights() + profileContext() + clientBlock();
           let text;
-          try { text = await genText(sys, "회의 안건: "+item, 600, eng); }
+          try { text = await genText(sys, "회의 안건: "+item, 700, eng); }
           catch(e1){
-            try { await new Promise(r=>setTimeout(r,1500)); text = await genText(sys, "회의 안건: "+item, 600, eng); } // 1회 재시도
+            try { await new Promise(r=>setTimeout(r,1500)); text = await genText(sys, "회의 안건: "+item, 700, eng); } // 1회 재시도
             catch(e2){ text = "(이 발언은 일시 오류로 건너뜀)"; logError("meeting-stmt", e2); }
           }
           transcript.push({ dept:d, member:MEMBERS[d]||"", round:r, agenda:ai, text });
