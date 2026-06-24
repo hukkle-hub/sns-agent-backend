@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -695,8 +695,8 @@ function pcmToWavBase64(pcmB64, rate, ch, bits){
 async function geminiText(prompt, maxTok){
   const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
-  // 1순위 Gemini 3.5 Flash. 확장(extended) 사고 사용. 사고가 출력 토큰을 먹어 답변이 잘리지 않게 여유 토큰 확보.
-  const models = ["gemini-3.5-flash","gemini-2.5-flash","gemini-2.0-flash","gemini-1.5-flash"];
+  // 살아있는 모델만 (gemini-2.0/1.5는 2026년 종료=404). 1순위 3.5 Flash → 2.5 Flash → 2.5 Flash-Lite
+  const models = ["gemini-3.5-flash","gemini-2.5-flash","gemini-2.5-flash-lite"];
   const want = maxTok || 1200;
   let lastErr=null;
   for (const mdl of models){
@@ -707,7 +707,9 @@ async function geminiText(prompt, maxTok){
     for (let attempt=0; attempt<2; attempt++){   // 0: 사고설정 포함 / 1: 필드 거부 대비 설정 빼고 재시도
       try{
         const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
-        const genCfg = { maxOutputTokens: want + (thinkCfg?3000:0) }; // 확장 사고용 여유 토큰 → 답변 잘림 방지
+        // 확장 사고는 출력 토큰을 많이 먹어 답변이 비거나 잘릴 수 있어 여유를 크게(3.x high=+6000, 2.5=+3000)
+        const headroom = thinkCfg ? (/gemini-3/.test(mdl) ? 6000 : 3000) : 0;
+        const genCfg = { maxOutputTokens: want + headroom };
         if (thinkCfg && attempt===0) genCfg.thinkingConfig = thinkCfg;
         const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
           body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }], generationConfig: genCfg }) });
@@ -1365,7 +1367,7 @@ app.get("/api/ping", (req,res)=>{
 app.post("/api/ops/check-stale", async (req,res)=>{
   try{
     const before = (DB.leadDirectives||[]).length;
-    await checkStaleDepts(10);
+    await checkStaleDepts(10, true);
     const added = (DB.leadDirectives||[]).slice(before);
     res.json({ ok:true, newDirectives: added, total:(DB.leadDirectives||[]).length });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
@@ -1601,6 +1603,7 @@ app.get("/api/sync", (req,res)=>{
     leadDirectives: (DB.leadDirectives||[]).filter(x=>x.at>since),
     lastTrainAt: DB.lastTrainAt || {},
     lastTrainRoundAt: DB.lastTrainRoundAt || 0,
+    growBurst: DB.growBurst || {active:false,total:0,done:0},
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -1708,6 +1711,34 @@ app.post("/api/ops/train", async (req,res)=>{
     const all=Object.keys(AGENTS).filter(d=>d!=="ops" && (DB.deptMemory[d]||[]).length>=2).length;
     const done=await runTrainingRound(b.all?all:(b.n||2));
     res.json({ ok:true, trained:done });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// ===== 집중 성장(burst): 전 부서를 여러 라운드 자기훈련시켜 레벨을 빠르게 올림 (백그라운드·무료) =====
+async function runGrowBurst(rounds){
+  rounds = Math.max(1, Math.min(6, rounds||4));
+  const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
+  DB.growBurst = { active:true, total:depts.length*rounds, done:0, rounds, startedAt:Date.now(), finishedAt:0 };
+  saveDB();
+  for (let r=0; r<rounds; r++){
+    for (const d of depts){
+      try{
+        if(!(DB.deptMemory[d]||[]).length){ DB.deptMemory[d]=[{ at:Date.now(), instruction:"[시작]", note:AGENTS[d].kr+" 부서 가동 시작 — 기본 역량 정비" }]; }
+        await runSelfTraining(d); // exp+1 + 전문성 distill
+      }catch(e){ logError("grow:"+d, e); }
+      DB.growBurst.done++; saveDB();
+      await new Promise(res=>setTimeout(res, 700)); // 레이트리밋 완화
+    }
+  }
+  DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
+  try{ kakaoNotify("⚡ 집중 성장 완료 — 전 부서가 "+rounds+"라운드 자기훈련으로 레벨을 올렸어요"); }catch(_){}
+}
+app.post("/api/ops/grow", (req,res)=>{
+  try{
+    if (DB.growBurst && DB.growBurst.active) return res.json({ ok:true, already:true, growBurst:DB.growBurst });
+    const rounds = +((req.body||{}).rounds) || 4;
+    runGrowBurst(rounds).catch(e=>logError("grow-burst", e)); // 백그라운드 진행
+    res.json({ ok:true, started:true, growBurst:DB.growBurst });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
@@ -2307,7 +2338,7 @@ async function leaderDirectiveFor(dept){
   return String(out||"").trim().replace(/^["'\s]+|["'\s]+$/g,"").slice(0,200);
 }
 // 24시간+ 정체된 부서를 팀장이 감지해 재지시
-async function checkStaleDepts(maxHandle){
+async function checkStaleDepts(maxHandle, force){
   const now=Date.now(), DAY=24*3600000; const CAP = maxHandle||2;
   DB.leadDirectives=DB.leadDirectives||[]; DB.staleHandled=DB.staleHandled||{};
   let handled=0;
@@ -2316,7 +2347,7 @@ async function checkStaleDepts(maxHandle){
     const arr=DB.deptMemory[d]||[]; if(!arr.length) continue;
     const lastAt=arr[arr.length-1].at||0;
     if(now-lastAt <= DAY) continue;                          // 최근 활동 있음 → 정상
-    if(DB.staleHandled[d] && now-DB.staleHandled[d] < DAY) continue; // 이미 처리됨
+    if(!force && DB.staleHandled[d] && now-DB.staleHandled[d] < DAY) continue; // 이미 처리됨(수동 점검은 무시)
     if(handled>=CAP) break;                                  // 기본 한 틱 2부서(수동 점검은 더 많이)
     try{
       const dir=await leaderDirectiveFor(d);
@@ -2324,9 +2355,12 @@ async function checkStaleDepts(maxHandle){
         DB.state=DB.state||{}; DB.state.deptDirective=DB.state.deptDirective||{}; DB.state.deptDirective[d]=dir;
         DB.leadDirectives.push({ dept:d, directive:dir, reason:"24시간+ 자율수행 정체 — 팀장이 학습 기반으로 재지시", at:now, lastActiveAt:lastAt });
         if(DB.leadDirectives.length>40) DB.leadDirectives=DB.leadDirectives.slice(-40);
+        // 재지시를 '활동'으로 즉시 기록 → 정체(마지막 활동 기준)가 바로 풀림 (autoRun 실패/지연과 무관)
+        DB.deptMemory[d].push({ at:Date.now(), instruction:"[팀장 재지시]", note:"팀장 지시 수신: "+dir });
+        if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
         DB.staleHandled[d]=now; saveDB();
         kakaoNotify("🧭 팀장 재지시 — "+AGENTS[d].kr+": "+dir).catch(()=>{});
-        autoRunDept(d, dir).catch(()=>{}); // 즉시 1회 수행해 정체 해소
+        autoRunDept(d, dir).catch(()=>{}); // 실제 수행은 백그라운드(정체는 위 활동 기록으로 이미 해소)
         handled++;
       }
     }catch(e){ logError("stale:"+d, e); }
