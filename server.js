@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -1349,6 +1349,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 
 // ========================= 엔드포인트 =========================
 app.get("/", (req,res)=> res.send("SNS 에이전트 확장 백엔드 작동 중"));
+let KEEPALIVE_ON=false; // 자기-핑 활성 여부(서버 자동 깨우기)
 // 외부 핑(Keep-alive): 서버를 깨우고, 근무 중이고 자율수행이 밀렸으면 그 자리에서 한 사이클 실행 + 상태 보고
 app.get("/api/ping", (req,res)=>{
   const col = (DB.state && DB.state.collect) || {};
@@ -1358,7 +1359,7 @@ app.get("/api/ping", (req,res)=>{
   const due = on && working && (Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000);
   if (due) { runAutoCycle().catch(e=>logError("ping-autocycle", e)); } // 핑이 트리거가 되어 평소 수행이 이어짐
   checkStaleDepts().catch(e=>logError("ping-stale", e)); // 서버가 깰 때마다 24h+ 정체 부서를 팀장이 점검·재지시
-  res.json({ ok:true, awake:true, working, autonomy:{ on, everyMin:col.everyMin||0, lastRunMinAgo:sinceMin, ranNow:!!due }, ts:Date.now() });
+  res.json({ ok:true, awake:true, keepAlive:KEEPALIVE_ON, working, autonomy:{ on, everyMin:col.everyMin||0, lastRunMinAgo:sinceMin, ranNow:!!due }, ts:Date.now() });
 });
 // 수동: 팀장이 지금 정체 부서를 점검해 재지시 (오피스 버튼)
 app.post("/api/ops/check-stale", async (req,res)=>{
@@ -1598,6 +1599,8 @@ app.get("/api/sync", (req,res)=>{
     clientProfile: DB.clientProfile || {text:"",at:0},
     briefings: (DB.briefings||[]).filter(b=>b.at>since),
     leadDirectives: (DB.leadDirectives||[]).filter(x=>x.at>since),
+    lastTrainAt: DB.lastTrainAt || {},
+    lastTrainRoundAt: DB.lastTrainRoundAt || 0,
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -1654,6 +1657,57 @@ app.post("/api/ops/consolidate", async (req,res)=>{
     const done=[];
     for(const d of depts){ try{ await distillKnowledge(d, true); done.push(AGENTS[d].kr); }catch(e){ logError("consolidate:"+d, e); } }
     res.json({ ok:true, consolidated:done });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// ===== 지식 자기 훈련(continuous training): 부서가 전문성으로 가상 도전을 풀고 자기비평→원칙 강화 =====
+async function runSelfTraining(dept){
+  const a=AGENTS[dept]; if(!a || dept==="ops") return null;
+  const kb=knowledgeText(dept);
+  const recent=(DB.deptMemory[dept]||[]).slice(-4).map(x=>"· "+String(x.note||"").slice(0,100)).join("\n");
+  // 자기주도: 그동안 스스로 짚은 약점·낮은 평가를 모아 이번 훈련의 표적으로 삼는다
+  const weak=(DB.deptMemory[dept]||[]).filter(x=>/\[(자기 훈련|회의 피드백|팀장 평가)\]/.test(x.instruction||"")).slice(-5)
+    .map(x=>"· "+String(x.note||"").slice(0,120)).join("\n");
+  const lv=deptLevel(dept);
+  const sys="너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"("+MEMBERS[dept]+")' 부서(Lv"+lv+")다. 역할: "+a.role+ADDRESS+STYLE+clientBlock()
+    +" 지금은 외부 지시 없이 스스로 실력을 끌어올리는 '자기 주도 훈련' 시간이다. 먼저 네 약점 기록을 보고 '오늘 무엇을 집중 훈련할지 스스로 정한 뒤' 그 부분을 단련하라. 다음 순서로 결과만 간결히 한국어로 출력:\n"
+    +"0) 오늘의 훈련 주제: (내 약점/성장 필요 영역에서 스스로 고른 한 가지)\n"
+    +"1) 도전 과제: 그 주제에 맞는 까다로운 상황 1개를 스스로 설정\n"
+    +"2) 해결: 네 전문성을 총동원한 최선의 해법(구체적으로)\n"
+    +"3) 자기 비평: 방금 해법의 약점·놓친 점을 냉정하게 1~2가지\n"
+    +"4) 강화된 원칙: 이번 훈련으로 더 단단해진 '재사용 가능한 핵심 원칙' 1~2개 (PRINCIPLE: 로 시작하는 줄로)\n"
+    +"낡은 지식은 버리고 더 날카롭게. 군더더기·서론 금지.";
+  const ctx="[현재 축적 전문성]\n"+(kb||"(아직 적음)")+(weak?"\n\n[내가 스스로 짚은 약점·받은 피드백 — 이번 훈련의 표적]\n"+weak:"")+"\n\n[최근 활동]\n"+(recent||"(없음)");
+  const out=await genText(sys, ctx, 1200, "gemini"); // 무료(Gemini 3.5)
+  // 강화된 원칙 추출
+  const principles=[]; String(out).replace(/PRINCIPLE:\s*(.+)/g,(m,p)=>{ principles.push(p.trim()); return m; });
+  const noteCore = principles.length ? principles.join(" / ") : String(out).slice(0,200);
+  if(!DB.deptMemory[dept]) DB.deptMemory[dept]=[];
+  DB.deptMemory[dept].push({ at:Date.now(), instruction:"[자기 훈련]", note:"훈련으로 강화된 원칙: "+noteCore });
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  DB.exp=DB.exp||{}; DB.exp[dept]=(DB.exp[dept]||0)+1;
+  DB.lastTrainAt=DB.lastTrainAt||{}; DB.lastTrainAt[dept]=Date.now();
+  await distillKnowledge(dept); // 훈련 결과를 전문성에 즉시 반영
+  saveDB();
+  return { dept, name:a.kr, principles, transcript:out };
+}
+// 훈련 라운드: 가장 오래 훈련 안 한 부서부터 n개 (무료라 자주 돌려도 부담 없음)
+async function runTrainingRound(n){
+  const cap=n||2;
+  DB.lastTrainAt=DB.lastTrainAt||{};
+  const cands=Object.keys(AGENTS).filter(d=>d!=="ops" && (DB.deptMemory[d]||[]).length>=2);
+  cands.sort((x,y)=>(DB.lastTrainAt[x]||0)-(DB.lastTrainAt[y]||0)); // 오래된 순
+  const picked=cands.slice(0,cap); const done=[];
+  for(const d of picked){ try{ const r=await runSelfTraining(d); if(r) done.push(r.name); }catch(e){ logError("train:"+d, e); } }
+  return done;
+}
+app.post("/api/ops/train", async (req,res)=>{
+  try{
+    const b=req.body||{};
+    if(b.dept && AGENTS[b.dept]){ const r=await runSelfTraining(b.dept); return res.json({ ok:true, trained:r?[r.name]:[], detail:r }); }
+    const all=Object.keys(AGENTS).filter(d=>d!=="ops" && (DB.deptMemory[d]||[]).length>=2).length;
+    const done=await runTrainingRound(b.all?all:(b.n||2));
+    res.json({ ok:true, trained:done });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
@@ -2115,6 +2169,17 @@ setInterval(async ()=>{
       }
     }
   } catch(e){ /* 지식공유 실패 무시 */ }
+  // (0-e) 지식 자기 훈련: 주기적으로 부서가 스스로 전문성을 단련(기본 12시간마다 2부서) — 자동·무료
+  try {
+    const st3 = DB.state || {};
+    if (st3.trainOn !== false) {
+      const everyH = Number.isFinite(+st3.trainEveryH) ? Math.max(2, +st3.trainEveryH) : 12;
+      if (Date.now() - (DB.lastTrainRoundAt||0) >= everyH*3600000) {
+        DB.lastTrainRoundAt = Date.now(); saveDB(); // 선점
+        runTrainingRound(2).then(done=>{ if(done&&done.length){ try{ kakaoNotify("🏋️ 지식 훈련 — "+done.join(", ")+" 부서가 스스로 실력을 단련했어요"); }catch(_){} } console.log("자기 훈련 라운드 완료"); }).catch(e=>logError("auto-train", e));
+      }
+    }
+  } catch(e){ /* 훈련 실패 무시 */ }
   for (const ms of (DB.meetingSchedules||[])){
     let due = false;
     if (ms.repeat === "interval"){
@@ -2300,6 +2365,23 @@ const PORT = process.env.PORT || 3000;
   (DB.jobs||[]).forEach(function(j){ if(j && j.status==="running"){ j.status="error"; j.error="서버 재시작으로 중단됨"; _orphan++; } });
   if(_orphan){ try{ saveDB(); }catch(e){} console.log("중단된 작업 "+_orphan+"건 정리(error 처리)"); }
   app.listen(PORT, ()=> console.log("SNS 에이전트 백엔드 listening on " + PORT + (useSupabase?" (Supabase)":" (file)")));
+  // ── 자기-핑(self keep-alive): 서버가 스스로 자기 URL을 주기적으로 호출해 무료 슬립(15분)을 막음 ──
+  // Render는 RENDER_EXTERNAL_URL을 자동 제공. 직접 지정하려면 SELF_URL 환경변수 사용.
+  try {
+    const selfUrl = (process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/,"");
+    if (selfUrl) {
+      const everyMin = Math.max(5, Math.min(14, +process.env.KEEPALIVE_MIN || 13)); // 슬립(15분) 직전에
+      KEEPALIVE_ON=true;
+      console.log("자기-핑 활성화: "+selfUrl+"/api/ping (매 "+everyMin+"분) — 서버가 스스로 깨어 있게 유지");
+      setInterval(()=>{
+        fetch(selfUrl+"/api/ping").then(r=>r&&r.json&&r.json()).then(()=>{}).catch(e=>console.log("자기-핑 실패(무시): "+(e&&e.message||e)));
+      }, everyMin*60000);
+      // 부팅 직후 한 번
+      setTimeout(()=>{ fetch(selfUrl+"/api/ping").catch(()=>{}); }, 8000);
+    } else {
+      console.log("자기-핑 비활성(SELF_URL/RENDER_EXTERNAL_URL 없음) — 외부 핑(cron-job.org 등) 권장");
+    }
+  } catch(e){ console.log("자기-핑 설정 오류(무시): "+(e&&e.message||e)); }
   // 서버가 깨어나면(콜드스타트 포함) 밀린 자율수행을 한 번 따라잡아 '평소 수행'이 이어지게
   try {
     const col = DB.state && DB.state.collect;
