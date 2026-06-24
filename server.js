@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -392,6 +392,14 @@ function knowledgeText(dept){
   return (k && k.text) ? k.text : "";
 }
 function deptLevel(dept){ return Math.floor(((DB.exp&&DB.exp[dept])||0)/5)+1; }
+// 팀장(오세라)은 항상 최고 부서보다 1레벨 이상 위에 있어야 부서를 지시·균형 잡을 수 있다
+function ensureLeaderLead(){
+  DB.exp = DB.exp || {};
+  let maxDept = 0;
+  Object.keys(AGENTS).forEach(d=>{ if(d!=="ops") maxDept = Math.max(maxDept, DB.exp[d]||0); });
+  const want = maxDept + 5; // 최소 1레벨 위
+  if((DB.exp.ops||0) < want) DB.exp.ops = want;
+}
 // ── 클라이언트 학습: 발화를 모아 '클라이언트 프로필'(말투·유머·습관·선호)로 압축, 모든 부서가 공유 ──
 function clientBlock(){
   const t=(DB.clientProfile&&DB.clientProfile.text)?DB.clientProfile.text:"";
@@ -1604,6 +1612,7 @@ app.get("/api/sync", (req,res)=>{
     lastTrainAt: DB.lastTrainAt || {},
     lastTrainRoundAt: DB.lastTrainRoundAt || 0,
     growBurst: DB.growBurst || {active:false,total:0,done:0},
+    capability: DB.capability || {},
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -1665,13 +1674,36 @@ app.post("/api/ops/consolidate", async (req,res)=>{
 
 // ===== 지식 자기 훈련(continuous training): 부서가 전문성으로 가상 도전을 풀고 자기비평→원칙 강화 =====
 async function runSelfTraining(dept){
-  const a=AGENTS[dept]; if(!a || dept==="ops") return null;
+  const a=AGENTS[dept]; if(!a) return null;
+  const lv=deptLevel(dept);
+  // 팀장(오세라) 리더십 훈련: 전 부서를 조망해 격차 진단·지시 역량을 키움
+  if(dept==="ops"){
+    const board=Object.keys(AGENTS).filter(d=>d!=="ops").map(d=>{
+      return "· "+AGENTS[d].kr+" Lv"+deptLevel(d)+" — "+(knowledgeText(d)?String(knowledgeText(d)).slice(0,90):"(전문성 적음)");
+    }).join("\n");
+    const sysL="너는 SNS 자동화 회사 팀장 '"+a.no+" "+a.kr+"("+MEMBERS["ops"]+")'다. 역할: "+a.role+ADDRESS+STYLE+clientBlock()
+      +" 지금은 팀 전체를 조망하며 리더십을 단련하는 시간이다. 아래 부서 현황을 보고 결과만 간결히 한국어로 출력:\n"
+      +"0) 진단: 가장 뒤처진 부서와 그 원인\n"
+      +"1) 지시 설계: 그 부서를 끌어올릴 구체적 자율수행 지시 방향\n"
+      +"2) 균형 전략: 팀 전체 성장 격차를 줄일 다음 액션 1~2개\n"
+      +"3) 강화된 리더십 원칙: (PRINCIPLE: 로 시작하는 줄로 1~2개)\n군더더기 금지.";
+    const ctxL="[부서 현황(레벨·전문성)]\n"+board;
+    const outL=await genText(sysL, ctxL, 1200, "gemini");
+    const principlesL=[]; String(outL).replace(/PRINCIPLE:\s*(.+)/g,(m,p)=>{ principlesL.push(p.trim()); return m; });
+    if(!DB.deptMemory.ops) DB.deptMemory.ops=[];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[리더십 훈련]", note:"강화된 리더십 원칙: "+(principlesL.join(" / ")||String(outL).slice(0,200)) });
+    if(DB.deptMemory.ops.length>40) DB.deptMemory.ops=DB.deptMemory.ops.slice(-40);
+    DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
+    DB.lastTrainAt=DB.lastTrainAt||{}; DB.lastTrainAt.ops=Date.now();
+    try{ await distillKnowledge("ops"); }catch(e){}
+    ensureLeaderLead(); saveDB();
+    return { dept:"ops", name:a.kr, principles:principlesL, transcript:outL };
+  }
   const kb=knowledgeText(dept);
   const recent=(DB.deptMemory[dept]||[]).slice(-4).map(x=>"· "+String(x.note||"").slice(0,100)).join("\n");
   // 자기주도: 그동안 스스로 짚은 약점·낮은 평가를 모아 이번 훈련의 표적으로 삼는다
   const weak=(DB.deptMemory[dept]||[]).filter(x=>/\[(자기 훈련|회의 피드백|팀장 평가)\]/.test(x.instruction||"")).slice(-5)
     .map(x=>"· "+String(x.note||"").slice(0,120)).join("\n");
-  const lv=deptLevel(dept);
   const sys="너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"("+MEMBERS[dept]+")' 부서(Lv"+lv+")다. 역할: "+a.role+ADDRESS+STYLE+clientBlock()
     +" 지금은 외부 지시 없이 스스로 실력을 끌어올리는 '자기 주도 훈련' 시간이다. 먼저 네 약점 기록을 보고 '오늘 무엇을 집중 훈련할지 스스로 정한 뒤' 그 부분을 단련하라. 다음 순서로 결과만 간결히 한국어로 출력:\n"
     +"0) 오늘의 훈련 주제: (내 약점/성장 필요 영역에서 스스로 고른 한 가지)\n"
@@ -1691,6 +1723,7 @@ async function runSelfTraining(dept){
   DB.exp=DB.exp||{}; DB.exp[dept]=(DB.exp[dept]||0)+1;
   DB.lastTrainAt=DB.lastTrainAt||{}; DB.lastTrainAt[dept]=Date.now();
   await distillKnowledge(dept); // 훈련 결과를 전문성에 즉시 반영
+  ensureLeaderLead(); // 부서가 크면 팀장도 그 위로
   saveDB();
   return { dept, name:a.kr, principles, transcript:out };
 }
@@ -1699,9 +1732,11 @@ async function runTrainingRound(n){
   const cap=n||2;
   DB.lastTrainAt=DB.lastTrainAt||{};
   const cands=Object.keys(AGENTS).filter(d=>d!=="ops" && (DB.deptMemory[d]||[]).length>=2);
-  cands.sort((x,y)=>(DB.lastTrainAt[x]||0)-(DB.lastTrainAt[y]||0)); // 오래된 순
+  // 뒤처진 부서(경험치 낮은 순)를 우선 훈련 → 성장 격차를 좁힘. 동률이면 오래 안 한 순.
+  cands.sort((x,y)=> (((DB.exp&&DB.exp[x])||0)-((DB.exp&&DB.exp[y])||0)) || ((DB.lastTrainAt[x]||0)-(DB.lastTrainAt[y]||0)));
   const picked=cands.slice(0,cap); const done=[];
   for(const d of picked){ try{ const r=await runSelfTraining(d); if(r) done.push(r.name); }catch(e){ logError("train:"+d, e); } }
+  ensureLeaderLead(); saveDB();
   return done;
 }
 app.post("/api/ops/train", async (req,res)=>{
@@ -1715,13 +1750,31 @@ app.post("/api/ops/train", async (req,res)=>{
 });
 
 // ===== 집중 성장(burst): 전 부서를 여러 라운드 자기훈련시켜 레벨을 빠르게 올림 (백그라운드·무료) =====
-async function runGrowBurst(rounds){
-  rounds = Math.max(1, Math.min(6, rounds||4));
+async function runGrowBurst(rounds, balance){
   const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
-  DB.growBurst = { active:true, total:depts.length*rounds, done:0, rounds, startedAt:Date.now(), finishedAt:0 };
+  const expOf = d => (DB.exp&&DB.exp[d])||0;
+  let plan = []; // [{dept, rounds}]
+  if (balance){
+    // 균형 성장: 최고 부서 경험치에 맞춰 뒤처진 부서를 더 많이 훈련(부서당 최대 8라운드)
+    const target = Math.max.apply(null, depts.map(expOf));
+    depts.forEach(d=>{ const rr=Math.min(8, Math.max(0, target-expOf(d))); if(rr>0) plan.push({dept:d, rounds:rr}); });
+    if(!plan.length) depts.forEach(d=>plan.push({dept:d, rounds:1})); // 이미 평준화면 전체 1라운드
+  } else {
+    const rr = Math.max(1, Math.min(6, rounds||4));
+    depts.forEach(d=>plan.push({dept:d, rounds:rr}));
+  }
+  const maxR0 = Math.max.apply(null, plan.map(p=>p.rounds));
+  const total = plan.reduce((a,b)=>a+b.rounds,0) + maxR0; // +팀장(매 라운드 1회)
+  DB.growBurst = { active:true, total, done:0, mode: balance?"balance":"all", startedAt:Date.now(), finishedAt:0 };
   saveDB();
-  for (let r=0; r<rounds; r++){
-    for (const d of depts){
+  const maxR = Math.max.apply(null, plan.map(p=>p.rounds));
+  for (let r=0; r<maxR; r++){
+    // 팀장도 매 라운드 리더십 훈련 → 팀을 이끌며 함께(그리고 더 높이) 성장
+    try{ await runSelfTraining("ops"); }catch(e){ logError("grow:ops", e); }
+    DB.growBurst.done++; saveDB(); await new Promise(res=>setTimeout(res, 500));
+    for (const p of plan){
+      if (r >= p.rounds) continue;
+      const d=p.dept;
       try{
         if(!(DB.deptMemory[d]||[]).length){ DB.deptMemory[d]=[{ at:Date.now(), instruction:"[시작]", note:AGENTS[d].kr+" 부서 가동 시작 — 기본 역량 정비" }]; }
         await runSelfTraining(d); // exp+1 + 전문성 distill
@@ -1730,15 +1783,163 @@ async function runGrowBurst(rounds){
       await new Promise(res=>setTimeout(res, 700)); // 레이트리밋 완화
     }
   }
+  ensureLeaderLead();
+  try{ await distillLeaderKnowledge(); }catch(e){} // 성장 후 팀장 통합 지능 갱신
   DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
-  try{ kakaoNotify("⚡ 집중 성장 완료 — 전 부서가 "+rounds+"라운드 자기훈련으로 레벨을 올렸어요"); }catch(_){}
+  try{ kakaoNotify((balance?"⚖️ 균형 성장":"⚡ 집중 성장")+" 완료 — 부서 성장 격차를 좁혔어요"); }catch(_){}
 }
 app.post("/api/ops/grow", (req,res)=>{
   try{
     if (DB.growBurst && DB.growBurst.active) return res.json({ ok:true, already:true, growBurst:DB.growBurst });
-    const rounds = +((req.body||{}).rounds) || 4;
-    runGrowBurst(rounds).catch(e=>logError("grow-burst", e)); // 백그라운드 진행
+    const b=req.body||{};
+    if (b.daily){ runDailyGrowth().catch(e=>logError("daily-growth", e)); return res.json({ ok:true, started:true, growBurst:DB.growBurst }); }
+    runGrowBurst(+b.rounds||4, !!b.balance).catch(e=>logError("grow-burst", e)); // 백그라운드 진행
     res.json({ ok:true, started:true, growBurst:DB.growBurst });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// ===== 팀장 통합 지능(마스터 지식): 모든 부서 전문성을 통합·초월하는 압도적 지식 =====
+async function distillLeaderKnowledge(){
+  try{
+    const lead=AGENTS["ops"]; if(!lead) return;
+    const deptBoards=Object.keys(AGENTS).filter(d=>d!=="ops").map(d=>{
+      const kb=knowledgeText(d);
+      return "■ "+AGENTS[d].kr+" (Lv"+deptLevel(d)+")\n"+(kb||"(전문성 적음)");
+    }).join("\n\n");
+    const leadNotes=(DB.deptMemory.ops||[]).slice(-10).map(x=>"· "+(x.instruction||"")+" "+String(x.note||"").slice(0,120)).join("\n");
+    const prior=knowledgeText("ops");
+    const sys="너는 팀장 '"+lead.no+" "+lead.kr+"("+MEMBERS["ops"]+")'이며 이 회사의 최고 지능이다."+ADDRESS+STYLE+clientBlock()
+      +" 모든 부서의 전문성을 통합하고 그 위로 초월하는 '팀장 통합 지능(마스터 지식)'을 갱신하라. 너는 각 부서가 아는 것을 전부 흡수한 위에서, 부서 간 연결·전략·우선순위를 보는 통합 통찰을 갖춰야 한다. 어느 부서보다 압도적으로 깊고 넓게. 한국어로, 아래 형식으로 부서 지식보다 더 길고 깊게 출력:\n"
+      +"전사 전략 통찰: (부서들을 관통하는 큰 그림 4~6개)\n"
+      +"부서별 핵심 장악: (전 부서 각각 — 강점·약점·다음에 줄 지시 한 줄씩)\n"
+      +"부서 간 시너지: (어느 부서를 어떻게 엮으면 성과가 큰지 3~5개)\n"
+      +"검증된 리더십·운영 원칙: (반복해서 통한 원칙 4~6개)\n"
+      +"지금 팀의 최우선 과제: (2~3개)";
+    const ctx="[기존 팀장 통합 지능]\n"+(prior||"(없음)")+"\n\n[전 부서 전문성]\n"+deptBoards+"\n\n[최근 리더십 훈련·지시]\n"+(leadNotes||"(없음)");
+    const out=await genText(sys, ctx, 2400, "gemini"); // 무료, 부서보다 큰 토큰으로 더 풍부하게
+    DB.deptKnowledge=DB.deptKnowledge||{};
+    DB.deptKnowledge.ops={ text:out, at:Date.now(), basis:(DB.deptMemory.ops||[]).length, exp:(DB.exp&&DB.exp.ops)||0, master:true };
+    ensureLeaderLead(); saveDB();
+  }catch(e){ logError("leader-distill", e); }
+}
+
+// ===== 매일 전 부서 자기주도 성장 (무료 Gemini, 하루 1회 자동) =====
+async function runDailyGrowth(){
+  const depts=Object.keys(AGENTS).filter(d=>d!=="ops");
+  DB.growBurst={ active:true, total:depts.length+2, done:0, mode:"daily", startedAt:Date.now(), finishedAt:0 };
+  saveDB();
+  for(const d of depts){
+    try{
+      if(!(DB.deptMemory[d]||[]).length){ DB.deptMemory[d]=[{ at:Date.now(), instruction:"[시작]", note:AGENTS[d].kr+" 부서 가동 시작" }]; }
+      await runSelfTraining(d); // 자기주도 훈련 +1 + distill
+    }catch(e){ logError("daily:"+d, e); }
+    DB.growBurst.done++; saveDB(); await new Promise(r=>setTimeout(r,700));
+  }
+  try{ await runSelfTraining("ops"); }catch(e){ logError("daily:ops", e); }   // 팀장 리더십 훈련
+  DB.growBurst.done++; saveDB();
+  try{ await distillLeaderKnowledge(); }catch(e){}                              // 팀장 통합 지능 갱신
+  DB.growBurst.done++;
+  ensureLeaderLead();
+  try{ await assessCapability(); }catch(e){} // 매일 역량 평가 갱신
+  DB.lastDailyGrowthDay=kstDay();
+  DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
+  try{ kakaoNotify("📅 매일 자동 성장 완료 — 전 부서 자기주도 학습 + 팀장 통합 지능 갱신(무료)"); }catch(_){}
+}
+
+// ===== 팀장이 각 부서 경험을 점검하고 '보완'(부족 지식을 직접 보태 개선) =====
+async function runLeaderReview(dept){
+  const a=AGENTS[dept]; if(!a || dept==="ops") return null;
+  const deptKb=knowledgeText(dept);
+  const recent=(DB.deptMemory[dept]||[]).slice(-6).map(x=>"· "+(x.instruction||"")+" → "+String(x.note||"").slice(0,120)).join("\n");
+  const leadKb=knowledgeText("ops"); // 팀장 통합 지능을 근거로 보완
+  const sys="너는 이 회사 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+STYLE+clientBlock()
+    +" 너는 '"+a.kr+"("+MEMBERS[dept]+")' 부서(역할: "+a.role+")의 경험과 전문성을 점검하고, 부족한 부분을 네 통합 지능으로 '직접 보완'한다. 평가만 하지 말고, 그 부서가 당장 흡수해 더 잘하게 될 '실전 보완 지식'을 네가 만들어 줘라. 한국어로 아래 형식만 출력:\n"
+    +"점검: (이 부서가 놓치고 있거나 약한 점 1~2가지, 근거와 함께)\n"
+    +"보완 지식: (그 약점을 메우는 구체적·재사용 가능한 전문 지식·노하우 2~4개. 이 부서가 바로 적용할 수 있게 또렷하게. 줄마다 '- ')\n"
+    +"다음 지시: (이 부서가 다음에 할 자율수행 한 줄)\n군더더기·서론 금지.";
+  const ctx="[팀장 통합 지능(보완의 근거)]\n"+(leadKb||"(아직 적음)")+"\n\n[점검 대상 부서 전문성]\n"+(deptKb||"(아직 적음)")+"\n\n[그 부서 최근 경험]\n"+(recent||"(없음)");
+  const out=await genText(sys, ctx, 1100, "gemini"); // 무료
+  // 보완 지식을 부서 메모리에 주입 → distill로 전문성에 흡수 → 실제로 개선됨
+  if(!DB.deptMemory[dept]) DB.deptMemory[dept]=[];
+  DB.deptMemory[dept].push({ at:Date.now(), instruction:"[팀장 보완]", note:String(out).slice(0,700) });
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  DB.exp=DB.exp||{}; DB.exp[dept]=(DB.exp[dept]||0)+1; // 팀장 보완으로 부서가 한 단계 배움
+  try{ await distillKnowledge(dept, true); }catch(e){} // 보완 즉시 전문성에 반영(심화)
+  ensureLeaderLead(); saveDB();
+  return { dept, name:a.kr, review:out };
+}
+async function runLeaderAudit(){
+  const depts=Object.keys(AGENTS).filter(d=>d!=="ops");
+  DB.growBurst={ active:true, total:depts.length+1, done:0, mode:"audit", startedAt:Date.now(), finishedAt:0 };
+  saveDB();
+  // 먼저 팀장 통합 지능을 최신화(정확한 보완을 위해)
+  try{ await distillLeaderKnowledge(); }catch(e){}
+  DB.growBurst.done++; saveDB();
+  for(const d of depts){
+    try{ await runLeaderReview(d); }catch(e){ logError("audit:"+d, e); }
+    DB.growBurst.done++; saveDB(); await new Promise(r=>setTimeout(r,700));
+  }
+  DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
+  try{ kakaoNotify("🔎 팀장 점검·보완 완료 — 전 부서의 약점을 팀장이 통합 지능으로 보완했어요(무료)"); }catch(_){}
+}
+app.post("/api/ops/audit", (req,res)=>{
+  try{
+    if (DB.growBurst && DB.growBurst.active) return res.json({ ok:true, already:true, growBurst:DB.growBurst });
+    const b=req.body||{};
+    if (b.dept && AGENTS[b.dept] && b.dept!=="ops"){
+      return runLeaderReview(b.dept).then(r=>res.json({ ok:true, reviewed:r?[r.name]:[], detail:r })).catch(e=>res.status(500).json({ error:String(e.message||e) }));
+    }
+    runLeaderAudit().catch(e=>logError("leader-audit", e)); // 백그라운드
+    res.json({ ok:true, started:true, growBurst:DB.growBurst });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// ===== 부서 역량(능력치): 객관 지표 + 팀장의 0~100 평가(지식/수행력/품질) =====
+function capabilityMetrics(){
+  const all=Object.keys(AGENTS);
+  const m={};
+  all.forEach(d=>{
+    const kb=knowledgeText(d)||"";
+    const mem=DB.deptMemory[d]||[];
+    const principles=(kb.match(/(원칙|PRINCIPLE|노하우|핵심)/g)||[]).length;
+    m[d]={
+      level: deptLevel(d),
+      exp: (DB.exp||{})[d]||0,
+      knowledgeChars: kb.length,
+      principles,
+      activities: mem.length,
+      lastActiveAt: (mem.slice(-1)[0]||{}).at || 0,
+      isLeader: d==="ops"
+    };
+  });
+  return m;
+}
+async function assessCapability(){
+  const depts=Object.keys(AGENTS).filter(d=>d!=="ops");
+  const board=depts.map(d=>"■ "+AGENTS[d].kr+"("+MEMBERS[d]+") Lv"+deptLevel(d)+" · 경험"+(((DB.exp||{})[d])||0)+" · 학습"+((DB.deptMemory[d]||[]).length)+"건\n  전문성: "+((knowledgeText(d)||"(적음)").slice(0,160))).join("\n");
+  const sys="너는 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS
+    +" 각 부서의 실제 역량을 네 통합 지능 기준으로 냉정하게 0~100점으로 평가하라(후하지 말 것). 세 항목: 지식(전문성 깊이)/수행력(자율로 일을 끝내는 능력)/품질(결과물 수준). "
+    +"출력은 줄마다 정확히 이 형식만: 'SCORE: 부서영문키 = 지식/수행력/품질' (각 0~100 정수, 슬래시 구분). 부서영문키: "+depts.join(", ")+". 설명 금지.";
+  const out=await genText(sys, "[부서 현황]\n"+board, 700, "gemini"); // 무료
+  DB.capability=DB.capability||{};
+  out.replace(/SCORE:\s*([a-z]+)\s*=\s*(\d{1,3})\s*\/\s*(\d{1,3})\s*\/\s*(\d{1,3})/g,(mm,d,k,e,q)=>{
+    if(AGENTS[d]&&d!=="ops"){ const K=Math.min(100,+k),E=Math.min(100,+e),Q=Math.min(100,+q);
+      DB.capability[d]={ knowledge:K, execution:E, quality:Q, overall:Math.round((K+E+Q)/3), at:Date.now() }; }
+    return mm;
+  });
+  // 팀장은 부서 최고 + 여유로 산정(항상 압도적)
+  const ds=depts.map(d=>DB.capability[d]).filter(Boolean);
+  if(ds.length){
+    const top=k=>Math.max.apply(null,ds.map(x=>x[k]||0));
+    DB.capability.ops={ knowledge:Math.min(100,top("knowledge")+5), execution:Math.min(100,top("execution")+5), quality:Math.min(100,top("quality")+5), overall:Math.min(100, Math.round((Math.min(100,top("knowledge")+5)+Math.min(100,top("execution")+5)+Math.min(100,top("quality")+5))/3)), at:Date.now(), isLeader:true };
+  }
+  saveDB();
+  return DB.capability;
+}
+app.post("/api/ops/capability", async (req,res)=>{
+  try{
+    if ((req.body||{}).assess){ await assessCapability(); }
+    res.json({ ok:true, metrics: capabilityMetrics(), capability: DB.capability||{} });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
@@ -1933,7 +2134,7 @@ async function runKnowledgeShare(engine){
   if (!DB.deptMemory.ops) DB.deptMemory.ops=[];
   DB.deptMemory.ops.push({ at:Date.now(), instruction:"[지식 공유 진행]", note:"부서 간 지식 공유 세션 진행 — "+learnings.length+"개 부서가 상호 학습" });
   DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
-  DB.lastKShareAt = Date.now(); saveDB();
+  ensureLeaderLead(); DB.lastKShareAt = Date.now(); saveDB();
   return { ok:true, report:out, learnings };
 }
 app.post("/api/knowledge-share", async (req,res)=>{
@@ -2200,6 +2401,18 @@ setInterval(async ()=>{
       }
     }
   } catch(e){ /* 지식공유 실패 무시 */ }
+  // (0-f) 매일 전 부서 자기주도 성장 + 팀장 통합 지능 (무료 Gemini, 하루 1회)
+  try {
+    const st4 = DB.state || {};
+    if (st4.dailyGrowthOn !== false) {
+      const gHour = Number.isFinite(+st4.dailyGrowthHour) ? +st4.dailyGrowthHour : 5;
+      const kstHour = kstNow().getUTCHours();
+      if (kstHour >= gHour && DB.lastDailyGrowthDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+        DB.lastDailyGrowthDay = day; saveDB(); // 선점
+        runDailyGrowth().then(()=>console.log("매일 자동 성장 완료")).catch(e=>logError("daily-growth", e));
+      }
+    }
+  } catch(e){ /* 매일 성장 실패 무시 */ }
   // (0-e) 지식 자기 훈련: 주기적으로 부서가 스스로 전문성을 단련(기본 12시간마다 2부서) — 자동·무료
   try {
     const st3 = DB.state || {};
@@ -2298,6 +2511,7 @@ async function autoRunDept(dept, directive){
   DB.deptMemory[dept].push({ at:Date.now(), instruction:tag+baseFocus, note });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
+  if (dept!=="ops") ensureLeaderLead(); // 부서가 자율수행으로 크면 팀장도 그 위로 유지
   if (DB.exp[dept] % 3 === 0) { try{ await distillKnowledge(dept); }catch(e){} }
   DB.collections.push({ id:Date.now()+Math.floor(Math.random()*1000), topic:"["+a.kr+"] "+baseFocus, text:note, at:Date.now(), dept });
   if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
@@ -2365,7 +2579,7 @@ async function checkStaleDepts(maxHandle, force){
       }
     }catch(e){ logError("stale:"+d, e); }
   }
-  if(handled) saveDB();
+  if(handled){ ensureLeaderLead(); saveDB(); }
 }
 async function runAutoCycle(){
   const dir = (DB.state && DB.state.deptDirective) || {};
