@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -216,6 +216,23 @@ async function anthropic(system, user, maxTokens = 1500, images){
       DB.usageDaily.in += data.usage.input_tokens || 0;
       DB.usageDaily.out += data.usage.output_tokens || 0;
       DB.usageDaily.calls += 1;
+      // 한 달 누적(월이 바뀌면 자동 리셋)
+      const _month = _today.slice(0,7);
+      if (!DB.usageMonthly || DB.usageMonthly.month !== _month) DB.usageMonthly = { month:_month, in:0, out:0, calls:0, alerted:"" };
+      DB.usageMonthly.in += data.usage.input_tokens || 0;
+      DB.usageMonthly.out += data.usage.output_tokens || 0;
+      DB.usageMonthly.calls += 1;
+      // 월 한도 알림(설정된 경우, 한 달 1회)
+      try {
+        const st = DB.state || {};
+        const limit = +st.monthLimitKrw || 0;
+        if (limit > 0 && DB.usageMonthly.alerted !== _month) {
+          const inR=+(process.env.PRICE_IN_PER_M||3), outR=+(process.env.PRICE_OUT_PER_M||15);
+          const rate=+(st.usdKrw)||+(process.env.PRICE_USD_KRW||1540);
+          const krw=Math.round(((DB.usageMonthly.in/1e6)*inR+(DB.usageMonthly.out/1e6)*outR)*rate);
+          if (krw >= limit) { DB.usageMonthly.alerted=_month; kakaoNotify("💸 이번 달 사용액이 한도(₩"+limit.toLocaleString()+")를 넘었어요 — 현재 약 ₩"+krw.toLocaleString()+" (유료 Claude 직접지시 기준). 자동작업은 무료예요.").catch(()=>{}); }
+        }
+      } catch(_){}
     }
     let part = (data.content || []).filter(b=>b.type==="text").map(b=>b.text).join("");
     if (needSpace && part && !/^\s/.test(part)) part = " " + part;  // 이음새 공백 복원(중복 방지)
@@ -349,7 +366,7 @@ const EMB = new Map(); const EMB_CAP = 1500;
 function _embGet(k){ if(!EMB.has(k)) return null; const v=EMB.get(k); EMB.delete(k); EMB.set(k,v); return v; } // LRU 갱신
 function _embSet(k,v){ EMB.set(k,v); if(EMB.size>EMB_CAP){ EMB.delete(EMB.keys().next().value); } }
 async function geminiEmbed(text){
-  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  const key = geminiKey();
   if(!key) return null;
   const t = String(text||"").slice(0,1600); if(!t.trim()) return null;
   const cached = _embGet(t); if(cached) return cached;
@@ -598,7 +615,7 @@ async function uploadMedia(base64, mime, name){
 }
 async function generateVideo(prompt){
   // 1순위: Google Gemini(Veo) API (GEMINI_API_KEY) — 서버가 스스로 자동 생성
-  const gkey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  const gkey = geminiKey();
   if (gkey) return await generateVideoVeo(prompt, gkey);
   // 2순위: Replicate
   const token = process.env.REPLICATE_API_TOKEN;
@@ -700,14 +717,84 @@ function pcmToWavBase64(pcmB64, rate, ch, bits){
   return buf.toString("base64");
 }
 // Gemini 텍스트 생성(영상 프롬프트 등 협력용)
+// 무료 등급(429 한도) 보호: 모든 모델이 한도에 걸리면 잠깐 쉬었다 재개 (자동작업은 멈추지 않고 다음 주기에 재시도)
+let geminiCooldownUntil = 0;
+let gemini429Streak = 0;
+function geminiRateInfo(){ const now=Date.now(); return { cooling: now < geminiCooldownUntil, cooldownUntil: geminiCooldownUntil, secondsLeft: Math.max(0, Math.ceil((geminiCooldownUntil-now)/1000)), streak: gemini429Streak }; }
+function isRateErr(msg, code){ return code===429 || /quota|exhaust|RESOURCE_EXHAUSTED|rate limit|too many request|429/i.test(String(msg||"")); }
+// ===== Gemini API 사용량·비용·월예산(₩) 추적 (24시간 운용을 예산 안에서) =====
+// 무료↔유료 키 전환: 평소 무료(0원), 필요할 때만 유료 키로 (앱 토글 paidGeminiOn)
+function geminiKey(){
+  const st = DB.state || {};
+  const free = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+  const paid = process.env.GEMINI_API_KEY_PAID || "";
+  if (st.paidGeminiOn && paid) return paid;
+  return free;
+}
+function paidKeyAvailable(){ return !!process.env.GEMINI_API_KEY_PAID; }
+function paidModeOn(){ const st=DB.state||{}; return !!(st.paidGeminiOn && paidKeyAvailable()); }
+function geminiRates(){ return { inM:+(process.env.GEMINI_IN_PER_M||0.3), outM:+(process.env.GEMINI_OUT_PER_M||2.5) }; } // per 1M 토큰(USD, flash 추정)
+function geminiUsdKrw(){ const st=DB.state||{}; return +(st.usdKrw)||+(process.env.PRICE_USD_KRW||1540); }
+function geminiCostKrw(tin, tout){ const r=geminiRates(); return Math.round(((tin/1e6)*r.inM + (tout/1e6)*r.outM)*geminiUsdKrw()); }
+function recordGeminiUsage(um){
+  if(!um) return;
+  const tin = (um.promptTokenCount||0);
+  const tout = (um.candidatesTokenCount||0) + (um.thoughtsTokenCount||0); // 사고 토큰도 출력 과금
+  const today = todayStr(), month = today.slice(0,7);
+  DB.geminiUsage = DB.geminiUsage || { in:0, out:0, calls:0 };
+  DB.geminiUsage.in += tin; DB.geminiUsage.out += tout; DB.geminiUsage.calls += 1;
+  if(!DB.geminiDaily || DB.geminiDaily.date!==today) DB.geminiDaily = { date:today, in:0, out:0, calls:0 };
+  DB.geminiDaily.in += tin; DB.geminiDaily.out += tout; DB.geminiDaily.calls += 1;
+  if(!DB.geminiMonthly || DB.geminiMonthly.month!==month) DB.geminiMonthly = { month, in:0, out:0, calls:0, alerted:"", dayAlerted:"" };
+  DB.geminiMonthly.in += tin; DB.geminiMonthly.out += tout; DB.geminiMonthly.calls += 1;
+}
+function daysInMonth(){ const d=new Date(); return new Date(d.getFullYear(), d.getMonth()+1, 0).getDate(); }
+function geminiBudget(){
+  const st = DB.state || {};
+  const monthLimit = (st.geminiMonthLimitKrw!=null) ? +st.geminiMonthLimitKrw : 100000; // 기본 월 ₩100,000
+  const today = todayStr(), month = today.slice(0,7);
+  const gm = (DB.geminiMonthly && DB.geminiMonthly.month===month) ? DB.geminiMonthly : { in:0, out:0, calls:0 };
+  const gd = (DB.geminiDaily && DB.geminiDaily.date===today) ? DB.geminiDaily : { in:0, out:0, calls:0 };
+  const monthKrw = geminiCostKrw(gm.in, gm.out);
+  const dayKrw = geminiCostKrw(gd.in, gd.out);
+  // 하루 예산 = 월예산을 이 달 일수로 균등 분배 + 그날 미사용분 약간 이월(최대 2배까지 허용)
+  const dayAllow = monthLimit>0 ? Math.round(monthLimit / daysInMonth()) : 0;
+  const monthOver = monthLimit>0 && monthKrw >= monthLimit;
+  const dayOver = dayAllow>0 && dayKrw >= dayAllow*2;   // 그날 평소의 2배까지는 허용(버스트), 그 이상이면 다음날로 페이싱
+  return { monthLimit, monthKrw, dayKrw, dayAllow, monthOver, dayOver, calls:(gm.calls||0) };
+}
+// 자동작업이 Gemini를 호출해도 되는가? (월 상한 초과 OR 하루 페이싱 초과면 잠시 멈춤 — 다음 날/다음 달 자동 재개)
+function geminiAutoAllowed(){
+  if (!paidModeOn()) return true; // 무료 키 모드: 비용 0원 → 예산 가드 불필요(429 보호만 작동)
+  const b = geminiBudget();
+  if(b.monthLimit<=0) return true; // 0=무제한
+  if(b.monthOver){
+    const m = todayStr().slice(0,7);
+    if(DB.geminiMonthly && DB.geminiMonthly.alerted!==m){ DB.geminiMonthly.alerted=m; saveDB();
+      kakaoNotify("🛑 Gemini 자동작업 월 예산(₩"+b.monthLimit.toLocaleString()+") 도달 — 이번 달 자동작업을 잠시 멈췄어요(추가 과금 0). 다음 달 1일 자동 재개되며, 예산을 올리면 바로 재개돼요.").catch(()=>{});
+    }
+    return false;
+  }
+  if(b.dayOver){
+    const today = todayStr();
+    if(DB.geminiMonthly && DB.geminiMonthly.dayAlerted!==today){ DB.geminiMonthly.dayAlerted=today; saveDB();
+      kakaoNotify("⏳ 오늘 Gemini 예산 분배분(약 ₩"+(b.dayAllow*2).toLocaleString()+")을 다 써서, 예산을 고르게 쓰려고 잠시 천천히 돌려요. 내일 자동으로 평소 속도 재개돼요.").catch(()=>{});
+    }
+    return false;
+  }
+  return true;
+}
 async function geminiText(prompt, maxTok){
-  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  const key = geminiKey();
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
+  // 무료 한도 쿨다운 중이면 호출하지 않고 즉시 스킵(하머링 방지)
+  if (Date.now() < geminiCooldownUntil) throw new Error("gemini-cooldown:"+geminiRateInfo().secondsLeft+"s");
   // 살아있는 모델만 (gemini-2.0/1.5는 2026년 종료=404). 1순위 3.5 Flash → 2.5 Flash → 2.5 Flash-Lite
   const models = ["gemini-3.5-flash","gemini-2.5-flash","gemini-2.5-flash-lite"];
   const want = maxTok || 1200;
-  let lastErr=null;
+  let lastErr=null, rateHits=0, modelsTried=0;
   for (const mdl of models){
+    modelsTried++;
     // 모델별 '확장 사고' 설정 (3.x: thinkingLevel, 2.5: thinkingBudget 동적)
     let thinkCfg=null;
     if (/gemini-3/.test(mdl)) thinkCfg = { thinkingLevel: "high" };  // 3.x: 확장 사고
@@ -724,32 +811,53 @@ async function geminiText(prompt, maxTok){
         const dj = await r.json();
         if (dj.error){
           lastErr=String(dj.error.message||"");
+          const code = dj.error.code || r.status;
+          if (isRateErr(lastErr, code)){ rateHits++; break; }          // 이 모델 한도(429) → 다음 모델(별도 쿼터)로
           if (attempt===0 && thinkCfg && /think/i.test(lastErr)) continue; // 사고설정 거부 → 같은 모델, 설정 빼고 재시도
           break;                                                            // 그 외 오류 → 다음 모델
         }
         const parts = (((dj.candidates||[])[0]||{}).content||{}).parts||[];
         const text = parts.map(p=>p.text||"").join("").trim();
-        if (text) return text;
+        if (text){ gemini429Streak=0; try{ recordGeminiUsage(dj.usageMetadata); }catch(_){} return text; }
         lastErr = "빈 응답"; break;
       }catch(e){
         lastErr=String(e.message||e);
+        if (isRateErr(lastErr)){ rateHits++; break; }
         if (attempt===0 && thinkCfg && /think/i.test(lastErr)) continue;
         break;
       }
     }
   }
+  // 모든 모델이 한도(429)에 걸렸으면 잠깐 쿨다운 (무료 등급 보호 — 자동작업은 멈추지 않고 다음 주기에 재개)
+  if (rateHits>0 && rateHits>=modelsTried){
+    gemini429Streak++;
+    const mins = Math.min(10, gemini429Streak); // 연속 실패할수록 1→2→…→최대 10분
+    geminiCooldownUntil = Date.now() + mins*60000;
+    throw new Error("gemini-rate-limited(무료한도) — "+mins+"분 쉼: "+(lastErr||""));
+  }
   throw new Error("Gemini 텍스트 생성 실패: "+(lastErr||"원인 미상"));
 }
 
 // 기획안 → Veo 3.1 프롬프트(10초 구간별로 분리). Gemini 협력, 실패 시 Claude 대체.
-// 회의 등에서 엔진 선택: gemini면 Gemini(무료 한도)로 → Claude 크레딧 절약. 실패 시 1회만 Claude 폴백.
+// 회의 등에서 엔진 선택: gemini면 Gemini(무료)로 → 기본은 유료(Claude) 폴백 안 함(무료 보호).
 async function genText(system, user, maxTok, engine){
   const prompt = String(system||"") + "\n\n" + String(user||"");
   if (engine === "gemini") {
     try { return await geminiText(prompt, maxTok); }
     catch(e1){
-      try { await new Promise(r=>setTimeout(r,1200)); return await geminiText(prompt, maxTok); }
-      catch(e2){ logError("genText-gemini", e2); return await anthropic(system, user, maxTok); } // 최후 폴백(드묾)
+      const allowPaid = !!(DB.state && DB.state.allowPaidFallback);
+      // 쿨다운이 아니면 무료로 한 번 더 재시도
+      if (Date.now() >= geminiCooldownUntil) {
+        try { await new Promise(r=>setTimeout(r,1500)); return await geminiText(prompt, maxTok); }
+        catch(e2){
+          if (allowPaid) { logError("genText-gemini→claude(유료폴백 허용됨)", e2); return await anthropic(system, user, maxTok); }
+          logError("genText-gemini(무료보호: 유료폴백 안 함, 다음 주기 재시도)", e2);
+          throw e2;
+        }
+      }
+      // 무료 한도 쿨다운 중: 기본은 스킵(0원). 명시적으로 켰을 때만 유료 폴백.
+      if (allowPaid) { logError("genText-gemini→claude(쿨다운, 유료폴백 허용됨)", e1); return await anthropic(system, user, maxTok); }
+      throw e1;
     }
   }
   return await anthropic(system, user, maxTok);
@@ -769,7 +877,7 @@ async function veoPromptFromPlan(plan){
 }
 
 async function ttsGemini(text, voiceName){
-  const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  const key = geminiKey();
   if (!key) throw new Error("GEMINI_API_KEY 미설정 — 설정에서 등록하세요");
   const voice = voiceName || "Charon";
   const clean = String(text||"").replace(/[#*>_`~|]/g," ").replace(/\s+/g," ").trim().slice(0,1200);
@@ -1369,7 +1477,7 @@ app.get("/api/ping", (req,res)=>{
   const due = on && working && (Date.now() - (DB.lastCollectAt||0) >= col.everyMin*60000);
   if (due) { runAutoCycle().catch(e=>logError("ping-autocycle", e)); } // 핑이 트리거가 되어 평소 수행이 이어짐
   checkStaleDepts().catch(e=>logError("ping-stale", e)); // 서버가 깰 때마다 24h+ 정체 부서를 팀장이 점검·재지시
-  res.json({ ok:true, awake:true, keepAlive:KEEPALIVE_ON, working, autonomy:{ on, everyMin:col.everyMin||0, lastRunMinAgo:sinceMin, ranNow:!!due }, ts:Date.now() });
+  res.json({ ok:true, awake:true, keepAlive:KEEPALIVE_ON, working, autonomy:{ on, everyMin:col.everyMin||0, lastRunMinAgo:sinceMin, ranNow:!!due }, gemini:geminiRateInfo(), ts:Date.now() });
 });
 // 수동: 팀장이 지금 정체 부서를 점검해 재지시 (오피스 버튼)
 app.post("/api/ops/check-stale", async (req,res)=>{
@@ -1613,6 +1721,7 @@ app.get("/api/sync", (req,res)=>{
     lastTrainRoundAt: DB.lastTrainRoundAt || 0,
     growBurst: DB.growBurst || {active:false,total:0,done:0},
     capability: DB.capability || {},
+    pubSchedules: DB.pubSchedules || [],
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -1621,6 +1730,17 @@ app.get("/api/sync", (req,res)=>{
 });
 // 동기화 — 앱 상태 올리기(백업)
 app.post("/api/state", (req,res)=>{ DB.state = req.body||null; saveDB(); res.json({ ok:true, updatedAt:DB.updatedAt }); });
+
+// ===== 웹 백업(클라우드) 저장·불러오기 — 기기 간 수동 동기화 =====
+app.post("/api/cloud-backup", (req,res)=>{
+  try{ DB.cloudBackup = { at:Date.now(), data:(req.body&&req.body.data!==undefined)?req.body.data:(req.body||null) }; saveDB();
+    res.json({ ok:true, at:DB.cloudBackup.at }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/cloud-backup", (req,res)=>{
+  const b=DB.cloudBackup||null;
+  res.json({ ok:!!(b&&b.data), at:b?b.at:0, data:b?b.data:null });
+});
 
 // 조회
 app.get("/api/memory/:dept", (req,res)=> res.json(DB.deptMemory[req.params.dept] || []));
@@ -2143,6 +2263,19 @@ app.post("/api/knowledge-share", async (req,res)=>{
 });
 
 // 자체 점검: 서버 상태 진단 + DB 구조 자가 보완
+app.post("/api/ops/clear-errors", (req,res)=>{ try{ const n=(DB.errors||[]).length; DB.errors=[]; saveDB(); res.json({ ok:true, cleared:n }); }catch(e){ res.status(500).json({ error:String(e.message||e) }); } });
+// 환율 자동 가져오기(무료 공개 API). 실패 시 현재 설정/기본값 반환.
+app.get("/api/fxrate", async (req,res)=>{
+  try{
+    const r = await fetch("https://open.er-api.com/v6/latest/USD");
+    const j = await r.json();
+    const rate = j && j.rates && j.rates.KRW;
+    if (rate && rate>0){ res.json({ ok:true, usdKrw: Math.round(rate) }); }
+    else throw new Error("환율 데이터 없음");
+  }catch(e){
+    const st=DB.state||{}; res.json({ ok:false, usdKrw: +(st.usdKrw)||+(process.env.PRICE_USD_KRW||1540), error:String(e.message||e) });
+  }
+});
 app.get("/api/selfcheck", async (req,res)=>{
   const checks = [];
   const add = (name, ok, note)=> checks.push({ name, ok:!!ok, note:note||"" });
@@ -2163,7 +2296,7 @@ app.get("/api/selfcheck", async (req,res)=>{
     add("자율수행", on, on ? ("주기 "+col.everyMin+"분 · 근무 "+(isWorking()?"중(작동)":"외(대기)")+" · 마지막 실행 "+last) : "꺼짐 — 설정 › 자율수행 주기에서 분을 설정하세요");
   } catch(e){ add("자율수행", false, String(e.message||e).slice(0,80)); }
   add("카카오 알림", !!KAKAO_TOKEN, KAKAO_TOKEN?"연동됨":"미설정(선택)");
-  add("진짜 성우(Gemini TTS)", true, (process.env.GEMINI_API_KEY||process.env.GOOGLE_API_KEY)?("사용 가능 · 모델 "+TTS_MODEL):"GEMINI_API_KEY 미설정 — 기기 음성만 사용");
+  add("진짜 성우(Gemini TTS)", true, (geminiKey())?("사용 가능 · 모델 "+TTS_MODEL):"GEMINI_API_KEY 미설정 — 기기 음성만 사용");
 
   add("작업 기록", true, "작업 "+(DB.jobs||[]).length+"건 · 회의 "+(DB.meetings||[]).length+"건 · 자료 "+((DB.collections||[]).length)+"건");
   const memN = Object.values(DB.deptMemory||{}).reduce((a,b)=>a+(b||[]).length,0);
@@ -2171,7 +2304,7 @@ app.get("/api/selfcheck", async (req,res)=>{
   const zero = Object.keys(AGENTS).filter(d=>!((DB.deptMemory[d]||[]).length)).map(d=>AGENTS[d].kr);
   add("부서별 학습", memN>0, "총 "+memN+"건 · "+perDept + (zero.length? ("  ※ 아직 학습 0건: "+zero.join(", ")) : ""));
   const errs = (DB.errors||[]).slice(-10);
-  add("최근 오류", errs.length===0, errs.length? (errs.length+"건 (마지막: "+(errs[errs.length-1].where||"")+")") : "없음");
+  add("최근 오류", errs.length===0, errs.length? (errs.length+"건 (마지막: "+(errs[errs.length-1].where||"")+" — "+String(errs[errs.length-1].msg||"").slice(0,80)+")") : "없음");
   add("가동 시간", true, Math.floor(process.uptime()/60)+"분");
   res.json({ ok: checks.every(c=>c.ok || ["카카오 알림","영구 저장(Supabase)","최근 오류","진짜 성우(Gemini TTS)"].includes(c.name)), checks, at:Date.now() });
 });
@@ -2184,6 +2317,12 @@ app.post("/api/kakao/webhook", async (req,res)=>{
     const uid = req.body?.userRequest?.user?.id || "";
     if (ALLOWED_KAKAO.length && !ALLOWED_KAKAO.includes(uid)) {
       return res.json(kakaoText("권한이 없는 사용자입니다."));
+    }
+    // 예약 외부발행 관리 의도면 팀장(오세라)이 직접 처리
+    const isSchedCmd = /예약/.test(utter) || (/발행|게시|올려|포스팅/.test(utter) && /(매일|매주|오전|오후|\d\s*시|\d\s*건|건수|시각|시간|취소|삭제|목록|중단|정지)/.test(utter));
+    if (isSchedCmd) {
+      const out = await opsCommand(utter, "kakao");
+      return res.json(kakaoText((out && out.reply) || "예약 발행을 처리했어요."));
     }
     const job = await handleInstruction(utter, "kakao");
     const reply = job.results.map(r=>AGENTS[r.dept].no+" "+AGENTS[r.dept].kr+":\n"+r.text).join("\n\n").slice(0,1000);
@@ -2234,7 +2373,7 @@ app.post("/api/tts", async (req,res)=>{
     res.json({ ok:true, audio, mime:"audio/wav", voice:v });
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
-app.get("/api/tts/voices", (req,res)=> res.json({ map:DEPT_VOICE, enabled: !!(process.env.GEMINI_API_KEY||process.env.GOOGLE_API_KEY) }));
+app.get("/api/tts/voices", (req,res)=> res.json({ map:DEPT_VOICE, enabled: !!geminiKey() }));
 app.post("/api/generate-image", async (req,res)=>{
   try {
     const prompt = (req.body && req.body.prompt || "").trim();
@@ -2269,15 +2408,29 @@ app.post("/api/upload-video", async (req,res)=>{
 // 비용·토큰 사용량: 누적 토큰 + 예상 비용(USD)
 app.get("/api/usage", (req,res)=>{
   const u = DB.usage || { in:0, out:0, calls:0 };
-  // 단가(예시, 모델/시점에 따라 조정): 입력 $3 / 출력 $15 per 1M 토큰
+  const st = DB.state || {};
   const inRate = +(process.env.PRICE_IN_PER_M || 3), outRate = +(process.env.PRICE_OUT_PER_M || 15);
-  const costUsd = (u.in/1e6)*inRate + (u.out/1e6)*outRate;
-  const today = todayStr();
+  const usdKrw = +(st.usdKrw) || +(process.env.PRICE_USD_KRW || 1540); // 설정 환율 우선, 없으면 env, 기본 1540
+  const monthLimitKrw = +(st.monthLimitKrw) || 0; // 0 = 한도 알림 끔
+  const krw = c => Math.round(c*usdKrw);
+  const cost = x => (x.in/1e6)*inRate + (x.out/1e6)*outRate;
+  const today = todayStr(), month = today.slice(0,7);
   const pubToday = (DB.jobs||[]).filter(j=>j.type==="publish" && j.ok && new Date(j.at).toISOString().slice(0,10)===today).reduce((a,j)=>a+(j.count||1),0);
   const ud = (DB.usageDaily && DB.usageDaily.date===today) ? DB.usageDaily : { in:0, out:0, calls:0 };
-  const costToday = (ud.in/1e6)*inRate + (ud.out/1e6)*outRate;
-  res.json({ tokensIn:u.in, tokensOut:u.out, calls:u.calls, estCostUsd:+costUsd.toFixed(4), publishesToday:pubToday,
-    tokensInToday:ud.in, tokensOutToday:ud.out, callsToday:ud.calls, estCostUsdToday:+costToday.toFixed(4) });
+  const um = (DB.usageMonthly && DB.usageMonthly.month===month) ? DB.usageMonthly : { in:0, out:0, calls:0 };
+  const costAll=cost(u), costToday=cost(ud), costMonth=cost(um);
+  const krwMonth=krw(costMonth);
+  res.json({
+    tokensIn:u.in, tokensOut:u.out, calls:u.calls, estCostUsd:+costAll.toFixed(4), estCostKrw:krw(costAll),
+    tokensInToday:ud.in, tokensOutToday:ud.out, callsToday:ud.calls, estCostUsdToday:+costToday.toFixed(4), estCostKrwToday:krw(costToday),
+    tokensInMonth:um.in, tokensOutMonth:um.out, callsMonth:um.calls, estCostUsdMonth:+costMonth.toFixed(4), estCostKrwMonth:krwMonth,
+    publishesToday:pubToday, usdKrw, inRate, outRate,
+    monthLimitKrw, monthOver: (monthLimitKrw>0 && krwMonth>=monthLimitKrw),
+    monthPct: monthLimitKrw>0 ? Math.min(100, Math.round(krwMonth/monthLimitKrw*100)) : 0,
+    gemini: geminiRateInfo(), paidFallback: !!(st.allowPaidFallback),
+    geminiBudget: (function(){ const b=geminiBudget(); return { monthLimitKrw:b.monthLimit, monthKrw:b.monthKrw, dayKrw:b.dayKrw, monthPct: b.monthLimit>0?Math.min(100,Math.round(b.monthKrw/b.monthLimit*100)):0, monthOver:b.monthOver, paused:!geminiAutoAllowed(), calls:b.calls }; })(),
+    paidMode: paidModeOn(), paidGeminiOn: !!(st.paidGeminiOn), paidKeyAvailable: paidKeyAvailable()
+  });
 });
 
 // 에러 로그 조회
@@ -2363,6 +2516,7 @@ setInterval(async ()=>{
   } catch(e){ /* 감시 실패는 무시 */ }
   // (0) 예약 회의: 근무시간과 무관하게 지정 시각(KST)에 실행
   const hm = kstHHMM(), day = kstDay(), dow = kstDow(), nowMs = Date.now();
+  const autoOK = geminiAutoAllowed(); // Gemini 월 예산(₩) 안에서만 자동 지능작업 수행(초과 시 잠시 멈춤·다음날/다음달 재개)
   // (0-b) 팀장 브리핑: 아침(오늘 할 일)·저녁(오늘 한 일)·주간(한 주 종합) — 자동이므로 무료(Gemini)
   try {
     const st = DB.state || {};
@@ -2373,27 +2527,27 @@ setInterval(async ()=>{
     const kstHour = kstNow().getUTCHours();
     DB.briefDone = DB.briefDone || { morning:"", evening:"", weekly:"" };
     // 아침
-    if (morningOn && kstHour >= morningHour && DB.briefDone.morning !== day) {
+    if (autoOK && morningOn && kstHour >= morningHour && DB.briefDone.morning !== day) {
       DB.briefDone.morning = day; saveDB();
       runBriefing("morning","gemini",true).then(()=>console.log("아침 브리핑 완료")).catch(e=>logError("brief-morning", e));
     }
     // 주간 (지정 요일 + 저녁 시각 이후, 주 1회) — 저녁보다 먼저 체크
-    else if (weeklyOn && dow === weeklyDow && kstHour >= eveningHour && DB.briefDone.weekly !== weekKey()) {
+    else if (autoOK && weeklyOn && dow === weeklyDow && kstHour >= eveningHour && DB.briefDone.weekly !== weekKey()) {
       DB.briefDone.weekly = weekKey(); saveDB();
       runBriefing("weekly","gemini",true).then(()=>console.log("주간 브리핑 완료")).catch(e=>logError("brief-weekly", e));
     }
     // 저녁
-    else if (eveningOn && kstHour >= eveningHour && DB.briefDone.evening !== day) {
+    else if (autoOK && eveningOn && kstHour >= eveningHour && DB.briefDone.evening !== day) {
       DB.briefDone.evening = day; DB.lastBriefDay = day; saveDB();
       runBriefing("evening","gemini",true).then(()=>console.log("저녁 브리핑 완료")).catch(e=>logError("brief-evening", e));
     }
   } catch(e){ /* 브리핑 실패 무시 */ }
   // (0-c) 24시간+ 자율수행 정체 부서: 팀장이 감지해 학습 기반으로 재지시 (자동·무료)
-  checkStaleDepts().catch(e=>logError("stale-check", e));
+  if (autoOK) checkStaleDepts().catch(e=>logError("stale-check", e));
   // (0-d) 부서 간 지식 공유·성장 세션: 주기 자동 진행(기본 48시간마다) — 자동·무료
   try {
     const st2 = DB.state || {};
-    if (st2.kShareOn !== false) {
+    if (autoOK && st2.kShareOn !== false) {
       const everyH = Number.isFinite(+st2.kShareEveryH) ? Math.max(6, +st2.kShareEveryH) : 48;
       if (Date.now() - (DB.lastKShareAt||0) >= everyH*3600000) {
         DB.lastKShareAt = Date.now(); saveDB(); // 선점
@@ -2404,7 +2558,7 @@ setInterval(async ()=>{
   // (0-f) 매일 전 부서 자기주도 성장 + 팀장 통합 지능 (무료 Gemini, 하루 1회)
   try {
     const st4 = DB.state || {};
-    if (st4.dailyGrowthOn !== false) {
+    if (autoOK && st4.dailyGrowthOn !== false) {
       const gHour = Number.isFinite(+st4.dailyGrowthHour) ? +st4.dailyGrowthHour : 5;
       const kstHour = kstNow().getUTCHours();
       if (kstHour >= gHour && DB.lastDailyGrowthDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
@@ -2416,7 +2570,7 @@ setInterval(async ()=>{
   // (0-e) 지식 자기 훈련: 주기적으로 부서가 스스로 전문성을 단련(기본 12시간마다 2부서) — 자동·무료
   try {
     const st3 = DB.state || {};
-    if (st3.trainOn !== false) {
+    if (autoOK && st3.trainOn !== false) {
       const everyH = Number.isFinite(+st3.trainEveryH) ? Math.max(2, +st3.trainEveryH) : 12;
       if (Date.now() - (DB.lastTrainRoundAt||0) >= everyH*3600000) {
         DB.lastTrainRoundAt = Date.now(); saveDB(); // 선점
@@ -2457,6 +2611,20 @@ setInterval(async ()=>{
     catch(e){ console.error("scheduled task error", e); }
   }
   if (due.length) saveDB();
+  // (1.2) 예약 외부발행 (시각 지정, 건수·AI생성 지원, 발행은 항상 카카오 확인)
+  try {
+    const hhmm = kstHHMM(), kday = kstDay(), kdow = kstDow();
+    for (const ps of (DB.pubSchedules||[])) {
+      if (!ps || ps.disabled) continue;
+      if (ps.time !== hhmm) continue;
+      if (ps.lastRunDay === kday) continue;
+      if (Array.isArray(ps.days) && ps.days.length && ps.days.indexOf(kdow) < 0) continue;
+      ps.lastRunDay = kday;
+      if (ps.repeat === "once") ps.disabled = true;
+      try { await runScheduledPublish(ps); } catch(e){ logError("pub-schedule", e); }
+      saveDB();
+    }
+  } catch(e){ logError("pub-schedule-loop", e); }
   // (1.5) 발행 재시도 큐 (최대 3회)
   const rq = (DB.retryQueue||[]).filter(t=>t.nextAt<=Date.now());
   for (const t of rq) {
@@ -2499,14 +2667,23 @@ async function autoRunDept(dept, directive){
   // 학습된 내용을 실제로 활용해 수행 (이 부서 경험 + 타 부서 공유 기록)
   const _kb2 = knowledgeText(dept); const _lv2 = deptLevel(dept);
   sys += " (현재 Lv"+_lv2+" 숙련도)";
-  if (_kb2) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 이걸 기반으로 더 발전된 결과를 내라]\n" + _kb2;
-  if (directive){ const _rel2 = await relevantSmart(dept, directive, 3); if (_rel2) sys += "\n\n[이 지시와 비슷한 과거 작업·자료 — 재활용·갱신해 빠르게 처리]\n" + _rel2; }
-  const mem = (DB.deptMemory[dept]||[]).slice(-6).map(x=>"· "+(x.instruction?("["+x.instruction+"] "):"")+x.note).join("\n");
+  if (_kb2) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 이걸 기반으로 더 발전된 결과를 내라]\n" + String(_kb2).slice(0,1200);
+  if (directive){ try{ const _rel2 = await relevantSmart(dept, directive, 3); if (_rel2) sys += "\n\n[이 지시와 비슷한 과거 작업·자료 — 재활용·갱신해 빠르게 처리]\n" + String(_rel2).slice(0,800); }catch(_){} }
+  const mem = (DB.deptMemory[dept]||[]).slice(-6).map(x=>"· "+(x.instruction?("["+x.instruction+"] "):"")+String(x.note||"").slice(0,160)).join("\n");
   if (mem) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem;
   const cross = crossDeptMemory(dept);
-  if (cross) sys += "\n\n[다른 부서들이 최근 학습·작성한 내용 — 관련되면 활용·보완하라]\n" + cross;
+  if (cross) sys += "\n\n[다른 부서들이 최근 학습·작성한 내용 — 관련되면 활용·보완하라]\n" + String(cross).slice(0,800);
   const tag = directive ? "[자율 지시] " : (dept==="engagement" ? "[반응 수집] " : "[자율 학습] ");
-  const note = await genText(sys, directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성"), directive ? 1300 : 900, "gemini"); // 자동 주기 = 항상 무료(Gemini)
+  // 자동 주기는 '무료 전용' — Gemini만(유료 Anthropic 폴백 없음). 실패하면 오류로 쌓지 말고 다음 주기에 재시도.
+  let note;
+  try {
+    const userLine = directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성");
+    note = await geminiText(sys + "\n\n" + userLine, directive ? 1300 : 900);
+  } catch(e) {
+    console.warn("[autoRunDept "+dept+"] Gemini 실패 — 이번 주기 건너뜀(다음에 재시도):", String((e&&e.message)||e));
+    return; // 무료 전용: 폴백 없이 조용히 건너뜀(오류 누적 방지)
+  }
+  if (!note || !String(note).trim()) { console.warn("[autoRunDept "+dept+"] 빈 응답 — 건너뜀"); return; }
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:tag+baseFocus, note });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
@@ -2582,6 +2759,7 @@ async function checkStaleDepts(maxHandle, force){
   if(handled){ ensureLeaderLead(); saveDB(); }
 }
 async function runAutoCycle(){
+  if (!geminiAutoAllowed()) return; // Gemini 월 예산 초과/하루 페이싱 → 자동수행 잠시 멈춤(다음 주기 재개)
   const dir = (DB.state && DB.state.deptDirective) || {};
   const allIds = Object.keys(AGENTS);
   const dirDepts = allIds.filter(d => dir[d] && String(dir[d]).trim());
@@ -2596,12 +2774,115 @@ async function runAutoCycle(){
   DB.lastCollectAt = Date.now(); saveDB();
 }
 
+// ===== 예약 외부발행 (시각 지정 · 건수 · AI 자동생성 · 발행 시 카카오 확인) =====
+const PUB_PLATFORMS = ["유튜브","인스타그램","블로그","홈페이지"];
+async function runScheduledPublish(ps){
+  const platforms = (ps.platforms||[]).filter(p=>PUB_PLATFORMS.includes(p));
+  if(!platforms.length) return;
+  const count = Math.max(1, Math.min(5, +ps.count||1));
+  const safety = (DB.state && DB.state.safety) || {};
+  for(let i=0;i<count;i++){
+    let content;
+    if(ps.autoGen){
+      let text;
+      try{
+        const a = AGENTS["creation"];
+        const sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+profileContext()
+          + " 아래 주제로 "+platforms.join("·")+"에 바로 올릴 게시물 캡션/설명을 한국어로 1개 작성하라. 적절한 해시태그 포함, 간결하고 매력적으로. 군더더기·머리말 없이 본문만 출력.";
+        text = await genText(sys, "[주제] "+(ps.topic||ps.caption||(a.kr+" 분야"))+"\n(이번이 "+(i+1)+"/"+count+"번째 — 이전과 다른 각도로)", 600, "gemini");
+      }catch(e){ text = ps.caption || ps.topic || ""; }
+      content = { description:text, caption:text, autoGen:true };
+    } else {
+      content = { description:ps.caption, caption:ps.caption };
+    }
+    try{
+      if(safety.requireApproval){ await publish(content, platforms); }
+      else { const id=Date.now()+i, code=randCode(); DB.approvals.push({ id, code, content, platforms, status:"pending", at:id, scheduled:true }); await kakaoApprovalRequest(content, platforms, id, code); }
+    }catch(e){ logError("scheduled-publish-item", e); }
+  }
+  kakaoNotify("⏰ 예약 발행 시간 — "+platforms.join(", ")+" "+count+"건"+(ps.autoGen?" (AI 자동생성)":"")+" · 카카오로 진행 확인을 보냈어요. ✅승인 시 발행됩니다.").catch(()=>{});
+  saveDB();
+}
+function pubSchedSummary(){
+  const arr=(DB.pubSchedules||[]);
+  if(!arr.length) return "(현재 예약된 발행 없음)";
+  return arr.map(p=>"· "+p.time+" "+(p.repeat==="once"?"한번":"매일")+" "+(p.platforms||[]).join(",")+" "+((+p.count>1)?(p.count+"건 "):"")+(p.autoGen?("[AI생성:"+(p.topic||"")+"] "):(String(p.caption||"").slice(0,24)))+(p.disabled?" (정지)":"")).join("\n");
+}
+// 팀장(오세라) 운영 명령: 예약 외부발행을 직접 관리 (개발 지시와 동급 권한·책임)
+async function opsCommand(instruction, source){
+  const lead = AGENTS["ops"];
+  const sys = "너는 이 SNS 자동화 플랫폼의 팀장 '"+lead.no+" "+lead.kr+"("+MEMBERS["ops"]+")' AI다. 너에게는 '시간 예약 외부발행'을 직접 생성·수정·삭제할 권한과 수행 책임이 있다(플랫폼 개발 지시와 동급의 권한)."+ADDRESS+clientBlock()
+    + " 사용 가능한 플랫폼은 다음뿐: "+PUB_PLATFORMS.join(", ")+".\n현재 예약 목록:\n"+pubSchedSummary()+"\n\n"
+    + "클라이언트님의 지시를 해석해 예약을 관리하라. 반드시 아래 JSON 하나만 출력(마크다운 펜스·설명 금지):\n"
+    + '{"action":"create|delete|clear|list|none","schedules":[{"time":"HH:MM","platforms":["인스타그램"],"repeat":"daily|once","count":1,"autoGen":false,"topic":"","caption":""}],"deleteTimes":["HH:MM"],"reply":"클라이언트께 자연스럽게 보고할 한국어 문장"}\n'
+    + "규칙: time은 24시간 HH:MM(KST). count=한 번에 발행할 건수(1~5). autoGen=true면 caption 대신 topic으로 매번 AI가 새로 생성해 발행. 내용이 정해졌으면 caption에 넣어라. '몇 건' '하루 N번' 같은 표현은 count로. 모호하면 합리적으로 가정하고 reply에 밝혀라. 발행은 시각이 되면 카카오 승인을 거친다는 점을 reply에 자연스럽게 알려라.";
+  let raw;
+  try{ raw = await geminiText(sys+"\n\n[클라이언트 지시]\n"+instruction, 1200); }
+  catch(e){ try{ raw = await genText(sys, "[클라이언트 지시]\n"+instruction, 1200, "gemini"); }catch(e2){ return { ok:false, reply:"지금 지시를 처리하지 못했어요. 잠시 후 다시 시도해 주세요." }; } }
+  let plan; try{ plan = JSON.parse(String(raw).replace(/```json|```/g,"").trim()); }
+  catch(e){ return { ok:false, reply:"지시를 정확히 이해하지 못했어요. 예: '매일 오전 9시 인스타그램에 3건 자동생성으로 예약 발행해줘'" }; }
+  DB.pubSchedules = DB.pubSchedules || [];
+  let created=0, deleted=0;
+  if(plan.action==="clear"){ deleted=DB.pubSchedules.length; DB.pubSchedules=[]; }
+  if(Array.isArray(plan.deleteTimes)&&plan.deleteTimes.length){ const b=DB.pubSchedules.length; DB.pubSchedules=DB.pubSchedules.filter(p=>!plan.deleteTimes.includes(p.time)); deleted+=b-DB.pubSchedules.length; }
+  if(plan.action==="create" && Array.isArray(plan.schedules)){
+    for(const s of plan.schedules){
+      const time=String(s.time||"").trim(); if(!/^\d{2}:\d{2}$/.test(time)) continue;
+      const platforms=(Array.isArray(s.platforms)?s.platforms:[]).filter(p=>PUB_PLATFORMS.includes(p));
+      if(!platforms.length) continue;
+      const autoGen=!!s.autoGen, caption=String(s.caption||"").trim(), topic=String(s.topic||"").trim();
+      if(!autoGen && !caption) continue;
+      if(autoGen && !topic && !caption) continue;
+      DB.pubSchedules.push({ id:Date.now()+Math.floor(Math.random()*1000), time, platforms, caption, topic, autoGen, count:Math.max(1,Math.min(5,+s.count||1)), repeat:(s.repeat==="once"?"once":"daily"), days:[], disabled:false, lastRunDay:"", at:Date.now(), by:"ops" });
+      created++;
+    }
+  }
+  if(created||deleted) saveDB();
+  const reply = String(plan.reply||"").trim() || ("예약 "+created+"건 등록, "+deleted+"건 삭제 완료했어요.");
+  return { ok:true, reply, created, deleted, schedules:DB.pubSchedules };
+}
+app.post("/api/ops/command", async (req,res)=>{
+  try{ const instruction=String((req.body||{}).instruction||"").trim();
+    if(!instruction) return res.status(400).json({ error:"instruction 필요" });
+    res.json(await opsCommand(instruction, "app"));
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
 // 예약 작업 등록: { instruction, runAt(ms) }
 app.post("/api/schedule", (req,res)=>{
   const { instruction, runAt } = req.body||{};
   if(!instruction) return res.status(400).json({error:"instruction 필요"});
   DB.scheduled.push({ id:Date.now(), instruction, runAt:runAt||Date.now(), done:false }); saveDB();
   res.json({ ok:true });
+});
+
+// ===== 예약 외부발행(시각 지정, 발행 시 카카오 확인) =====
+app.get("/api/publish-schedules", (req,res)=> res.json(DB.pubSchedules||[]));
+app.post("/api/publish-schedule", (req,res)=>{
+  const b = req.body||{};
+  const time = String(b.time||"").trim();
+  if(!/^\d{2}:\d{2}$/.test(time)) return res.status(400).json({ error:"time은 HH:MM 형식이어야 해요" });
+  const platforms = (Array.isArray(b.platforms)?b.platforms:[]).filter(p=>PUB_PLATFORMS.includes(p));
+  if(!platforms.length) return res.status(400).json({ error:"플랫폼을 1개 이상 선택하세요" });
+  const autoGen = !!b.autoGen;
+  const caption = String(b.caption||"").trim();
+  const topic = String(b.topic||"").trim();
+  if(!autoGen && !caption) return res.status(400).json({ error:"발행할 내용을 입력하세요" });
+  if(autoGen && !topic && !caption) return res.status(400).json({ error:"AI 자동생성에는 주제를 입력하세요" });
+  const count = Math.max(1, Math.min(5, +b.count||1));
+  const item = { id:Date.now(), time, platforms, caption, topic, autoGen, count, repeat:(b.repeat==="once"?"once":"daily"), days:Array.isArray(b.days)?b.days:[], disabled:false, lastRunDay:"", at:Date.now() };
+  DB.pubSchedules = DB.pubSchedules||[]; DB.pubSchedules.push(item); saveDB();
+  res.json({ ok:true, schedules:DB.pubSchedules });
+});
+app.post("/api/publish-schedule/delete", (req,res)=>{
+  const id = (req.body||{}).id;
+  DB.pubSchedules = (DB.pubSchedules||[]).filter(x=>x.id!==id); saveDB();
+  res.json({ ok:true, schedules:DB.pubSchedules });
+});
+app.post("/api/publish-schedule/toggle", (req,res)=>{
+  const id = (req.body||{}).id;
+  (DB.pubSchedules||[]).forEach(x=>{ if(x.id===id) x.disabled=!x.disabled; }); saveDB();
+  res.json({ ok:true, schedules:DB.pubSchedules });
 });
 
 const PORT = process.env.PORT || 3000;
