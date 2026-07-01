@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -1717,6 +1717,9 @@ app.get("/api/sync", (req,res)=>{
     clientProfile: DB.clientProfile || {text:"",at:0},
     briefings: (DB.briefings||[]).filter(b=>b.at>since),
     leadDirectives: (DB.leadDirectives||[]).filter(x=>x.at>since),
+    leaderDailyDirective: DB.leaderDailyDirective || {},
+    dailyReview: DB.dailyReview || {},
+    nightResearch: DB.nightResearch || {},
     lastTrainAt: DB.lastTrainAt || {},
     lastTrainRoundAt: DB.lastTrainRoundAt || 0,
     growBurst: DB.growBurst || {active:false,total:0,done:0},
@@ -1944,6 +1947,158 @@ async function distillLeaderKnowledge(){
 }
 
 // ===== 매일 전 부서 자기주도 성장 (무료 Gemini, 하루 1회 자동) =====
+// ===== 퇴근 시각: 팀장(오세라)이 그날 각 부서의 자율수행 결과를 평가·학습 → 다음날 지시에 반영 =====
+async function runDailyReview(){
+  const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
+  const ldd = DB.leaderDailyDirective||{};
+  const today = kstDay();
+  const board = depts.map(d=>{
+    const assigned = (ldd[d]&&ldd[d].text) ? ldd[d].text : "(오늘 배정된 지시 없음)";
+    const mm = DB.deptMemory[d]||[];
+    const todays = mm.filter(x=> x.at && (Date.now()-x.at < 20*3600000)).slice(-6);
+    const acts = todays.length ? todays.map(x=>"· "+String(x.instruction||"").slice(0,18)+": "+String(x.note||"").slice(0,130)).join("\n") : "(오늘 활동 기록 없음)";
+    return "■ "+d+" "+AGENTS[d].kr+"("+MEMBERS[d]+")\n  오늘 지시: "+assigned+"\n  오늘 한 일:\n"+acts;
+  }).join("\n\n");
+  const sys = "너는 이 SNS 자동화 회사 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()
+    + " 지금은 퇴근 시각이다. 오늘 각 부서가 자율수행한 결과를 냉정하게 회고하라(후하지 말 것). 각 부서에 대해: ①오늘 지시를 얼마나 잘 수행했는지 등급(상/중/하), ②그 부서가 내일 더 잘하도록 흡수할 '보완 지식' 1가지(구체적·재사용 가능, 막연한 격려 금지), ③그것을 반영한 '내일의 자율수행 지시' 한 줄(25~55자, 오늘의 부족을 메우거나 잘한 것을 발전).\n"
+    + "반드시 아래 형식의 줄만 출력(설명·머리말 금지, 한 부서당 한 줄):\n"
+    + "REVIEW: 부서영문키 | 등급 | 보완지식 | 내일지시\n대상 부서영문키: "+depts.join(", ");
+  let out;
+  try{ out = await genText(sys, "[부서별 오늘 결과]\n"+board, 1400, "gemini"); } // 무료
+  catch(e){ logError("daily-review", e); return null; }
+  DB.dailyReview = DB.dailyReview || {};
+  const now = Date.now();
+  let n=0, gradeSum={상:0,중:0,하:0};
+  for(const line of String(out).split(/\n+/)){
+    const m = line.match(/REVIEW:\s*([a-z]+)\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*(.+)$/);
+    if(!m) continue;
+    const d=m[1].trim(); if(!AGENTS[d]||d==="ops") continue;
+    const grade=String(m[2]||"").trim().replace(/[^상중하]/g,"").charAt(0)||"중";
+    const improve=String(m[3]||"").trim().slice(0,200);
+    const tomorrow=String(m[4]||"").trim().replace(/^["'“]|["'”]$/g,"").slice(0,120);
+    DB.dailyReview[d]={ grade, improve, tomorrow, at:now, day:today };
+    if(gradeSum[grade]!=null) gradeSum[grade]++;
+    if(improve){
+      DB.deptMemory[d]=DB.deptMemory[d]||[];
+      DB.deptMemory[d].push({ at:now, instruction:"[팀장 회고]", note:"오늘 회고("+grade+"): "+improve+(tomorrow?(" / 내일: "+tomorrow):"") });
+      if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+      DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+      if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
+    }
+    n++;
+  }
+  DB.lastReviewDay = today;
+  ensureLeaderLead(); saveDB();
+  if(n>0){
+    const s = "🌙 퇴근 회고 완료 — 오세라가 오늘 "+n+"개 부서를 평가했어요 (상 "+gradeSum.상+" · 중 "+gradeSum.중+" · 하 "+gradeSum.하+"). 보완점을 학습해 내일 지시에 반영해요.";
+    kakaoNotify(s).catch(()=>{});
+  }
+  return DB.dailyReview;
+}
+app.post("/api/ops/daily-review", async (req,res)=>{
+  try{ const r = await runDailyReview(); res.json({ ok:!!r, dailyReview: DB.dailyReview||{} }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// ===== 야간: 팀장이 각 부서의 '내일'을 위해 밤새 연구·학습·자료 수집 (아침 지시의 근거) =====
+async function runNightResearch(){
+  const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
+  const rev = DB.dailyReview||{};
+  const board = depts.map(d=>{
+    const a=AGENTS[d];
+    const r=rev[d];
+    const dir = r&&r.tomorrow ? r.tomorrow : "(내일 방향 미정 — 역할 기반으로)";
+    const weak = r&&r.improve ? r.improve : "";
+    const kb=(knowledgeText(d)||"").slice(0,120);
+    return "■ "+d+" "+a.kr+"("+MEMBERS[d]+") — 역할: "+String(a.role||"").slice(0,60)+"\n  내일 방향: "+dir+(weak?("\n  보완 필요: "+weak):"")+"\n  현재 전문성: "+(kb||"(적음)");
+  }).join("\n\n");
+  const sys = "너는 이 SNS 자동화 회사 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()+profileContext()
+    + " 지금은 밤이다. 내일 각 부서가 최고의 결과를 내도록, 부서별로 '내일 방향'에 딱 맞는 실전 리서치·자료를 네가 밤새 조사해 정리해 준다. 각 부서에 대해: 내일 과제에 바로 활용할 수 있는 ①핵심 트렌드/인사이트 ②구체적 아이디어·앵글 2가지 ③참고할 포맷/사례 요령 — 을 압축해서 줘라. 일반론·격려 금지, 그 부서가 내일 즉시 쓸 수 있는 실무 자료로.\n"
+    + "반드시 아래 형식의 줄만 출력(한 부서당 한 줄, 설명·머리말 금지):\n"
+    + "RESEARCH: 부서영문키 | 내일 쓸 리서치 요약(120자 내외, 세미콜론으로 항목 구분)\n대상 부서영문키: "+depts.join(", ");
+  let out;
+  try{ out = await genText(sys, "[부서별 내일 방향]\n"+board, 1500, "gemini"); } // 무료
+  catch(e){ logError("night-research", e); return null; }
+  DB.nightResearch = DB.nightResearch || {};
+  const now=Date.now(), today=kstDay();
+  let n=0;
+  for(const line of String(out).split(/\n+/)){
+    const m = line.match(/RESEARCH:\s*([a-z]+)\s*\|\s*(.+)$/);
+    if(!m) continue;
+    const d=m[1].trim(); if(!AGENTS[d]||d==="ops") continue;
+    const brief=String(m[2]||"").trim().slice(0,300);
+    if(!brief) continue;
+    DB.nightResearch[d]={ text:brief, at:now, day:today };
+    // 야간 연구를 부서 메모리에 넣어 두면 그 부서가 다음 자율수행에서 참고 + distill로 흡수
+    DB.deptMemory[d]=DB.deptMemory[d]||[];
+    DB.deptMemory[d].push({ at:now, instruction:"[야간 연구]", note:"팀장 리서치 브리핑: "+brief });
+    if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+    n++;
+  }
+  DB.lastNightResearchDay = today;
+  saveDB();
+  if(n>0) kakaoNotify("🌌 야간 연구 완료 — 오세라가 밤새 "+n+"개 부서의 내일 자료를 조사·정리했어요. 아침 지시에 반영돼요.").catch(()=>{});
+  return DB.nightResearch;
+}
+app.post("/api/ops/night-research", async (req,res)=>{
+  try{ const r = await runNightResearch(); res.json({ ok:!!r, nightResearch: DB.nightResearch||{} }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// ===== 팀장(오세라)이 매일 각 부서에 "오늘의 자율수행 지시"를 직접 배정 =====
+// (개발지시 없는 부서가 빈 지시로 방치되지 않도록, 팀장이 매일 구체적 과제를 내림)
+async function assignDailyDirectives(){
+  const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
+  // 아침 지시 전, 밤새 연구가 아직이면 먼저 연구·수집을 끝낸다(연구 → 지시 순서 보장)
+  if (DB.lastNightResearchDay !== kstDay()){ try{ await runNightResearch(); }catch(e){ logError("assign:night", e); } }
+  const cap = DB.capability||{};
+  const rev = DB.dailyReview||{};
+  const nr = DB.nightResearch||{};
+  const board = depts.map(d=>{
+    const lv = deptLevel(d), exp=(DB.exp||{})[d]||0;
+    const kb = (knowledgeText(d)||"").slice(0,140);
+    const mm = DB.deptMemory[d]||[]; const last = mm.slice(-1)[0];
+    const lastTxt = last ? String(last.instruction||last.note||"").slice(0,50) : "(활동 없음)";
+    const c = cap[d];
+    const score = c ? ("역량 "+c.overall+"(지식"+c.knowledge+"/수행"+c.execution+"/품질"+c.quality+")") : "역량 미평가";
+    const r = rev[d];
+    const yreview = r ? ("\n  어제 회고: 등급 "+r.grade+(r.tomorrow?(" · 내일방향: "+r.tomorrow):"")+(r.improve?(" · 보완: "+String(r.improve).slice(0,60)):"")) : "";
+    const research = (nr[d]&&nr[d].text) ? ("\n  밤새 연구: "+String(nr[d].text).slice(0,160)) : "";
+    return "■ "+AGENTS[d].kr+"("+MEMBERS[d]+") Lv"+lv+" · 경험"+exp+" · "+score+"\n  최근: "+lastTxt+"\n  전문성: "+(kb||"(적음)")+yreview+research;
+  }).join("\n");
+  const sys = "너는 이 SNS 자동화 회사 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()
+    + " 오늘 하루 각 부서가 스스로 수행할 '구체적이고 실행 가능한' 자율수행 과제를 하나씩 내려라. 막연한 지시(예: '열심히 하세요', '트렌드를 학습하세요') 금지 — 그 부서 역할과 현재 역량(약한 항목)에 맞춰, 오늘 바로 결과물이 나올 수 있는 실무 지시로. **어제 회고의 '내일방향·보완점'과 네가 밤새 조사한 '밤새 연구' 자료를 반드시 이어받아 구체화하라**(연구한 트렌드·아이디어를 지시에 녹여라). 역량이 낮거나 최근 활동이 없는 부서는 우선 기초를 다지는 과제를, 역량이 높은 부서는 더 심화된 과제를 내려라.\n"
+    + "반드시 아래 형식의 줄만 출력(설명·머리말 금지):\nDIRECTIVE: 부서영문키 = 오늘의 지시(한국어 1문장, 25~60자)\n대상 부서영문키: "+depts.join(", ");
+  let out;
+  try{ out = await genText(sys, "[부서 현황]\n"+board, 900, "gemini"); } // 무료
+  catch(e){ logError("assign-daily-directives", e); return null; }
+  DB.leaderDailyDirective = DB.leaderDailyDirective || {};
+  const day = kstDay(), now = Date.now();
+  let n=0;
+  String(out).replace(/DIRECTIVE:\s*([a-z]+)\s*=\s*(.+)/g,(mm,d,txt)=>{
+    d=d.trim();
+    if(AGENTS[d] && d!=="ops"){
+      const clean = String(txt||"").trim().replace(/^["'“]|["'”]$/g,"").slice(0,140);
+      if(clean){
+        DB.leaderDailyDirective[d] = { text:clean, at:now, day };
+        DB.leadDirectives = DB.leadDirectives||[];
+        DB.leadDirectives.push({ dept:d, directive:clean, reason:"일일 자율수행 지시(오세라)", at:now });
+        if(DB.leadDirectives.length>60) DB.leadDirectives=DB.leadDirectives.slice(-60);
+        n++;
+      }
+    }
+    return mm;
+  });
+  DB.lastLeaderDirectDay = day;
+  saveDB();
+  if(n>0) kakaoNotify("🧭 오늘의 팀장 지시 배정 완료 — "+n+"개 부서에 오늘의 자율수행 과제를 내렸어요.").catch(()=>{});
+  return DB.leaderDailyDirective;
+}
+app.post("/api/ops/daily-directives", async (req,res)=>{
+  try{ const r = await assignDailyDirectives(); res.json({ ok:!!r, leaderDailyDirective: DB.leaderDailyDirective||{} }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
 async function runDailyGrowth(){
   const depts=Object.keys(AGENTS).filter(d=>d!=="ops");
   DB.growBurst={ active:true, total:depts.length+2, done:0, mode:"daily", startedAt:Date.now(), finishedAt:0 };
@@ -1961,6 +2116,7 @@ async function runDailyGrowth(){
   DB.growBurst.done++;
   ensureLeaderLead();
   try{ await assessCapability(); }catch(e){} // 매일 역량 평가 갱신
+  try{ await assignDailyDirectives(); }catch(e){ logError("daily-growth:assign", e); } // 팀장이 매일 각 부서에 구체 지시 배정
   DB.lastDailyGrowthDay=kstDay();
   DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
   try{ kakaoNotify("📅 매일 자동 성장 완료 — 전 부서 자기주도 학습 + 팀장 통합 지능 갱신(무료)"); }catch(_){}
@@ -2542,6 +2698,26 @@ setInterval(async ()=>{
       runBriefing("evening","gemini",true).then(()=>console.log("저녁 브리핑 완료")).catch(e=>logError("brief-evening", e));
     }
   } catch(e){ /* 브리핑 실패 무시 */ }
+  // (0-b2) 퇴근 회고: 저녁 시각(briefHour) 이후 하루 1회 — 팀장이 각 부서 오늘 자율수행을 평가·학습 → 다음날 지시에 반영
+  try {
+    const st5 = DB.state || {};
+    const endHour = Number.isFinite(+st5.briefHour) ? +st5.briefHour : 21;
+    const kstHour2 = kstNow().getUTCHours();
+    if (autoOK && kstHour2 >= endHour && DB.lastReviewDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+      DB.lastReviewDay = day; saveDB(); // 선점
+      runDailyReview().then(()=>console.log("퇴근 회고 완료")).catch(e=>logError("daily-review", e));
+    }
+  } catch(e){ /* 회고 실패 무시 */ }
+  // (0-f0) 야간 연구: 아침 지시(≥6시) 전 심야~새벽에 팀장이 내일 자료를 조사(무료). 하루 1회.
+  try {
+    if (autoOK && DB.lastNightResearchDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+      const kh = kstNow().getUTCHours();
+      if (kh < 6) { // 자정~새벽 5시대 (아침 지시 배정 전)
+        DB.lastNightResearchDay = day; saveDB(); // 선점
+        runNightResearch().then(()=>console.log("야간 연구 완료")).catch(e=>logError("night-research", e));
+      }
+    }
+  } catch(e){ /* 야간 연구 실패 무시 */ }
   // (0-c) 24시간+ 자율수행 정체 부서: 팀장이 감지해 학습 기반으로 재지시 (자동·무료)
   if (autoOK) checkStaleDepts().catch(e=>logError("stale-check", e));
   // (0-d) 부서 간 지식 공유·성장 세션: 주기 자동 진행(기본 48시간마다) — 자동·무료
@@ -2567,6 +2743,16 @@ setInterval(async ()=>{
       }
     }
   } catch(e){ /* 매일 성장 실패 무시 */ }
+  // (0-f2) 팀장의 매일 자율수행 지시 배정 — 자동성장이 꺼져 있어도 독립적으로 매일 보장
+  try {
+    if (autoOK && DB.lastLeaderDirectDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+      const kstHour2 = kstNow().getUTCHours();
+      if (kstHour2 >= 6) { // 새벽 6시 이후, 하루 한 번
+        DB.lastLeaderDirectDay = day; saveDB(); // 선점
+        assignDailyDirectives().then(()=>console.log("팀장 일일 지시 배정 완료")).catch(e=>logError("daily-directives", e));
+      }
+    }
+  } catch(e){ /* 일일 지시 실패 무시 */ }
   // (0-e) 지식 자기 훈련: 주기적으로 부서가 스스로 전문성을 단련(기본 12시간마다 2부서) — 자동·무료
   try {
     const st3 = DB.state || {};
@@ -2744,6 +2930,8 @@ async function checkStaleDepts(maxHandle, force){
       const dir=await leaderDirectiveFor(d);
       if(dir){
         DB.state=DB.state||{}; DB.state.deptDirective=DB.state.deptDirective||{}; DB.state.deptDirective[d]=dir;
+        DB.leaderDailyDirective = DB.leaderDailyDirective || {};
+        DB.leaderDailyDirective[d] = { text:dir, at:now, day:kstDay() };
         DB.leadDirectives.push({ dept:d, directive:dir, reason:"24시간+ 자율수행 정체 — 팀장이 학습 기반으로 재지시", at:now, lastActiveAt:lastAt });
         if(DB.leadDirectives.length>40) DB.leadDirectives=DB.leadDirectives.slice(-40);
         // 재지시를 '활동'으로 즉시 기록 → 정체(마지막 활동 기준)가 바로 풀림 (autoRun 실패/지연과 무관)
@@ -2769,7 +2957,9 @@ async function runAutoCycle(){
     DB.learnIdx = (DB.learnIdx||0) % noDir.length;
     const d = noDir[DB.learnIdx];
     DB.learnIdx = (DB.learnIdx + 1) % noDir.length;
-    try { await autoRunDept(d, ""); } catch(e){ logError("auto-learn:"+d, e); }
+    const ldd = DB.leaderDailyDirective || {};
+    const leaderInst = (ldd[d] && ldd[d].text) ? String(ldd[d].text).trim() : "";
+    try { await autoRunDept(d, leaderInst); } catch(e){ logError("auto-learn:"+d, e); }
   }
   DB.lastCollectAt = Date.now(); saveDB();
 }
