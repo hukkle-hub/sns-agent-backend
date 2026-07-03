@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -784,6 +784,40 @@ function geminiAutoAllowed(){
   }
   return true;
 }
+// ===== 팀장 전용: 실시간 구글검색(grounding)으로 전 세계 공개 웹 자료 수집 =====
+function searchesToday(){ const t=todayStr(); return (DB.geminiSearchDaily && DB.geminiSearchDaily.date===t) ? DB.geminiSearchDaily.n : 0; }
+function noteSearch(){ const t=todayStr(); if(!DB.geminiSearchDaily || DB.geminiSearchDaily.date!==t) DB.geminiSearchDaily={date:t,n:0}; DB.geminiSearchDaily.n++; DB.geminiSearchTotal=(DB.geminiSearchTotal||0)+1; }
+// 하루 검색 상한(폭주·과금 방지): 무료 5회 / 유료 40회
+function searchDailyCap(){ return paidModeOn() ? 40 : 5; }
+function searchAllowedNow(){ return searchesToday() < searchDailyCap(); }
+async function geminiSearch(prompt, maxTok){
+  const key = geminiKey();
+  if (!key) throw new Error("GEMINI_API_KEY 미설정");
+  if (Date.now() < geminiCooldownUntil) throw new Error("gemini-cooldown");
+  if (!searchAllowedNow()) throw new Error("search-daily-cap");
+  const models = ["gemini-2.5-flash","gemini-3.5-flash"]; // 구글검색 grounding 지원 모델
+  const want = maxTok || 1400;
+  let lastErr=null;
+  for (const mdl of models){
+    try{
+      const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
+      const body = { contents:[{ parts:[{ text: prompt }] }], tools:[{ google_search:{} }], generationConfig:{ maxOutputTokens: want } };
+      const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
+      const dj = await r.json();
+      if (dj.error){ lastErr=String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(lastErr,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
+      const cand = (dj.candidates||[])[0]||{};
+      const parts = (cand.content||{}).parts||[];
+      const text = parts.map(p=>p.text||"").join("").trim();
+      const gmeta = cand.groundingMetadata || {};
+      const chunks = gmeta.groundingChunks || [];
+      const sources = chunks.map(c=> (c && c.web) ? { title:String(c.web.title||"").slice(0,80), uri:c.web.uri } : null).filter(Boolean).slice(0,8);
+      if (text){ noteSearch(); try{ recordGeminiUsage(dj.usageMetadata); }catch(_){} return { text, sources }; }
+      lastErr = "빈 응답";
+    }catch(e){ lastErr=String(e.message||e); }
+  }
+  throw new Error("gemini-search 실패: "+(lastErr||"원인 미상"));
+}
+
 async function geminiText(prompt, maxTok){
   const key = geminiKey();
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
@@ -1720,6 +1754,7 @@ app.get("/api/sync", (req,res)=>{
     leaderDailyDirective: DB.leaderDailyDirective || {},
     dailyReview: DB.dailyReview || {},
     nightResearch: DB.nightResearch || {},
+    leaderReport: buildLeaderReport(),
     lastTrainAt: DB.lastTrainAt || {},
     lastTrainRoundAt: DB.lastTrainRoundAt || 0,
     growBurst: DB.growBurst || {active:false,total:0,done:0},
@@ -1995,6 +2030,42 @@ async function runDailyReview(){
   }
   return DB.dailyReview;
 }
+// 팀장에게 하루 전체를 맡김: 회고 → 야간연구 → 아침지시 → 역량평가를 순서대로 한 번에
+app.post("/api/ops/run-all", async (req,res)=>{
+  const done=[];
+  try{
+    try{ await runDailyReview(); done.push("review"); }catch(e){ logError("runall-review", e); }
+    try{ await runNightResearch(); done.push("research"); }catch(e){ logError("runall-research", e); }
+    try{ await assignDailyDirectives(); done.push("directives"); }catch(e){ logError("runall-directives", e); }
+    try{ await assessCapability(); done.push("capability"); }catch(e){ logError("runall-capability", e); }
+    res.json({ ok:true, done, leaderReport: buildLeaderReport() });
+  }catch(e){ res.status(500).json({ error:String(e.message||e), done }); }
+});
+// 팀장 보고 요약: 오늘 팀장이 무엇을 했는지 한눈에
+function buildLeaderReport(){
+  const today = kstDay();
+  const ldd = DB.leaderDailyDirective||{}, rev=DB.dailyReview||{}, nr=DB.nightResearch||{};
+  const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
+  const directedToday = depts.filter(d=> ldd[d] && ldd[d].day===today).length;
+  const reviewedDepts = depts.filter(d=> rev[d]);
+  const grades = { 상:0, 중:0, 하:0 };
+  reviewedDepts.forEach(d=>{ const g=rev[d].grade; if(grades[g]!=null) grades[g]++; });
+  const researchedToday = depts.filter(d=> nr[d] && nr[d].day===today);
+  const websearched = researchedToday.filter(d=> nr[d].searched).length;
+  return {
+    day: today,
+    directed: directedToday,
+    reviewed: reviewedDepts.length,
+    grades,
+    researched: researchedToday.length,
+    websearched,
+    lastReviewDay: DB.lastReviewDay||"",
+    lastDirectDay: DB.lastLeaderDirectDay||"",
+    lastResearchDay: DB.lastNightResearchDay||"",
+    searchToday: (function(){ const t=todayStr(); return (DB.geminiSearchDaily&&DB.geminiSearchDaily.date===t)?DB.geminiSearchDaily.n:0; })()
+  };
+}
+app.get("/api/ops/report", (req,res)=>{ try{ res.json({ ok:true, leaderReport: buildLeaderReport() }); }catch(e){ res.status(500).json({ error:String(e.message||e) }); } });
 app.post("/api/ops/daily-review", async (req,res)=>{
   try{ const r = await runDailyReview(); res.json({ ok:!!r, dailyReview: DB.dailyReview||{} }); }
   catch(e){ res.status(500).json({ error:String(e.message||e) }); }
@@ -2004,40 +2075,75 @@ app.post("/api/ops/daily-review", async (req,res)=>{
 async function runNightResearch(){
   const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
   const rev = DB.dailyReview||{};
-  const board = depts.map(d=>{
-    const a=AGENTS[d];
-    const r=rev[d];
-    const dir = r&&r.tomorrow ? r.tomorrow : "(내일 방향 미정 — 역할 기반으로)";
-    const weak = r&&r.improve ? r.improve : "";
-    const kb=(knowledgeText(d)||"").slice(0,120);
-    return "■ "+d+" "+a.kr+"("+MEMBERS[d]+") — 역할: "+String(a.role||"").slice(0,60)+"\n  내일 방향: "+dir+(weak?("\n  보완 필요: "+weak):"")+"\n  현재 전문성: "+(kb||"(적음)");
-  }).join("\n\n");
-  const sys = "너는 이 SNS 자동화 회사 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()+profileContext()
-    + " 지금은 밤이다. 내일 각 부서가 최고의 결과를 내도록, 부서별로 '내일 방향'에 딱 맞는 실전 리서치·자료를 네가 밤새 조사해 정리해 준다. 각 부서에 대해: 내일 과제에 바로 활용할 수 있는 ①핵심 트렌드/인사이트 ②구체적 아이디어·앵글 2가지 ③참고할 포맷/사례 요령 — 을 압축해서 줘라. 일반론·격려 금지, 그 부서가 내일 즉시 쓸 수 있는 실무 자료로.\n"
-    + "반드시 아래 형식의 줄만 출력(한 부서당 한 줄, 설명·머리말 금지):\n"
-    + "RESEARCH: 부서영문키 | 내일 쓸 리서치 요약(120자 내외, 세미콜론으로 항목 구분)\n대상 부서영문키: "+depts.join(", ");
-  let out;
-  try{ out = await genText(sys, "[부서별 내일 방향]\n"+board, 1500, "gemini"); } // 무료
-  catch(e){ logError("night-research", e); return null; }
+  const cap = DB.capability||{};
+  const st = DB.state||{};
+  const searchOn = st.nightSearchOn !== false; // 기본 켜짐
+  // 오늘 웹검색할 부서 수: 유료=전 부서, 무료=소수(기본 3)
+  const freeCount = Number.isFinite(+st.nightSearchFreeCount) ? Math.max(0,Math.min(9,+st.nightSearchFreeCount)) : 3;
+  let searchQuota = !searchOn ? 0 : (paidModeOn() ? depts.length : freeCount);
+  // 우선순위: 내일 방향(구체 주제)이 있는 부서 먼저, 그다음 역량 낮은 순
+  const ordered = depts.slice().sort((a,b)=>{
+    const ta=(rev[a]&&rev[a].tomorrow)?1:0, tb=(rev[b]&&rev[b].tomorrow)?1:0;
+    if(ta!==tb) return tb-ta;
+    const ca=(cap[a]&&cap[a].overall)||0, cb=(cap[b]&&cap[b].overall)||0;
+    return ca-cb;
+  });
   DB.nightResearch = DB.nightResearch || {};
   const now=Date.now(), today=kstDay();
-  let n=0;
-  for(const line of String(out).split(/\n+/)){
-    const m = line.match(/RESEARCH:\s*([a-z]+)\s*\|\s*(.+)$/);
-    if(!m) continue;
-    const d=m[1].trim(); if(!AGENTS[d]||d==="ops") continue;
-    const brief=String(m[2]||"").trim().slice(0,300);
-    if(!brief) continue;
-    DB.nightResearch[d]={ text:brief, at:now, day:today };
-    // 야간 연구를 부서 메모리에 넣어 두면 그 부서가 다음 자율수행에서 참고 + distill로 흡수
-    DB.deptMemory[d]=DB.deptMemory[d]||[];
-    DB.deptMemory[d].push({ at:now, instruction:"[야간 연구]", note:"팀장 리서치 브리핑: "+brief });
-    if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
-    n++;
+  let n=0, searched=0;
+  const noSearch=[]; // 검색 안 한 부서는 지식기반 배치로
+  for(const d of ordered){
+    const a=AGENTS[d]; const r=rev[d];
+    const topic = (r&&r.tomorrow) ? r.tomorrow : (a.kr+" 분야 최신 트렌드");
+    const weak = (r&&r.improve) ? r.improve : "";
+    if (searchQuota>0 && searchAllowedNow()){
+      const sp = "너는 이 SNS 자동화 회사 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'다."+ADDRESS
+        + " '"+a.kr+"' 부서의 내일 과제를 위해 전 세계 공개 웹에서 최신 자료를 조사하라. 딥웹·비공개·로그인 필요 소스는 제외하고, 신뢰할 만한 공개 자료(뉴스·블로그·업계 리포트·SNS 공개글 등)만 활용하라. 국가·언어 제한 없이 폭넓게 조사하되 한국 SNS에 적용 가능하게 정리하라.\n"
+        + "내일 과제: "+topic+(weak?("\n보완 필요: "+weak):"")+"\n"
+        + "실무에 바로 쓸 수 있게: ①핵심 트렌드/데이터 ②구체 아이디어·앵글 2가지 ③참고 포맷/사례 — 를 250자 내외로 압축해 한국어로 정리하라.";
+      try{
+        const res = await geminiSearch(sp, 1400);
+        const srcTxt = (res.sources&&res.sources.length) ? (" [출처: "+res.sources.map(s=>s.title||s.uri).slice(0,3).join(" · ")+"]") : "";
+        const brief = String(res.text||"").trim().slice(0,320);
+        if(brief){
+          DB.nightResearch[d]={ text:brief, sources:(res.sources||[]).slice(0,5), searched:true, at:now, day:today };
+          DB.deptMemory[d]=DB.deptMemory[d]||[];
+          DB.deptMemory[d].push({ at:now, instruction:"[야간 웹연구]", note:"팀장 웹리서치: "+brief+srcTxt });
+          if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+          n++; searched++; searchQuota--;
+          continue;
+        }
+      }catch(e){ logError("night-search:"+d, e); /* 실패 시 지식기반으로 폴백 */ }
+    }
+    noSearch.push(d);
+  }
+  // 검색 안 한 부서: 한 번의 지식기반 배치 브리핑(무료)
+  if(noSearch.length){
+    const board = noSearch.map(d=>{
+      const a=AGENTS[d]; const r=rev[d];
+      const dir = r&&r.tomorrow ? r.tomorrow : "(역할 기반)";
+      return "■ "+d+" "+a.kr+" — 내일 방향: "+dir;
+    }).join("\n");
+    const sys = "너는 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'다."+ADDRESS+profileContext()
+      + " 아래 부서들의 내일 과제에 바로 쓸 실무 리서치를 정리하라(핵심 트렌드·아이디어·참고 포맷). 일반론 금지.\n"
+      + "형식(한 부서당 한 줄): RESEARCH: 부서영문키 | 요약(120자 내외, 세미콜론 구분)";
+    try{
+      const out = await genText(sys, "[부서]\n"+board, 1400, "gemini");
+      for(const line of String(out).split(/\n+/)){
+        const m=line.match(/RESEARCH:\s*([a-z]+)\s*\|\s*(.+)$/);
+        if(!m) continue; const d=m[1].trim(); if(!AGENTS[d]||d==="ops") continue;
+        const brief=String(m[2]||"").trim().slice(0,300); if(!brief) continue;
+        DB.nightResearch[d]={ text:brief, sources:[], searched:false, at:now, day:today };
+        DB.deptMemory[d]=DB.deptMemory[d]||[];
+        DB.deptMemory[d].push({ at:now, instruction:"[야간 연구]", note:"팀장 리서치: "+brief });
+        if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+        n++;
+      }
+    }catch(e){ logError("night-research-batch", e); }
   }
   DB.lastNightResearchDay = today;
   saveDB();
-  if(n>0) kakaoNotify("🌌 야간 연구 완료 — 오세라가 밤새 "+n+"개 부서의 내일 자료를 조사·정리했어요. 아침 지시에 반영돼요.").catch(()=>{});
+  if(n>0) kakaoNotify("🌌 야간 연구 완료 — 오세라가 "+n+"개 부서 자료를 정리했어요"+(searched>0?(" (웹검색 "+searched+"건 포함)"):"")+". 아침 지시에 반영돼요.").catch(()=>{});
   return DB.nightResearch;
 }
 app.post("/api/ops/night-research", async (req,res)=>{
@@ -2585,7 +2691,8 @@ app.get("/api/usage", (req,res)=>{
     monthPct: monthLimitKrw>0 ? Math.min(100, Math.round(krwMonth/monthLimitKrw*100)) : 0,
     gemini: geminiRateInfo(), paidFallback: !!(st.allowPaidFallback),
     geminiBudget: (function(){ const b=geminiBudget(); return { monthLimitKrw:b.monthLimit, monthKrw:b.monthKrw, dayKrw:b.dayKrw, monthPct: b.monthLimit>0?Math.min(100,Math.round(b.monthKrw/b.monthLimit*100)):0, monthOver:b.monthOver, paused:!geminiAutoAllowed(), calls:b.calls }; })(),
-    paidMode: paidModeOn(), paidGeminiOn: !!(st.paidGeminiOn), paidKeyAvailable: paidKeyAvailable()
+    paidMode: paidModeOn(), paidGeminiOn: !!(st.paidGeminiOn), paidKeyAvailable: paidKeyAvailable(),
+    search: { today: searchesToday(), cap: searchDailyCap(), total: (DB.geminiSearchTotal||0), on: (st.nightSearchOn!==false) }
   });
 });
 
