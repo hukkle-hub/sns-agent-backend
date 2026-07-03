@@ -2044,6 +2044,7 @@ app.post("/api/ops/run-all", async (req,res)=>{
 // 팀장 보고 요약: 오늘 팀장이 무엇을 했는지 한눈에
 function buildLeaderReport(){
   const today = kstDay();
+  const leaderAutoOn = ((DB.state||{}).leaderAutoOn !== false);
   const ldd = DB.leaderDailyDirective||{}, rev=DB.dailyReview||{}, nr=DB.nightResearch||{};
   const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
   const directedToday = depts.filter(d=> ldd[d] && ldd[d].day===today).length;
@@ -2054,6 +2055,7 @@ function buildLeaderReport(){
   const websearched = researchedToday.filter(d=> nr[d].searched).length;
   return {
     day: today,
+    leaderAutoOn,
     directed: directedToday,
     reviewed: reviewedDepts.length,
     grades,
@@ -2780,6 +2782,7 @@ setInterval(async ()=>{
   // (0) 예약 회의: 근무시간과 무관하게 지정 시각(KST)에 실행
   const hm = kstHHMM(), day = kstDay(), dow = kstDow(), nowMs = Date.now();
   const autoOK = geminiAutoAllowed(); // Gemini 월 예산(₩) 안에서만 자동 지능작업 수행(초과 시 잠시 멈춤·다음날/다음달 재개)
+  const leaderAuto = autoOK && ((DB.state||{}).leaderAutoOn !== false); // 팀장에게 맡기기 ON(기본)이면 매일 자동으로 회고·연구·지시 실행
   // (0-b) 팀장 브리핑: 아침(오늘 할 일)·저녁(오늘 한 일)·주간(한 주 종합) — 자동이므로 무료(Gemini)
   try {
     const st = DB.state || {};
@@ -2810,14 +2813,14 @@ setInterval(async ()=>{
     const st5 = DB.state || {};
     const endHour = Number.isFinite(+st5.briefHour) ? +st5.briefHour : 21;
     const kstHour2 = kstNow().getUTCHours();
-    if (autoOK && kstHour2 >= endHour && DB.lastReviewDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+    if (leaderAuto && kstHour2 >= endHour && DB.lastReviewDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
       DB.lastReviewDay = day; saveDB(); // 선점
       runDailyReview().then(()=>console.log("퇴근 회고 완료")).catch(e=>logError("daily-review", e));
     }
   } catch(e){ /* 회고 실패 무시 */ }
   // (0-f0) 야간 연구: 아침 지시(≥6시) 전 심야~새벽에 팀장이 내일 자료를 조사(무료). 하루 1회.
   try {
-    if (autoOK && DB.lastNightResearchDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+    if (leaderAuto && DB.lastNightResearchDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
       const kh = kstNow().getUTCHours();
       if (kh < 6) { // 자정~새벽 5시대 (아침 지시 배정 전)
         DB.lastNightResearchDay = day; saveDB(); // 선점
@@ -2852,7 +2855,7 @@ setInterval(async ()=>{
   } catch(e){ /* 매일 성장 실패 무시 */ }
   // (0-f2) 팀장의 매일 자율수행 지시 배정 — 자동성장이 꺼져 있어도 독립적으로 매일 보장
   try {
-    if (autoOK && DB.lastLeaderDirectDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+    if (leaderAuto && DB.lastLeaderDirectDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
       const kstHour2 = kstNow().getUTCHours();
       if (kstHour2 >= 6) { // 새벽 6시 이후, 하루 한 번
         DB.lastLeaderDirectDay = day; saveDB(); // 선점
