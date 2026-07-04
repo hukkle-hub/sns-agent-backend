@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -127,11 +127,11 @@ const AGENTS = {
   publishing:  { no:"03", kr:"채널 발행",      role:"채널 발행 담당. 완성된 콘텐츠를 연결된 플랫폼에 발행하고 일정·해시태그·발행 최적화를 관리한다. (영상·콘텐츠 제작은 02 부서가 담당한다)" },
   engagement:  { no:"04", kr:"커뮤니티·CS",    role:"커뮤니티·고객응대 담당. 댓글·DM 응답 문안, 팔로워 소통 방안을 작성한다." },
   analytics:   { no:"05", kr:"데이터 분석",    role:"데이터 분석 담당. 성과 해석·개선 포인트·다음 액션을 제시한다." },
-  monetization:{ no:"06", kr:"수익화",        role:"수익화 담당. 제휴·광고·상품·멤버십 등 수익 모델과 정산을 제안한다." },
-  growth:      { no:"07", kr:"성장·광고",      role:"성장·광고 담당. 유료 광고·A/B 테스트·바이럴 전략을 설계한다." },
+  monetization:{ no:"06", kr:"수익화",        role:"판매 전환 담당. 스마트스토어·상세페이지 구성, 구매 전환을 높이는 카피(혜택·후기·CTA), 특산물 상품 소개, 제휴·공동구매 아이디어를 만든다. 지금은 대규모 수익화보다 '실제 판매로 이어지는 전환'에 집중한다." },
+  growth:      { no:"07", kr:"성장·광고",      role:"유기적 성장(무료 바이럴) 담당. 돈 들이지 않고 팔로워·도달을 늘리는 방법에 집중한다: 해시태그 전략, 릴스·숏폼 확산 포인트, 게시 시간대 최적화, 참여 유도(저장·공유·댓글) 훅, 이웃·품앗이·챌린지 아이디어. 유료 광고는 필요할 때만 보조로 제안한다." },
   ops:         { no:"08", kr:"감사·법무·리스크", role:"플랫폼 운영·관리 총괄 감사관. 저작권·광고법·정책·정보보안 관점에서 점검·경고할 뿐 아니라, 모든 부서의 산출물·기획·발행물을 검토하고 직접 수정·보완·재작성할 권한이 있다. 클로드(텍스트·추론 엔진)와 제미나이(영상·이미지 생성, 수동 핸드오프)를 함께 활용해 콘텐츠·정책·발행 전반을 조율한다." },
-  advisory:    { no:"09", kr:"자문·서기",      role:"자문·서기 담당. 논의를 정리·요약하고 결정을 구조화해 기록한다." },
-  scout:       { no:"10", kr:"탐색·발상",      role:"탐색·발상 담당(R&D). 새 기회·아이디어·트렌드 조합을 능동 발굴한다." }
+  advisory:    { no:"09", kr:"자문·서기",      role:"품질 검수·서기 담당. 콘텐츠가 나가기 전 최종 게이트키퍼: 과대·허위광고 표현('최고/유일/1위' 등 근거 없는 단정), 브랜드 톤앤매너 이탈, 오탈자·가독성, 플랫폼 정책 위반을 점검해 PASS/FAIL로 판정하고 구체적 개선 지시를 남긴다. 회의 논의도 정리·기록한다." },
+  scout:       { no:"10", kr:"탐색·발상",      role:"트렌드 소재화 담당. 팀장이 웹에서 조사해온 트렌드·밈·키워드를 받아, 우리 특산물 콘텐츠에 바로 쓸 수 있는 '실전 소재'로 가공한다: 이번 주 밀어볼 콘텐츠 아이디어 3~5개, 후킹 문구 후보, 릴스 포맷·오디오 제안, 시즌 이슈 접목 앵글. 조사 자체보다 '아이디어로 구체화'가 핵심." }
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
@@ -528,6 +528,15 @@ async function work(dept, instruction, context, images, teamLog){
   const mem = DB.deptMemory[dept] || [];
   if (mem.length) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem.slice(-4).map(x=>"· "+x.note).join("\n");
   const crossMem = crossDeptMemory(dept);
+  // 트렌드 소재화(10 탐색·발상): 팀장이 조사해온 최신 트렌드를 직접 이어받아 소재로 가공
+  if (dept === "scout"){
+    const nr = DB.nightResearch || {};
+    const feed = Object.keys(nr).map(k=>{
+      const r=nr[k]; if(!r||!r.text) return "";
+      return "· ["+(AGENTS[k]?AGENTS[k].kr:k)+"] "+String(r.text).slice(0,160)+(r.searched?" (웹검색)":"");
+    }).filter(Boolean).slice(0,6).join("\n");
+    if (feed) sys += "\n\n[팀장이 조사해온 최신 트렌드·자료 — 네 임무는 이걸 우리 특산물 콘텐츠에 바로 쓸 '실전 소재'(콘텐츠 아이디어·후킹 문구·릴스 포맷·시즌 앵글)로 가공하는 것이다. 조사를 반복하지 말고 이 재료를 가공하라]\n" + feed;
+  }
   if (crossMem) sys += "\n\n[다른 부서들이 최근 기록·작성한 내용 — 팀 전체가 공유한다. 관련되면 참조하고, 문제·빈틈이 보이면 보완하라]\n" + crossMem;
   if (teamLog) sys += "\n\n[최근 팀 전체 대화 — 운영자와 다른 부서들이 이 공용 콘솔에서 나눈 내용. 이미 너에게 공유된 맥락이다. 여기에 이어서 답하고, 관련 있으면 앞 대화를 구체적으로 참조하라]\n" + teamLog;
   if (context) sys += "\n\n[동료 부서들이 지금까지 진행한 협업 맥락 — 반드시 읽고 이어받아라]\n" + context + "\n앞 부서 결과를 중복하지 말고, 거기에 네 전문성을 더해 발전시키거나 빈 부분을 채워라. 필요하면 앞 부서 결과를 구체적으로 언급하며 연결하라.";
@@ -1249,7 +1258,7 @@ function createMeeting(opts){
   const topic = String(opts.topic||agenda[0]||"회의").trim();
   if (!agenda.length) agenda = [topic];
   if (agenda.length > 4) agenda = agenda.slice(0,4);
-  const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", status:"running", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries:[], transcript:[], summary:"", clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", at:Date.now(), source:opts.source||"app", engine:(((opts.engine || (DB.state&&DB.state.meetingEngine))==="gemini") ? "gemini" : "claude") };
+  const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", status:"running", phase:"준비", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries:[], transcript:[], summary:"", clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", state:{ topic, market_insight:"", draft_content:"", critique_feedback:"", revision_count:0, final_output:"" }, at:Date.now(), source:opts.source||"app", engine:(((opts.engine || (DB.state&&DB.state.meetingEngine))==="gemini") ? "gemini" : "claude") };
   DB.meetings.push(meeting);
   if (DB.meetings.length > 60) DB.meetings = DB.meetings.slice(-60);
   saveDB();
@@ -1277,6 +1286,23 @@ async function processMeeting(meeting){
     const prevctx = (meeting.prevSummary && String(meeting.prevSummary).trim()) ? ("\n\n[이전 회의 결론 — 처음부터 다시 하지 말고 여기서 이어 발전시켜라]\n"+String(meeting.prevSummary).trim()) : "";
 
     if (_cn){ transcript.push({ dept:"client", member:"클라이언트", round:0, agenda:0, text:_cn }); saveDB(); }
+    // 회의 전 트렌드 조사: 팀장(오세라)이 주제의 최신 트렌드를 실시간 웹검색해 회의에 주입(무료 한도 내, 실패 시 생략)
+    let trendCtx = "";
+    try{
+      const st = DB.state||{};
+      if (st.nightSearchOn !== false && searchAllowedNow()){
+        meeting.phase = "트렌드 조사"; saveDB();
+        const sp = "너는 팀장 '"+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'다. 곧 열릴 회의 주제 '"+topic+"'에 대해 전 세계 공개 웹에서 지금 유효한 최신 트렌드·키워드·사례를 조사하라. 딥웹·비공개 제외. 한국 SNS 마케팅에 바로 쓸 수 있게 핵심만 200자 내외로 정리(트렌드 키워드·타겟 반응·참고 앵글).";
+        const r = await geminiSearch(sp, 1200);
+        if (r && r.text){
+          trendCtx = "\n\n[회의 전 팀장이 조사한 최신 트렌드 — 발언에 적극 반영하라]\n"+String(r.text).slice(0,600);
+          meeting.trendResearch = { text:String(r.text).slice(0,600), sources:(r.sources||[]).slice(0,5), at:Date.now() };
+          transcript.push({ dept:"ops", member:MEMBERS["ops"]||"", round:0, agenda:0, text:"[회의 전 트렌드 조사] "+String(r.text).slice(0,400) });
+          saveDB();
+        }
+      }
+    }catch(e){ logError("meeting-trend", e); /* 검색 실패해도 회의는 진행 */ }
+    meeting.phase = "분석·토론"; saveDB();
     for (let ai=0; ai<agenda.length; ai++){
       const item = agenda[ai];
       for (let r=1; r<=rounds; r++){
@@ -1296,7 +1322,7 @@ async function processMeeting(meeting){
           if (mem) sys += "\n\n[네 최근 기록]\n"+mem;
           const log = tline(ai);
           if (log) sys += "\n\n[이 안건의 지금까지 발언]\n"+log;
-          sys += steer + prevctx + meetingFeedbackInsights() + profileContext() + clientBlock();
+          sys += steer + prevctx + trendCtx + meetingFeedbackInsights() + profileContext() + clientBlock();
           let text;
           try { text = await genText(sys, "회의 안건: "+item, 700, eng); }
           catch(e1){
@@ -1327,6 +1353,26 @@ async function processMeeting(meeting){
       try { meeting.summary = await genText(osys, "[안건별 결론]\n"+meeting.agendaSummaries.map((x,k)=>(k+1)+". "+x.title+"\n"+x.summary).join("\n\n"), 700, eng); }
       catch(e){ meeting.summary = meeting.agendaSummaries.map(x=>x.title+": "+x.summary).join("\n\n"); logError("meeting-osum", e); }
     }
+
+    // 구조화 State 자산화: 회의 결과를 topic→분석→결론 묶음으로 저장 (검수 이력 포함)
+    meeting.state.final_output = meeting.summary;
+    meeting.state.market_insight = (meeting.agendaSummaries[0] && meeting.agendaSummaries[0].summary) || "";
+    meeting.state.draft_content = meeting.summary;
+    // 회의 결론에 검수 게이트 적용(과대광고·톤 점검, 통과할 때까지 최대 3회 다듬기)
+    try{
+      let text = meeting.summary, revs=[];
+      for(let i=0;i<3;i++){
+        const rv = await reviewContent(text, topic, eng);
+        revs.push({ round:i+1, verdict:rv.pass?"PASS":"FAIL", feedback:rv.feedback });
+        meeting.state.revision_count = i;
+        if(rv.pass) break;
+        meeting.state.critique_feedback = rv.feedback;
+        const rsys = "너는 이 회의의 의장('"+(MEMBERS[chair]||"")+"')이다."+ADDRESS+" 아래 회의 결론을 검수부 피드백을 반영해 더 안전하고 완성도 높게 다시 정리하라. 같은 형식(종합 결론/핵심 결정) 유지."+profileContext();
+        try{ text = await genText(rsys, "[검수 피드백]\n"+rv.feedback+"\n\n[현재 결론]\n"+text, 800, eng); }catch(e){ break; }
+      }
+      meeting.summary = text; meeting.state.final_output = text; meeting.reviews = revs;
+    }catch(e){ logError("meeting-review", e); }
+    meeting.phase = "완료";
 
     // 학습: 참여 부서 메모리 + 경험치
     for (const d of depts){
@@ -1631,6 +1677,112 @@ app.post("/api/meeting/suggest-unresolved", async (req,res)=>{
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 회의 내용 → 콘텐츠 직접 생성(라우터 거치지 않고 제작부가 완성형 콘텐츠 반환 → 콘텐츠 탭에 바로 표시)
+// ===== 검수 게이트: 감사(09)가 콘텐츠를 PASS/FAIL 판정 → FAIL이면 제작부가 재작성(최대 3회) =====
+async function reviewContent(text, topic, engine){
+  const rev="advisory"; // 09 자문·서기(감사·법무·리스크 성향)가 검수
+  const a=AGENTS[rev]||AGENTS["ops"];
+  let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI로, 콘텐츠 품질·규정 검수를 맡는다."+ADDRESS
+    +" 아래 SNS 콘텐츠를 냉정하게 검수하라. 기준: ①과대·허위광고 요소 없음(의학적 효능 단정, '최고/유일' 등 객관적 근거 없는 표현) ②브랜드 톤앤매너 적합 ③플랫폼 정책 위반 없음 ④가독성·후킹·해시태그 적절. "
+    +"반드시 아래 형식 한 줄만 출력(설명 금지):\nVERDICT: PASS 또는 FAIL | (FAIL이면 무엇을 어떻게 고칠지 구체적 지시 한두 문장)";
+  const out=await genText(sys, "주제: "+(topic||"")+"\n\n[검수 대상 콘텐츠]\n"+String(text).slice(0,1800), 500, engine);
+  const m=String(out).match(/VERDICT:\s*(PASS|FAIL)\s*\|?\s*(.*)/i);
+  if(!m) return { pass:true, feedback:"" }; // 파싱 실패 시 통과(막지 않음)
+  return { pass:/PASS/i.test(m[1]), feedback:String(m[2]||"").trim() };
+}
+// 제작부가 콘텐츠를 만들고, 검수 통과할 때까지 자동 재작성(최대 3회). 검수 이력 반환.
+async function createReviewedContent(baseSys, userMsg, topic, engine){
+  let content=await genText(baseSys, userMsg, 1500, engine);
+  const history=[];
+  let passed=false, feedback="";
+  for(let i=0;i<3;i++){
+    const r=await reviewContent(content, topic, engine);
+    history.push({ round:i+1, verdict:r.pass?"PASS":"FAIL", feedback:r.feedback });
+    if(r.pass){ passed=true; break; }
+    feedback=r.feedback;
+    // 검수 피드백을 반영해 재작성
+    const reviseSys=baseSys+"\n\n[검수부 피드백 — 반드시 반영해 고쳐서 다시 작성]\n"+feedback;
+    content=await genText(reviseSys, userMsg+"\n\n(위 피드백을 반영해 개선한 완성본만 출력)", 1500, engine);
+  }
+  return { content, passed, reviews:history };
+}
+
+// ===== 채널별 카피 병렬(순차) 생성: 인스타/블로그·스마트스토어/카카오톡 각각 최적화 =====
+const CHANNEL_SPEC = {
+  instagram: { name:"인스타그램", guide:"피드 캡션: 첫 줄 후킹(스크롤 멈추게), 이모지 적절, 2~4문단, 해시태그 8~15개(대·중·소 믹스). 릴스면 짧은 훅+자막용 문장.", limit:"2200자 이내" },
+  blog: { name:"블로그·스마트스토어", guide:"정보성·신뢰형 톤. 제목(H1)+소제목 2~3개+본문. 상세페이지면 헤드카피+핵심 셀링포인트 3개+구매 유도. 검색 키워드 자연스럽게 포함.", limit:"1500~2500자" },
+  kakao: { name:"카카오톡 채널", guide:"알림톡/친구톡 톤. 짧고 명확, 첫 문장에 핵심 혜택, CTA 버튼 문구 제안. 과한 이모지 지양.", limit:"400자 이내" }
+};
+// ===== 비주얼 디렉터: 완성된 카피 → 이미지 생성 프롬프트 카드(유료 API 미사용, 프롬프트만) =====
+app.post("/api/content/visual", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const copy=String(body.content||body.source||"").slice(0,1600);
+    if(!copy) return res.status(400).json({ error:"카피 내용이 필요해요" });
+    const d="creation", a=AGENTS[d];
+    const eng=(body.engine||workEngine());
+    let sys="너는 SNS 자동화 회사의 비주얼 디렉터다. 아래 완성된 카피의 분위기·핵심 메시지에 딱 맞는 'SNS용 이미지 프롬프트'와 '짧은 영상(Veo/릴스) 프롬프트'를 둘 다 만들어라."+ADDRESS
+      +" 실제 이미지·영상은 클라이언트가 Gemini(나노바나나·Veo)·생성 도구에 붙여 만들 것이다. 바로 붙여넣어 쓸 수 있게 구체적으로. "
+      +"아래 형식으로만 출력(한국어 설명 + 영문 프롬프트 병기):\n"
+      +"【이미지】\n"
+      +"컨셉: (한 줄)\n"
+      +"한글 프롬프트: (피사체·구도·조명·색감·분위기·스타일 구체적으로)\n"
+      +"ENGLISH PROMPT: (same, in English)\n"
+      +"네거티브: (피해야 할 요소)\n"
+      +"추천 비율: (1:1 / 4:5 / 9:16 중 택1)\n"
+      +"【영상(Veo/릴스, 8~15초)】\n"
+      +"컨셉: (한 줄)\n"
+      +"구간 구성: (3~4컷, 각 컷의 화면·움직임·자막 한 줄씩)\n"
+      +"ENGLISH VIDEO PROMPT: (하나의 영상 생성 프롬프트로, 카메라 무빙·분위기·조명 포함)\n"
+      +"BGM·톤: (분위기 한 줄)\n"
+      +"추천 비율: (9:16 세로 권장)"+profileContext();
+    const out=await genText(sys, "[완성 카피]\n"+copy, 1300, eng);
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[비주얼 디렉터]", note:String(out).slice(0,300) });
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+    saveDB();
+    res.json({ ok:true, visualPrompt: out });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+app.post("/api/content/multichannel", async (req,res)=>{
+  try{
+    const body=req.body||{};
+    const chans = Array.isArray(body.channels)&&body.channels.length ? body.channels.filter(c=>CHANNEL_SPEC[c]) : ["instagram","blog","kakao"];
+    const d="creation", a=AGENTS[d];
+    const kb=knowledgeText(d);
+    const rel=await relevantSmart(d, String(body.source||"")+" "+(body.topic||""), 2);
+    const eng=(body.engine||workEngine());
+    const results=[];
+    // 순차 생성(무료 Gemini 429 방지). 채널마다 최적화 + 검수 게이트.
+    for(const c of chans){
+      const spec=CHANNEL_SPEC[c];
+      let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
+      if(kb) sys+="\n\n[축적 전문성]\n"+kb;
+      if(rel) sys+="\n\n[비슷한 과거 작업 — 톤·형식 재활용]\n"+rel;
+      sys+=" 아래 회의 내용을 바탕으로 '"+spec.name+"' 채널에 최적화된 완성형 콘텐츠를 만들어라. 채널 규칙: "+spec.guide+" 분량: "+spec.limit+". 되묻지 말고 완성본만, 한국어로."+profileContext();
+      const userMsg="주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,1600);
+      let out;
+      try{
+        const gated=await createReviewedContent(sys, userMsg, body.topic||"", eng);
+        out=gated.content;
+      }catch(e){ out="(생성 실패: "+String(e.message||e).slice(0,80)+")"; }
+      results.push({ channel:c, name:spec.name, content:out });
+      await new Promise(r=>setTimeout(r, 600)); // 순차 간격(429 방지)
+    }
+    // 학습 + 승인 대기(요청 시)
+    if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[채널별 콘텐츠] "+(body.label||""), note:results.map(r=>r.name).join("/")+" "+chans.length+"개 채널 생성" });
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+    if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
+    saveDB();
+    let approvals=[];
+    if(body.needApproval){
+      results.forEach(r=>{ const it=queueContentApproval(d, body.topic||"", (body.label||"")+" · "+r.name, r.content, []); approvals.push(it.id); });
+    }
+    res.json({ ok:true, results, approvalIds:approvals });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
 app.post("/api/content/create", async (req,res)=>{
   try{
     const body=req.body||{};
@@ -1640,13 +1792,23 @@ app.post("/api/content/create", async (req,res)=>{
     const rel=await relevantSmart(d, String(body.source||"")+" "+(body.topic||""), 3);
     if(rel) sys+="\n\n[비슷한 과거 콘텐츠 작업 — 톤·형식 재활용]\n"+rel;
     sys+=" 아래 회의 내용을 바탕으로, 바로 게시 가능한 완성형 SNS 콘텐츠를 직접 만들어라. 되묻지 말고 합리적으로 가정해 완성하라. 플랫폼에 맞는 게시물 카피(또는 영상 스크립트·구성안)와 해시태그까지 포함. 질문·선택 요청 없이 결과물만, 한국어로."+profileContext();
-    const out=await genText(sys, "회의 주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,1800), 1500, (body.engine||workEngine()));
+    const userMsg="회의 주제: "+(body.topic||"")+" / 출처: "+(body.label||"")+"\n\n[회의 내용]\n"+String(body.source||"").slice(0,1800);
+    const eng=(body.engine||workEngine());
+    // 검수 게이트 통과할 때까지 자동 다듬기(감사부 PASS/FAIL, 최대 3회)
+    const gated = (body.review!==false) ? await createReviewedContent(sys, userMsg, body.topic||"", eng)
+                                        : { content: await genText(sys, userMsg, 1500, eng), passed:true, reviews:[] };
+    const out=gated.content;
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[회의→콘텐츠] "+(body.label||""), note:String(out).slice(0,500) });
     DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
     if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
+    // 검수를 수행한 부서도 경험치(자기 성장)
+    DB.exp.advisory=(DB.exp.advisory||0)+1;
     saveDB();
-    res.json({ ok:true, content: out, dept:d });
+    // Human-in-the-Loop: 요청 시 승인 대기로 올림(승인/반려/직접수정)
+    let approval=null;
+    if(body.needApproval){ approval=queueContentApproval(d, body.topic||"", body.label||"", out, gated.reviews); }
+    res.json({ ok:true, content: out, dept:d, passed:gated.passed, reviews:gated.reviews, approvalId:(approval?approval.id:null) });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 동영상 기획 — 제작부(Claude)가 기획안 → Gemini가 Veo 3.1 프롬프트로 변환(협력). 클라이언트가 Gemini 앱(Ultra)에 붙여 샘플 생성.
@@ -1769,6 +1931,7 @@ app.get("/api/sync", (req,res)=>{
     leaderDailyDirective: DB.leaderDailyDirective || {},
     dirFeedback: DB.dirFeedback || {},
     capHistory: (DB.capHistory||[]).slice(-120),
+    contentApprovals: (DB.contentApprovals||[]).filter(a=>a.status==="pending"),
     dailyReview: DB.dailyReview || {},
     nightResearch: DB.nightResearch || {},
     leaderReport: buildLeaderReport(),
@@ -2704,6 +2867,74 @@ app.get("/api/approvals", (req,res)=>{
     id:a.id, code:a.code, platforms:a.platforms||[],
     title:String((a.content&&(a.content.title||a.content.description))||"").slice(0,90), at:a.at
   })));
+});
+
+// ===== Human-in-the-Loop: 콘텐츠 승인/반려/수정 =====
+// 콘텐츠 생성 결과를 '승인 대기'로 올림
+function queueContentApproval(dept, topic, label, content, reviews){
+  DB.contentApprovals = DB.contentApprovals || [];
+  const item={ id:Date.now()+Math.floor(Math.random()*1000), dept, topic:topic||"", label:label||"", content:String(content||""), reviews:reviews||[], status:"pending", at:Date.now() };
+  DB.contentApprovals.push(item);
+  if(DB.contentApprovals.length>50) DB.contentApprovals=DB.contentApprovals.slice(-50);
+  saveDB();
+  return item;
+}
+app.get("/api/content-approvals", (req,res)=>{
+  res.json((DB.contentApprovals||[]).filter(a=>a.status==="pending").map(a=>({
+    id:a.id, dept:a.dept, topic:a.topic, label:a.label, content:a.content, reviews:a.reviews, at:a.at
+  })));
+});
+// 승인: 확정 → 학습 반영
+app.post("/api/content-approve", (req,res)=>{
+  try{
+    const it=(DB.contentApprovals||[]).find(a=>String(a.id)===String((req.body||{}).id) && a.status==="pending");
+    if(!it) return res.status(404).json({ error:"대기 중인 항목이 없어요" });
+    it.status="approved"; it.decidedAt=Date.now();
+    const d=it.dept||"creation";
+    DB.deptMemory[d]=DB.deptMemory[d]||[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[승인된 콘텐츠] "+(it.label||""), note:"클라이언트 승인 · "+String(it.content).slice(0,300) });
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+    saveDB();
+    res.json({ ok:true, content:it.content });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 반려: 사유 반영해 재작성 → 다시 대기
+app.post("/api/content-reject", async (req,res)=>{
+  try{
+    const b=req.body||{};
+    const it=(DB.contentApprovals||[]).find(a=>String(a.id)===String(b.id) && a.status==="pending");
+    if(!it) return res.status(404).json({ error:"대기 중인 항목이 없어요" });
+    const reason=String(b.reason||"").trim();
+    const d=it.dept||"creation"; const a=AGENTS[d];
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE;
+    const kb=knowledgeText(d); if(kb) sys+="\n\n[축적 전문성]\n"+kb;
+    sys+=" 아래 콘텐츠에 대한 클라이언트 반려 사유를 반드시 반영해, 개선한 완성본만 다시 출력하라. 한국어로."+profileContext();
+    const revised=await genText(sys, "[반려 사유]\n"+(reason||"전반적으로 다시")+"\n\n[기존 콘텐츠]\n"+it.content, 1500, workEngine());
+    it.content=String(revised); it.reviews=(it.reviews||[]).concat([{ round:"반려", verdict:"REJECT", feedback:reason }]); it.at=Date.now();
+    // 학습: 반려 피드백
+    DB.deptMemory[d]=DB.deptMemory[d]||[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[클라이언트 반려]", note:reason.slice(0,200) });
+    saveDB();
+    res.json({ ok:true, content:it.content });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 직접 수정 확정: 클라이언트가 손본 최종본 저장 → 학습(가장 강한 신호)
+app.post("/api/content-edit", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const it=(DB.contentApprovals||[]).find(a=>String(a.id)===String(b.id) && a.status==="pending");
+    if(!it) return res.status(404).json({ error:"대기 중인 항목이 없어요" });
+    const edited=String(b.content||"").trim();
+    if(!edited) return res.status(400).json({ error:"수정 내용을 입력하세요" });
+    it.content=edited; it.status="approved"; it.decidedAt=Date.now(); it.edited=true;
+    const d=it.dept||"creation";
+    DB.deptMemory[d]=DB.deptMemory[d]||[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[클라이언트 직접수정 최종본]", note:edited.slice(0,300) });
+    DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+2; // 직접수정본은 강한 학습 신호
+    if(DB.exp[d]%3===0){ try{ distillKnowledge(d); }catch(e){} }
+    saveDB();
+    res.json({ ok:true, content:edited });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
 // 정기 자료수집 조회
