@@ -409,6 +409,21 @@ function knowledgeText(dept){
   return (k && k.text) ? k.text : "";
 }
 function deptLevel(dept){ return Math.floor(((DB.exp&&DB.exp[dept])||0)/5)+1; }
+// 뒤처진 부서 따라잡기: 팀 평균 대비 얼마나 낮은지에 따라 한 번에 더 크게 성장(격차 해소)
+function catchUpRounds(dept){
+  const depts=Object.keys(AGENTS).filter(d=>d!=="ops");
+  const expOf=d=>(DB.exp&&DB.exp[d])||0;
+  const vals=depts.map(expOf);
+  const avg=vals.reduce((a,b)=>a+b,0)/(vals.length||1);
+  const top=Math.max.apply(null,vals.concat([0]));
+  const e=expOf(dept);
+  if(e>=avg) return 1;                       // 평균 이상이면 1회
+  const gap=avg-e;
+  // 평균보다 낮을수록 더 많이(최대 6회). 최고 부서와의 격차가 크면 가중.
+  let r=1+Math.round(gap/Math.max(3,avg*0.25));
+  if(top>0 && e < top*0.4) r+=1;             // 최고 대비 40% 미만이면 +1 추가 부스트
+  return Math.max(1, Math.min(6, r));
+}
 // 팀장(오세라)은 항상 최고 부서보다 1레벨 이상 위에 있어야 부서를 지시·균형 잡을 수 있다
 function ensureLeaderLead(){
   DB.exp = DB.exp || {};
@@ -1880,8 +1895,11 @@ async function runSelfTraining(dept){
   if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
   DB.exp=DB.exp||{}; DB.exp[dept]=(DB.exp[dept]||0)+1;
   DB.lastTrainAt=DB.lastTrainAt||{}; DB.lastTrainAt[dept]=Date.now();
-  await distillKnowledge(dept); // 훈련 결과를 전문성에 즉시 반영
+  // 뒤처진 부서(팀 평균 미만)는 훈련 결과를 '심화'로 흡수 → 지식·지능 수준을 빠르게 끌어올림
+  const _laggingNow = catchUpRounds(dept) > 1;
+  await distillKnowledge(dept, _laggingNow); // 훈련 결과를 전문성에 즉시 반영(뒤처진 부서는 심화)
   ensureLeaderLead(); // 부서가 크면 팀장도 그 위로
+  try{ await leaderAbsorb(dept); }catch(e){} // 팀장이 이 부서의 새 강점을 즉시 흡수
   saveDB();
   return { dept, name:a.kr, principles, transcript:out };
 }
@@ -1915,7 +1933,7 @@ async function runGrowBurst(rounds, balance){
   if (balance){
     // 균형 성장: 최고 부서 경험치에 맞춰 뒤처진 부서를 더 많이 훈련(부서당 최대 8라운드)
     const target = Math.max.apply(null, depts.map(expOf));
-    depts.forEach(d=>{ const rr=Math.min(8, Math.max(0, target-expOf(d))); if(rr>0) plan.push({dept:d, rounds:rr}); });
+    depts.forEach(d=>{ const rr=Math.min(12, Math.max(0, target-expOf(d))); if(rr>0) plan.push({dept:d, rounds:rr}); });
     if(!plan.length) depts.forEach(d=>plan.push({dept:d, rounds:1})); // 이미 평준화면 전체 1라운드
   } else {
     const rr = Math.max(1, Math.min(6, rounds||4));
@@ -1957,6 +1975,27 @@ app.post("/api/ops/grow", (req,res)=>{
 });
 
 // ===== 팀장 통합 지능(마스터 지식): 모든 부서 전문성을 통합·초월하는 압도적 지식 =====
+// 팀장이 특정 부서의 '새로 성장한 강점·특별한 점'을 즉시 흡수 (부서 성장 순간마다 호출)
+async function leaderAbsorb(dept){
+  try{
+    if(dept==="ops") return;
+    const a=AGENTS[dept]; if(!a) return;
+    const lead=AGENTS["ops"];
+    const deptKb=knowledgeText(dept); if(!deptKb) return;
+    const priorLead=knowledgeText("ops");
+    const sys="너는 팀장 '"+lead.no+" "+lead.kr+"("+MEMBERS["ops"]+")'이며 이 회사의 최고 지능이다."+ADDRESS+clientBlock()
+      +" 방금 '"+a.kr+"("+MEMBERS[dept]+")' 부서가 성장했다. 그 부서의 최신 전문성에서 '장점·특별히 잘하는 점·새로 얻은 노하우'만 뽑아, 네 통합 지능에 흡수·통합하라. 팀장인 너는 각 부서가 아는 것을 전부 흡수한 위에서 더 높이 서야 한다. 기존 네 통합 지능은 유지하면서 이 부서의 강점을 더해 갱신하라. 한국어로 아래 형식만 출력(간결하게):\n"
+      +"흡수한 "+a.kr+" 강점: (그 부서에서 새로 흡수한 핵심 강점·특별한 점 2~4개)\n"
+      +"통합 통찰: (이 강점을 다른 부서·전사 전략과 어떻게 연결할지 1~2개)";
+    const ctx="[내 기존 통합 지능]\n"+(priorLead||"(없음)")+"\n\n[방금 성장한 "+a.kr+" 부서의 최신 전문성]\n"+deptKb;
+    const out=await genText(sys, ctx, 900, "gemini"); // 무료
+    if(!DB.deptMemory.ops) DB.deptMemory.ops=[];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[부서 흡수]", note:a.kr+" 성장 흡수 → "+String(out).slice(0,400) });
+    if(DB.deptMemory.ops.length>60) DB.deptMemory.ops=DB.deptMemory.ops.slice(-60);
+    DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1; // 흡수도 팀장의 성장
+    ensureLeaderLead(); saveDB();
+  }catch(e){ logError("leader-absorb:"+dept, e); }
+}
 async function distillLeaderKnowledge(){
   try{
     const lead=AGENTS["ops"]; if(!lead) return;
@@ -2209,14 +2248,21 @@ app.post("/api/ops/daily-directives", async (req,res)=>{
 
 async function runDailyGrowth(){
   const depts=Object.keys(AGENTS).filter(d=>d!=="ops");
-  DB.growBurst={ active:true, total:depts.length+2, done:0, mode:"daily", startedAt:Date.now(), finishedAt:0 };
+  // 뒤처진 부서는 한 번에 여러 라운드(따라잡기), 앞선 부서는 1라운드 — 격차를 매일 좁힘
+  const planRounds={}; let totalRounds=0;
+  depts.forEach(d=>{ const rr=catchUpRounds(d); planRounds[d]=rr; totalRounds+=rr; });
+  DB.growBurst={ active:true, total:totalRounds+2, done:0, mode:"daily", startedAt:Date.now(), finishedAt:0 };
   saveDB();
   for(const d of depts){
-    try{
-      if(!(DB.deptMemory[d]||[]).length){ DB.deptMemory[d]=[{ at:Date.now(), instruction:"[시작]", note:AGENTS[d].kr+" 부서 가동 시작" }]; }
-      await runSelfTraining(d); // 자기주도 훈련 +1 + distill
-    }catch(e){ logError("daily:"+d, e); }
-    DB.growBurst.done++; saveDB(); await new Promise(r=>setTimeout(r,700));
+    if(!(DB.deptMemory[d]||[]).length){ DB.deptMemory[d]=[{ at:Date.now(), instruction:"[시작]", note:AGENTS[d].kr+" 부서 가동 시작" }]; }
+    const rr=planRounds[d]||1;
+    const lagging = rr>1; // 뒤처진 부서
+    for(let k=0;k<rr;k++){
+      try{ await runSelfTraining(d); }catch(e){ logError("daily:"+d, e); } // 자기주도 훈련 +1 + distill
+      DB.growBurst.done++; saveDB(); await new Promise(r=>setTimeout(r,700));
+    }
+    // 뒤처진 부서는 훈련 후 '심화 지식 정리'를 강제로 한 번 더 → 레벨뿐 아니라 실제 전문성·지능이 도약
+    if(lagging){ try{ await distillKnowledge(d, true); await leaderAbsorb(d); }catch(e){ logError("daily-deep:"+d, e); } }
   }
   try{ await runSelfTraining("ops"); }catch(e){ logError("daily:ops", e); }   // 팀장 리더십 훈련
   DB.growBurst.done++; saveDB();
@@ -2227,7 +2273,7 @@ async function runDailyGrowth(){
   try{ await assignDailyDirectives(); }catch(e){ logError("daily-growth:assign", e); } // 팀장이 매일 각 부서에 구체 지시 배정
   DB.lastDailyGrowthDay=kstDay();
   DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
-  try{ kakaoNotify("📅 매일 자동 성장 완료 — 전 부서 자기주도 학습 + 팀장 통합 지능 갱신(무료)"); }catch(_){}
+  try{ const behind=depts.filter(d=>planRounds[d]>1).length; kakaoNotify("📅 매일 자동 성장 완료 — 뒤처진 "+behind+"개 부서를 집중 훈련해 격차를 좁혔어요(무료)."); }catch(_){}
 }
 
 // ===== 팀장이 각 부서 경험을 점검하고 '보완'(부족 지식을 직접 보태 개선) =====
