@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -1767,6 +1767,8 @@ app.get("/api/sync", (req,res)=>{
     briefings: (DB.briefings||[]).filter(b=>b.at>since),
     leadDirectives: (DB.leadDirectives||[]).filter(x=>x.at>since),
     leaderDailyDirective: DB.leaderDailyDirective || {},
+    dirFeedback: DB.dirFeedback || {},
+    capHistory: (DB.capHistory||[]).slice(-120),
     dailyReview: DB.dailyReview || {},
     nightResearch: DB.nightResearch || {},
     leaderReport: buildLeaderReport(),
@@ -2210,8 +2212,10 @@ async function assignDailyDirectives(){
     const score = c ? ("역량 "+c.overall+"(지식"+c.knowledge+"/수행"+c.execution+"/품질"+c.quality+")") : "역량 미평가";
     const r = rev[d];
     const yreview = r ? ("\n  어제 회고: 등급 "+r.grade+(r.tomorrow?(" · 내일방향: "+r.tomorrow):"")+(r.improve?(" · 보완: "+String(r.improve).slice(0,60)):"")) : "";
+    const fb = (DB.dirFeedback&&DB.dirFeedback[d]||[]).filter(x=>!x.used).slice(-3);
+    const fbTxt = fb.length ? ("\n  클라이언트 피드백(반드시 반영): "+fb.map(x=>x.text).join(" / ")) : "";
     const research = (nr[d]&&nr[d].text) ? ("\n  밤새 연구: "+String(nr[d].text).slice(0,160)) : "";
-    return "■ "+AGENTS[d].kr+"("+MEMBERS[d]+") Lv"+lv+" · 경험"+exp+" · "+score+"\n  최근: "+lastTxt+"\n  전문성: "+(kb||"(적음)")+yreview+research;
+    return "■ "+AGENTS[d].kr+"("+MEMBERS[d]+") Lv"+lv+" · 경험"+exp+" · "+score+"\n  최근: "+lastTxt+"\n  전문성: "+(kb||"(적음)")+yreview+fbTxt+research;
   }).join("\n");
   const sys = "너는 이 SNS 자동화 회사 팀장 '08 "+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()
     + " 오늘 하루 각 부서가 스스로 수행할 '구체적이고 실행 가능한' 자율수행 과제를 하나씩 내려라. 막연한 지시(예: '열심히 하세요', '트렌드를 학습하세요') 금지 — 그 부서 역할과 현재 역량(약한 항목)에 맞춰, 오늘 바로 결과물이 나올 수 있는 실무 지시로. **어제 회고의 '내일방향·보완점'과 네가 밤새 조사한 '밤새 연구' 자료를 반드시 이어받아 구체화하라**(연구한 트렌드·아이디어를 지시에 녹여라). 역량이 낮거나 최근 활동이 없는 부서는 우선 기초를 다지는 과제를, 역량이 높은 부서는 더 심화된 과제를 내려라.\n"
@@ -2237,6 +2241,7 @@ async function assignDailyDirectives(){
     return mm;
   });
   DB.lastLeaderDirectDay = day;
+  if(DB.dirFeedback){ Object.keys(DB.dirFeedback).forEach(function(dd){ (DB.dirFeedback[dd]||[]).forEach(function(x){ x.used=true; }); }); }
   saveDB();
   if(n>0) kakaoNotify("🧭 오늘의 팀장 지시 배정 완료 — "+n+"개 부서에 오늘의 자율수행 과제를 내렸어요.").catch(()=>{});
   return DB.leaderDailyDirective;
@@ -2244,6 +2249,26 @@ async function assignDailyDirectives(){
 app.post("/api/ops/daily-directives", async (req,res)=>{
   try{ const r = await assignDailyDirectives(); res.json({ ok:!!r, leaderDailyDirective: DB.leaderDailyDirective||{} }); }
   catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 클라이언트가 팀장 지시에 피드백 → 팀장이 학습해두고 다음날 지시에 참고
+app.post("/api/ops/directive-feedback", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const dept=String(b.dept||"").trim();
+    const text=String(b.text||"").trim();
+    if(!AGENTS[dept]||dept==="ops") return res.status(400).json({ error:"부서를 확인하세요" });
+    if(!text) return res.status(400).json({ error:"피드백 내용을 입력하세요" });
+    DB.dirFeedback = DB.dirFeedback || {};
+    DB.dirFeedback[dept] = DB.dirFeedback[dept] || [];
+    DB.dirFeedback[dept].push({ text:text.slice(0,300), at:Date.now(), day:kstDay(), used:false });
+    if(DB.dirFeedback[dept].length>10) DB.dirFeedback[dept]=DB.dirFeedback[dept].slice(-10);
+    // 부서 메모리에도 남겨 다음 학습·distill에 반영
+    DB.deptMemory[dept]=DB.deptMemory[dept]||[];
+    DB.deptMemory[dept].push({ at:Date.now(), instruction:"[클라이언트 피드백]", note:text.slice(0,300) });
+    if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+    saveDB();
+    res.json({ ok:true, dirFeedback: DB.dirFeedback });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
 async function runDailyGrowth(){
@@ -2363,6 +2388,17 @@ async function assessCapability(){
     const top=k=>Math.max.apply(null,ds.map(x=>x[k]||0));
     DB.capability.ops={ knowledge:Math.min(100,top("knowledge")+5), execution:Math.min(100,top("execution")+5), quality:Math.min(100,top("quality")+5), overall:Math.min(100, Math.round((Math.min(100,top("knowledge")+5)+Math.min(100,top("execution")+5)+Math.min(100,top("quality")+5))/3)), at:Date.now(), isLeader:true };
   }
+  // 일간/주간/누적 비교용 스냅샷 기록 (부서별 종합 + 팀 평균)
+  try{
+    const dd=depts.map(d=>DB.capability[d]).filter(Boolean);
+    if(dd.length){
+      const avg=Math.round(dd.reduce((s,x)=>s+(x.overall||0),0)/dd.length);
+      const per={}; depts.forEach(d=>{ if(DB.capability[d]) per[d]=DB.capability[d].overall; });
+      DB.capHistory=DB.capHistory||[];
+      DB.capHistory.push({ at:Date.now(), day:kstDay(), avg, per });
+      if(DB.capHistory.length>400) DB.capHistory=DB.capHistory.slice(-400);
+    }
+  }catch(e){}
   saveDB();
   return DB.capability;
 }
