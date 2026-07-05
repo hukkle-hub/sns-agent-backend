@@ -419,10 +419,11 @@ function catchUpRounds(dept){
   const e=expOf(dept);
   if(e>=avg) return 1;                       // 평균 이상이면 1회
   const gap=avg-e;
-  // 평균보다 낮을수록 더 많이(최대 6회). 최고 부서와의 격차가 크면 가중.
-  let r=1+Math.round(gap/Math.max(3,avg*0.25));
-  if(top>0 && e < top*0.4) r+=1;             // 최고 대비 40% 미만이면 +1 추가 부스트
-  return Math.max(1, Math.min(6, r));
+  // 평균보다 낮을수록 더 많이. 무료(Gemini) 한도 안에서 격차를 확실히 좁히도록 최대 12회까지 허용.
+  let r=1+Math.round(gap/Math.max(3,avg*0.2));
+  if(top>0 && e < top*0.4) r+=2;             // 최고 대비 40% 미만이면 강하게 부스트
+  if(top>0 && e < top*0.2) r+=2;             // 20% 미만이면 추가 부스트
+  return Math.max(1, Math.min(12, r));
 }
 // 팀장(오세라)은 항상 최고 부서보다 1레벨 이상 위에 있어야 부서를 지시·균형 잡을 수 있다
 function ensureLeaderLead(){
@@ -2098,8 +2099,8 @@ async function runTrainingRound(n){
   const cap=n||2;
   DB.lastTrainAt=DB.lastTrainAt||{};
   const cands=Object.keys(AGENTS).filter(d=>d!=="ops" && (DB.deptMemory[d]||[]).length>=2);
-  // 뒤처진 부서(경험치 낮은 순)를 우선 훈련 → 성장 격차를 좁힘. 동률이면 오래 안 한 순.
-  cands.sort((x,y)=> (((DB.exp&&DB.exp[x])||0)-((DB.exp&&DB.exp[y])||0)) || ((DB.lastTrainAt[x]||0)-(DB.lastTrainAt[y]||0)));
+  // 모든 부서가 골고루 훈련되도록 '오래 훈련 안 한 순'으로 정렬(공평 순환). 동률이면 경험치 낮은 부서 먼저.
+  cands.sort((x,y)=> ((DB.lastTrainAt[x]||0)-(DB.lastTrainAt[y]||0)) || (((DB.exp&&DB.exp[x])||0)-((DB.exp&&DB.exp[y])||0)));
   const picked=cands.slice(0,cap); const done=[];
   for(const d of picked){ try{ const r=await runSelfTraining(d); if(r) done.push(r.name); }catch(e){ logError("train:"+d, e); } }
   ensureLeaderLead(); saveDB();
@@ -3060,6 +3061,14 @@ function queueContentApproval(dept, topic, label, content, reviews){
   DB.contentApprovals.push(item);
   if(DB.contentApprovals.length>50) DB.contentApprovals=DB.contentApprovals.slice(-50);
   saveDB();
+  // 새 콘텐츠가 올라오면 카톡 알림 (설정 contentNotify가 false가 아니면 기본 ON)
+  try {
+    if((DB.state||{}).contentNotify !== false){
+      const deptKr = (AGENTS[dept]?AGENTS[dept].kr:dept)||"";
+      const preview = String(content||"").replace(/\s+/g," ").slice(0,80);
+      kakaoNotify("📝 새 콘텐츠가 올라왔어요 — "+deptKr+(topic?(" · "+String(topic).slice(0,30)):"")+"\n\""+preview+(String(content||"").length>80?"…":"")+"\"\n\n앱 '콘텐츠' 탭에서 확인·승인하세요.").catch(()=>{});
+    }
+  } catch(e){}
   return item;
 }
 app.get("/api/content-approvals", (req,res)=>{
@@ -3487,6 +3496,8 @@ async function runProjectCycle(project){
   if (!geminiAutoAllowed()) return null;
   const eng = "gemini";
   const p = project;
+  const setPhase = (t)=>{ p.progress = t; p.progressAt = Date.now(); saveDB(); };
+  setPhase("🔎 최신 자료 수집 중…");
   const recent = p.log.slice(-4).map(x=>"· C"+x.cycle+" ["+(AGENTS[x.dept]?AGENTS[x.dept].kr:x.dept)+"] "+String(x.work||"").slice(0,120)).join("\n") || "(아직 진행 없음)";
   const pendingNotes = (p.clientNotes||[]).filter(n=>!n.used);
   const noteTxt = pendingNotes.map(n=>n.text).join(" / ");
@@ -3502,6 +3513,7 @@ async function runProjectCycle(project){
   }catch(e){ logError("project-research:"+p.id, e); }
 
   // 2) 팀장이 이번 사이클 할 일 결정: 어느 부서 / 무슨 과제 (의견 최우선 반영) + 중대결정 시 확인요청
+  setPhase("👑 팀장이 이번 할 일 정하는 중…");
   let pick, task, holdReason="";
   try{
     const latestResearch = (p.research.slice(-1)[0]||{}).text||"";
@@ -3525,13 +3537,14 @@ async function runProjectCycle(project){
     p.cycle++;
     if(p.log.length>60) p.log=p.log.slice(-60);
     p.nextAt = Date.now() + p.intervalMin*60000;
-    saveDB();
+    p.progress = ""; saveDB();
     try{ kakaoProjectApproval(p).catch(()=>{ kakaoNotify("🙋 프로젝트 '"+p.title+"' — 팀장이 클라이언트 확인을 요청했어요:\n"+holdReason+"\n\n앱 프로젝트 탭에서 의견을 남기면 다시 진행해요.").catch(()=>{}); }); }catch(e){}
     return p;
   }
   if(!pick){ pick=p.depts[p.cycle % p.depts.length]; task=p.goal; }
 
   // 3) 부서 수행
+  setPhase("✍️ "+(AGENTS[pick]?AGENTS[pick].kr:pick)+" 부서 작업 중: "+String(task||"").slice(0,40));
   let work="";
   try{
     const a=AGENTS[pick];
@@ -3540,9 +3553,10 @@ async function runProjectCycle(project){
     sys+="\n\n[프로젝트]\n"+p.title+" / 목표: "+p.goal+"\n[이번 과제]\n"+task+"\n최근 진행:\n"+recent;
     sys+=" 이 과제를 실제 결과물 수준으로 수행하라. 되묻지 말고 완성해서 한국어로."+profileContext();
     work=await genText(sys, task, 1200, eng);
-  }catch(e){ logError("project-work:"+p.id, e); work="(수행 실패)"; }
+  }catch(e){ logError("project-work:"+p.id, e); work="(수행 실패: "+String(e&&e.message||e).slice(0,120)+")"; }
 
   // 4) 검수(감사부 PASS/FAIL) + 5) 팀장 보완평가
+  setPhase("🔍 검수·팀장 보완평가 중…");
   let review="", refine="";
   try{ const rv=await reviewContent(work, p.title, eng); review=(rv.pass?"PASS":"FAIL")+(rv.feedback?" · "+rv.feedback:""); }catch(e){}
   try{
@@ -3568,7 +3582,7 @@ async function runProjectCycle(project){
     if(p.outputs.length>40) p.outputs=p.outputs.slice(-40);
   }
   p.nextAt = Date.now() + p.intervalMin*60000;
-  saveDB();
+  p.progress = ""; saveDB();
   return p;
 }
 
