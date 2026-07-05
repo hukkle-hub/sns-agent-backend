@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -1932,6 +1932,7 @@ app.get("/api/sync", (req,res)=>{
     dirFeedback: DB.dirFeedback || {},
     capHistory: (DB.capHistory||[]).slice(-120),
     contentApprovals: (DB.contentApprovals||[]).filter(a=>a.status==="pending"),
+    projects: (DB.projects||[]).filter(p=>p.status!=="deleted"),
     dailyReview: DB.dailyReview || {},
     nightResearch: DB.nightResearch || {},
     leaderReport: buildLeaderReport(),
@@ -2600,6 +2601,42 @@ app.get("/api/meeting/:id", (req,res)=>{
 });
 // 예약 회의 목록/등록/삭제: time "HH:MM"(KST), repeat "daily"|"once"
 app.get("/api/meeting-schedules", (req,res)=> res.json(DB.meetingSchedules||[]));
+// ===== 프로젝트 엔드포인트 =====
+app.get("/api/projects", (req,res)=>{ res.json((DB.projects||[]).filter(p=>p.status!=="deleted")); });
+app.post("/api/projects/create", (req,res)=>{
+  try{ const p=createProject(req.body||{}); res.json({ ok:true, project:p }); }
+  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
+});
+app.post("/api/projects/run", async (req,res)=>{
+  try{ const p=projectById((req.body||{}).id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
+    if(p.status!=="active") return res.status(400).json({ error:"진행 중인 프로젝트가 아니에요" });
+    const r=await runProjectCycle(p); res.json({ ok:!!r, project:p }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/projects/note", (req,res)=>{
+  try{ const b=req.body||{}; const p=projectById(b.id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
+    const t=String(b.text||"").trim(); if(!t) return res.status(400).json({ error:"의견을 입력하세요" });
+    p.clientNotes=p.clientNotes||[]; p.clientNotes.push({ at:Date.now(), text:t.slice(0,500), used:false });
+    // 확인 대기 중이던 프로젝트는 의견을 받으면 다시 진행
+    if(p.status==="awaiting"){ p.status="active"; p.holdReason=""; p.nextAt=Date.now(); }
+    saveDB();
+    res.json({ ok:true, project:p }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/projects/interval", (req,res)=>{
+  try{ const b=req.body||{}; const p=projectById(b.id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
+    if([30,60,120].indexOf(+b.intervalMin)<0) return res.status(400).json({ error:"30/60/120 중 선택" });
+    p.intervalMin=+b.intervalMin; p.nextAt=Date.now()+p.intervalMin*60000; saveDB();
+    res.json({ ok:true, project:p }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/projects/status", (req,res)=>{
+  try{ const b=req.body||{}; const p=projectById(b.id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
+    const s=String(b.status||""); if(["active","paused","archived","deleted"].indexOf(s)<0) return res.status(400).json({ error:"상태값 오류" });
+    if(s==="active"){ const act=(DB.projects||[]).filter(x=>x.status==="active"&&x.id!==p.id); if(act.length>=2) return res.status(400).json({ error:"동시 진행은 최대 2개" }); p.nextAt=Date.now(); }
+    p.status=s; saveDB(); res.json({ ok:true, project:p }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
 app.post("/api/meeting-schedule", (req,res)=>{
   const b = req.body||{};
   const { topic, depts, rounds, time, room } = b;
@@ -3187,14 +3224,29 @@ setInterval(async ()=>{
       }
     }
   } catch(e){ /* 훈련 실패 무시 */ }
+  // 프로젝트 자동 사이클: 각 프로젝트의 설정 간격마다 한 사이클 진행(회의 대체, 지속형)
+  try{
+    for (const p of (DB.projects||[])){
+      if (!p || p.status!=="active") continue;
+      if (Date.now() >= (p.nextAt||0) && !p._running){
+        p._running = true; saveDB();
+        runProjectCycle(p).then(()=>{ p._running=false; saveDB(); }).catch(e=>{ p._running=false; logError("project-cycle:"+p.id, e); });
+      }
+    }
+  }catch(e){ /* 프로젝트 사이클 실패 무시 */ }
   for (const ms of (DB.meetingSchedules||[])){
     let due = false;
     if (ms.repeat === "interval"){
       if (!ms.nextAt) ms.nextAt = nowMs; // 안전 보정
       if (nowMs >= ms.nextAt) due = true;
-    } else if (ms.time === hm && ms.lastRunDay !== day){
-      if (ms.repeat === "weekly") due = (ms.days||[]).indexOf(dow) >= 0; // 지정 요일만
-      else due = true; // once / daily
+    } else if (ms.lastRunDay !== day){
+      // 정확한 '분' 일치를 요구하지 않고, 예약 시각을 지났으면 그날 1회 실행(놓침 방지)
+      const sched = String(ms.time||"").split(":");
+      const schedMin = (parseInt(sched[0],10)||0)*60 + (parseInt(sched[1],10)||0);
+      const nowMin = kstNow().getUTCHours()*60 + kstNow().getUTCMinutes();
+      const timeReached = nowMin >= schedMin;
+      if (ms.repeat === "weekly") due = timeReached && (ms.days||[]).indexOf(dow) >= 0; // 지정 요일만
+      else due = timeReached; // once / daily
     }
     if (!due) continue;
     if (ms.repeat === "interval"){
@@ -3257,6 +3309,122 @@ setInterval(async ()=>{
 }, 60000);
 
 // 한 부서의 자율수행 1회 실행 (지시가 있으면 지시 수행, 없으면 트렌드 학습/반응 수집)
+// ===== 프로젝트 엔진: 회의를 대체하는 지속형 협업(팀장 리드 → 부서 수행 → 검수 → 기록, 의견 반영) =====
+function createProject(opts){
+  DB.projects = DB.projects || [];
+  const active = DB.projects.filter(p=>p.status==="active");
+  if (active.length >= 2) throw new Error("동시 진행 프로젝트는 최대 2개예요. 기존 프로젝트를 보관(archive) 후 시작하세요.");
+  const p = {
+    id: Date.now()+Math.floor(Math.random()*1000),
+    title: String(opts.title||"무제 프로젝트").slice(0,120),
+    goal: String(opts.goal||opts.title||"").slice(0,600),
+    depts: (Array.isArray(opts.depts)&&opts.depts.length) ? opts.depts.filter(d=>AGENTS[d]&&d!=="ops") : Object.keys(AGENTS).filter(d=>d!=="ops"),
+    intervalMin: [30,60,120].indexOf(+opts.intervalMin)>=0 ? +opts.intervalMin : 60,
+    status: "active",
+    cycle: 0,
+    log: [],            // [{cycle, at, dept, work, review, refine}]
+    research: [],       // [{at, text, sources}]
+    clientNotes: [],    // [{at, text, used}]
+    outputs: [],        // 산출물(승인 대기로 연결된 것들)
+    nextAt: Date.now(), // 다음 자동 사이클 시각
+    at: Date.now()
+  };
+  DB.projects.push(p); saveDB();
+  return p;
+}
+function projectById(id){ return (DB.projects||[]).find(p=>String(p.id)===String(id)); }
+
+// 프로젝트 한 사이클: 팀장이 목표+지금까지 진행+클라이언트 의견을 보고 → 한 부서에 과제 지정 → 수행 → 검수 → 팀장 보완평가 → 기록
+async function runProjectCycle(project){
+  if (!project || project.status!=="active") return null;
+  if (!geminiAutoAllowed()) return null;
+  const eng = "gemini";
+  const p = project;
+  const recent = p.log.slice(-4).map(x=>"· C"+x.cycle+" ["+(AGENTS[x.dept]?AGENTS[x.dept].kr:x.dept)+"] "+String(x.work||"").slice(0,120)).join("\n") || "(아직 진행 없음)";
+  const pendingNotes = (p.clientNotes||[]).filter(n=>!n.used);
+  const noteTxt = pendingNotes.map(n=>n.text).join(" / ");
+
+  // 1) 자료수집(사이클마다 새로고침, 무료 검색 한도 안에서만)
+  try{
+    const st=DB.state||{};
+    if (st.nightSearchOn!==false && searchAllowedNow()){
+      const sp="너는 팀장 '"+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'다. 아래 프로젝트에 지금 당장 유용한 최신 자료·트렌드·사례를 전 세계 공개 웹에서 조사해 200자 내외로 정리하라. 딥웹·비공개 제외.\n프로젝트: "+p.title+"\n목표: "+p.goal;
+      const r=await geminiSearch(sp, 1200);
+      if (r&&r.text){ p.research.push({ at:Date.now(), text:String(r.text).slice(0,400), sources:(r.sources||[]).slice(0,5) }); if(p.research.length>30) p.research=p.research.slice(-30); }
+    }
+  }catch(e){ logError("project-research:"+p.id, e); }
+
+  // 2) 팀장이 이번 사이클 할 일 결정: 어느 부서 / 무슨 과제 (의견 최우선 반영) + 중대결정 시 확인요청
+  let pick, task, holdReason="";
+  try{
+    const latestResearch = (p.research.slice(-1)[0]||{}).text||"";
+    const sys="너는 이 회사 팀장 '"+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()
+      +" 아래 프로젝트를 최상의 결과로 이끌기 위해, 이번 사이클에 '어느 부서'가 '무슨 구체적 과제'를 할지 하나 정하라. 지금까지 진행을 이어 더 나은 방향으로 발전시키고, 클라이언트 의견이 있으면 반드시 최우선 반영하라. 막연한 지시 금지.\n"
+      +" 단, 클라이언트가 직접 결정해야 할 '중대한 방향 결정'(예: 큰 예산·핵심 콘셉트·법적 리스크·되돌리기 어려운 선택)이 필요하면, 진행하지 말고 확인을 요청하라.\n"
+      +"프로젝트: "+p.title+"\n목표: "+p.goal+"\n참여부서(영문키): "+p.depts.join(", ")
+      +"\n최근 진행:\n"+recent+(latestResearch?("\n최신 수집자료: "+latestResearch):"")+(noteTxt?("\n\n★ 클라이언트 의견(최우선 반영): "+noteTxt):"")
+      +"\n\n형식만 출력(둘 중 하나):\n진행: PICK: 부서영문키 | TASK: 이번 과제(한국어 1문장)\n확인요청: HOLD: 클라이언트에게 물어볼 중대 결정 사항(한국어 1~2문장)";
+    const out=await genText(sys, "이번 사이클을 정하라.", 400, eng);
+    const hm=String(out).match(/HOLD:\s*(.+)/i);
+    const m=String(out).match(/PICK:\s*([a-z]+)\s*\|\s*TASK:\s*(.+)/i);
+    if(hm && !m){ holdReason=String(hm[1]||"").trim().slice(0,300); }
+    else if(m && AGENTS[m[1].trim()] && m[1].trim()!=="ops"){ pick=m[1].trim(); task=String(m[2]||"").trim().slice(0,200); }
+  }catch(e){ logError("project-pick:"+p.id, e); }
+
+  // 팀장이 중대결정 확인을 요청하면: 이 사이클 대기 + 카카오 알림
+  if(holdReason){
+    p.status="awaiting"; p.holdReason=holdReason; p.holdAt=Date.now();
+    p.log.push({ cycle:p.cycle+1, at:Date.now(), dept:"ops", task:"[확인 필요] "+holdReason, work:"", review:"", refine:"", hold:true });
+    p.cycle++;
+    if(p.log.length>60) p.log=p.log.slice(-60);
+    p.nextAt = Date.now() + p.intervalMin*60000;
+    saveDB();
+    try{ kakaoNotify("🙋 프로젝트 '"+p.title+"' — 팀장이 클라이언트 확인을 요청했어요:\n"+holdReason+"\n\n앱 프로젝트 탭에서 의견을 남기면 다시 진행해요.").catch(()=>{}); }catch(e){}
+    return p;
+  }
+  if(!pick){ pick=p.depts[p.cycle % p.depts.length]; task=p.goal; }
+
+  // 3) 부서 수행
+  let work="";
+  try{
+    const a=AGENTS[pick];
+    let sys="너는 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(pick);
+    const kb=knowledgeText(pick); if(kb) sys+="\n\n[축적 전문성]\n"+kb.slice(0,600);
+    sys+="\n\n[프로젝트]\n"+p.title+" / 목표: "+p.goal+"\n[이번 과제]\n"+task+"\n최근 진행:\n"+recent;
+    sys+=" 이 과제를 실제 결과물 수준으로 수행하라. 되묻지 말고 완성해서 한국어로."+profileContext();
+    work=await genText(sys, task, 1200, eng);
+  }catch(e){ logError("project-work:"+p.id, e); work="(수행 실패)"; }
+
+  // 4) 검수(감사부 PASS/FAIL) + 5) 팀장 보완평가
+  let review="", refine="";
+  try{ const rv=await reviewContent(work, p.title, eng); review=(rv.pass?"PASS":"FAIL")+(rv.feedback?" · "+rv.feedback:""); }catch(e){}
+  try{
+    const sys="너는 팀장 '"+AGENTS.ops.kr+"'다."+ADDRESS+" 방금 '"+(AGENTS[pick].kr)+"' 부서가 한 아래 결과를 평가하고, 다음 사이클에 더 나아지도록 '보완 방향' 한두 문장을 제시하라. 프로젝트 목표: "+p.goal;
+    refine=await genText(sys, "[결과]\n"+String(work).slice(0,1200), 400, eng);
+  }catch(e){}
+
+  // 6) 기록 + 학습 + 의견 소진
+  p.cycle++;
+  p.log.push({ cycle:p.cycle, at:Date.now(), dept:pick, task, work:String(work).slice(0,1500), review, refine:String(refine).slice(0,400) });
+  if(p.log.length>60) p.log=p.log.slice(-60);
+  pendingNotes.forEach(n=>{ n.used=true; });
+  DB.deptMemory[pick]=DB.deptMemory[pick]||[];
+  DB.deptMemory[pick].push({ at:Date.now(), instruction:"[프로젝트] "+p.title, note:task+" → "+String(work).slice(0,300) });
+  DB.exp=DB.exp||{}; DB.exp[pick]=(DB.exp[pick]||0)+1;
+  if(DB.exp[pick]%3===0){ try{ await distillKnowledge(pick); }catch(e){} }
+  try{ await leaderAbsorb(pick); }catch(e){}
+
+  // 7) 산출물이면 확인 대기로(검수 PASS면 실질 결과물로 간주)
+  if(/PASS/.test(review)){
+    const it=queueContentApproval(pick, p.title, "["+p.title+"] C"+p.cycle, work, [{round:p.cycle,verdict:"PASS",feedback:""}]);
+    p.outputs.push({ approvalId:it.id, cycle:p.cycle, at:Date.now() });
+    if(p.outputs.length>40) p.outputs=p.outputs.slice(-40);
+  }
+  p.nextAt = Date.now() + p.intervalMin*60000;
+  saveDB();
+  return p;
+}
+
 async function autoRunDept(dept, directive){
   const a = AGENTS[dept]; if(!a) return;
   const col = (DB.state && DB.state.collect) || {};
@@ -3372,17 +3540,43 @@ async function checkStaleDepts(maxHandle, force){
 async function runAutoCycle(){
   if (!geminiAutoAllowed()) return; // Gemini 월 예산 초과/하루 페이싱 → 자동수행 잠시 멈춤(다음 주기 재개)
   const dir = (DB.state && DB.state.deptDirective) || {};
-  const allIds = Object.keys(AGENTS);
-  const dirDepts = allIds.filter(d => dir[d] && String(dir[d]).trim());
-  const noDir = allIds.filter(d => !(dir[d] && String(dir[d]).trim()));
-  for (const d of dirDepts) { try { await autoRunDept(d, String(dir[d]).trim()); } catch(e){ logError("auto-dir:"+d, e); } }
-  if (noDir.length) {
-    DB.learnIdx = (DB.learnIdx||0) % noDir.length;
-    const d = noDir[DB.learnIdx];
-    DB.learnIdx = (DB.learnIdx + 1) % noDir.length;
-    const ldd = DB.leaderDailyDirective || {};
-    const leaderInst = (ldd[d] && ldd[d].text) ? String(ldd[d].text).trim() : "";
-    try { await autoRunDept(d, leaderInst); } catch(e){ logError("auto-learn:"+d, e); }
+  const ldd = DB.leaderDailyDirective || {};
+  const allIds = Object.keys(AGENTS).filter(d => d !== "ops");
+  const today = kstDay();
+  const _now = Date.now();
+  DB.autoRunDay = DB.autoRunDay || {};        // { dept: {day, count} } 오늘 몇 번 돌았는지
+  const ranToday = (d)=> (DB.autoRunDay[d] && DB.autoRunDay[d].day===today) ? DB.autoRunDay[d].count : 0;
+  const markRun = (d)=>{ if(!DB.autoRunDay[d] || DB.autoRunDay[d].day!==today) DB.autoRunDay[d]={day:today,count:0}; DB.autoRunDay[d].count++; };
+  const lastActAt = (d)=>{ const mm=DB.deptMemory[d]||[]; return mm.length?(mm[mm.length-1].at||0):0; };
+  const instFor = (d)=> (dir[d] && String(dir[d]).trim()) ? String(dir[d]).trim()          // 클라이언트 직접 지시 우선
+                       : (ldd[d] && ldd[d].text ? String(ldd[d].text).trim() : "");         // 없으면 팀장 일일지시
+
+  // 이 부서가 오늘 목표로 몇 번 돌아야 하는가: 기본 1회 + 뒤처진 만큼 추가(최대 3회)
+  const avgLv = (function(){ const v=allIds.map(deptLevel); return v.reduce((a,b)=>a+b,0)/(v.length||1); })();
+  const targetRuns = (d)=>{
+    let t = 1;                                                  // 매일 최소 1회(팀장 지시 수행)
+    const lv = deptLevel(d);
+    const stalledH = (_now - lastActAt(d))/3600000;
+    if (lv < avgLv*0.6) t += 2;                                 // 역량이 평균의 60% 미만이면 +2
+    else if (lv < avgLv) t += 1;                                // 평균 미만이면 +1
+    if (stalledH > 24) t += 1;                                  // 하루 넘게 멈췄으면 +1
+    return Math.max(1, Math.min(3, t));                        // 하루 1~3회
+  };
+
+  // 우선순위: (오늘 아직 목표 미달) 부서 중, 역량 낮고 오래 멈춘 순
+  const need = allIds.filter(d => ranToday(d) < targetRuns(d))
+    .sort((a,b)=>{
+      const la=deptLevel(a), lb=deptLevel(b);
+      if (la!==lb) return la-lb;                                // 역량 낮은 순
+      return lastActAt(a)-lastActAt(b);                         // 그다음 오래 멈춘 순
+    });
+
+  // 이번 주기 실행량: 목표 미달 부서가 많으면 밀리지 않게 넉넉히(최대 6개/주기)
+  const runList = need.slice(0, Math.min(6, need.length));
+  for (const d of runList){
+    try { await autoRunDept(d, instFor(d)); markRun(d); }
+    catch(e){ logError("auto:"+d, e); }
+    await new Promise(r=>setTimeout(r, 500));                   // 429 방지 간격
   }
   DB.lastCollectAt = Date.now(); saveDB();
 }
