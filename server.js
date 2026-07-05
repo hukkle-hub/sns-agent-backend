@@ -1069,15 +1069,36 @@ const publishers = {
 };
 // ===== 발행 전 감사(08) + 한도 =====
 function randCode(){ return Math.random().toString(36).slice(2,6).toUpperCase(); }
+function publicBase(){ return process.env.PUBLIC_BASE || process.env.RENDER_EXTERNAL_URL || process.env.SELF_URL || ""; }
 async function kakaoApprovalRequest(c, platforms, id, code){
   let token; try { token = await getKakaoToken(); } catch(e){ return false; }
-  const base = process.env.PUBLIC_BASE || "";
+  const base = publicBase();
   const text = "📢 발행 승인 요청\n플랫폼: "+platforms.join(", ")+"\n내용: "+((c.description||c.caption||"").slice(0,120));
   const tpl = {
     object_type:"text", text, link:{ web_url:"", mobile_web_url:"" },
     buttons:[
       { title:"✅ 승인", link:{ web_url: base+"/api/approve?id="+id+"&code="+code, mobile_web_url: base+"/api/approve?id="+id+"&code="+code } },
       { title:"❌ 거절", link:{ web_url: base+"/api/reject?id="+id+"&code="+code, mobile_web_url: base+"/api/reject?id="+id+"&code="+code } }
+    ]
+  };
+  const r = await fetch("https://kapi.kakao.com/v2/api/talk/memo/default/send", {
+    method:"POST", headers:{ "Authorization":"Bearer "+token, "Content-Type":"application/x-www-form-urlencoded" },
+    body: "template_object=" + encodeURIComponent(JSON.stringify(tpl))
+  });
+  return r.ok;
+}
+// 프로젝트 중대결정: 카톡으로 승인/보류 버튼 전송 (승인 시 즉시 진행)
+async function kakaoProjectApproval(project){
+  let token; try { token = await getKakaoToken(); } catch(e){ return false; }
+  const base = publicBase();
+  const code = randCode();
+  project.approveCode = code; saveDB();
+  const text = "🙋 프로젝트 확인 요청\n["+String(project.title||"").slice(0,40)+"]\n"+String(project.holdReason||"").slice(0,300)+"\n\n승인하면 이 방향으로 계속 진행해요.";
+  const tpl = {
+    object_type:"text", text, link:{ web_url:"", mobile_web_url:"" },
+    buttons:[
+      { title:"✅ 승인·계속 진행", link:{ web_url: base+"/api/projects/approve?id="+project.id+"&code="+code, mobile_web_url: base+"/api/projects/approve?id="+project.id+"&code="+code } },
+      { title:"⏸ 보류(앱에서 지시)", link:{ web_url: base+"/api/projects/hold?id="+project.id+"&code="+code, mobile_web_url: base+"/api/projects/hold?id="+project.id+"&code="+code } }
     ]
   };
   const r = await fetch("https://kapi.kakao.com/v2/api/talk/memo/default/send", {
@@ -2465,7 +2486,14 @@ async function runDailyGrowth(){
   try{ await assignDailyDirectives(); }catch(e){ logError("daily-growth:assign", e); } // 팀장이 매일 각 부서에 구체 지시 배정
   DB.lastDailyGrowthDay=kstDay();
   DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
-  try{ const behind=depts.filter(d=>planRounds[d]>1).length; kakaoNotify("📅 매일 자동 성장 완료 — 뒤처진 "+behind+"개 부서를 집중 훈련해 격차를 좁혔어요(무료)."); }catch(_){}
+  try{
+    const behind=depts.filter(d=>planRounds[d]>1).length;
+    if(behind>0){
+      kakaoNotify("📅 매일 자동 성장 완료 — 뒤처진 "+behind+"개 부서를 집중 훈련해 격차를 좁혔어요(무료).");
+    } else {
+      kakaoNotify("📅 매일 자동 성장 완료 — 전 부서가 고르게 성장 중이라 뒤처진 부서 없이 균등 훈련했어요(무료).");
+    }
+  }catch(_){}
 }
 
 // ===== 팀장이 각 부서 경험을 점검하고 '보완'(부족 지식을 직접 보태 개선) =====
@@ -2626,9 +2654,42 @@ app.post("/api/projects/note", (req,res)=>{
     res.json({ ok:true, project:p }); }
   catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
+// 즉시 지시: 의견을 남기고 다음 사이클을 기다리지 않고 지금 바로 1회 사이클 실행
+app.post("/api/projects/note-run", async (req,res)=>{
+  try{ const b=req.body||{}; const p=projectById(b.id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
+    const t=String(b.text||"").trim();
+    if(t){ p.clientNotes=p.clientNotes||[]; p.clientNotes.push({ at:Date.now(), text:t.slice(0,500), used:false }); }
+    if(p.status==="awaiting"){ p.status="active"; p.holdReason=""; }
+    if(p.status!=="active"){ p.status="active"; }
+    saveDB();
+    const r=await runProjectCycle(p); // 지금 즉시 한 사이클
+    res.json({ ok:!!r, project:p }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 토론: 팀장에게 질문/의견을 보내면 즉답을 받고 프로젝트 맥락에 대화로 남김
+app.post("/api/projects/discuss", async (req,res)=>{
+  try{ const b=req.body||{}; const p=projectById(b.id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
+    const t=String(b.text||"").trim(); if(!t) return res.status(400).json({ error:"내용을 입력하세요" });
+    if(!geminiAutoAllowed()) return res.status(400).json({ error:"지금은 자동 지능작업 예산이 소진돼 잠시 후 가능해요" });
+    p.discuss=p.discuss||[];
+    p.discuss.push({ at:Date.now(), role:"client", text:t.slice(0,600) });
+    const recent = (p.log||[]).slice(-4).map(x=>"· C"+x.cycle+" ["+(AGENTS[x.dept]?AGENTS[x.dept].kr:x.dept)+"] "+String(x.work||"").slice(0,100)).join("\n") || "(아직 진행 없음)";
+    const chat = p.discuss.slice(-8).map(m=>(m.role==="client"?"클라이언트: ":"팀장: ")+m.text).join("\n");
+    const sys="너는 이 회사 팀장 '"+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()
+      +" 아래 프로젝트에 대해 클라이언트와 토론 중이다. 클라이언트의 마지막 말에 대해 팀장으로서 구체적이고 실질적으로 답하라. 방향 제시·근거·다음 액션을 명확히. 되묻기만 하지 말고 네 판단을 제시하되, 클라이언트 결정이 필요한 지점은 짚어라. 한국어로 3~6문장."
+      +"\n프로젝트: "+p.title+"\n목표: "+p.goal+"\n최근 진행:\n"+recent+"\n\n[대화]\n"+chat;
+    let reply="";
+    try{ reply=await genText(sys, "팀장으로서 답하라.", 600, "gemini"); }catch(e){ logError("project-discuss:"+p.id, e); }
+    if(!reply) reply="(지금 답변을 생성하지 못했어요. 잠시 후 다시 시도해 주세요.)";
+    p.discuss.push({ at:Date.now(), role:"lead", text:String(reply).slice(0,900) });
+    if(p.discuss.length>40) p.discuss=p.discuss.slice(-40);
+    saveDB();
+    res.json({ ok:true, reply:String(reply), project:p }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
 app.post("/api/projects/interval", (req,res)=>{
   try{ const b=req.body||{}; const p=projectById(b.id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
-    if([30,60,120].indexOf(+b.intervalMin)<0) return res.status(400).json({ error:"30/60/120 중 선택" });
+    if([60,120,180,360,720,1440].indexOf(+b.intervalMin)<0) return res.status(400).json({ error:"허용된 간격이 아니에요(1/2/3/6/12/24시간)" });
     p.intervalMin=+b.intervalMin; p.nextAt=Date.now()+p.intervalMin*60000; saveDB();
     res.json({ ok:true, project:p }); }
   catch(e){ res.status(500).json({ error:String(e.message||e) }); }
@@ -2864,20 +2925,85 @@ app.post("/api/kakao/webhook", async (req,res)=>{
   try {
     const utter = req.body?.userRequest?.utterance || "";
     const uid = req.body?.userRequest?.user?.id || "";
+    const callbackUrl = req.body?.userRequest?.callbackUrl || "";
     if (ALLOWED_KAKAO.length && !ALLOWED_KAKAO.includes(uid)) {
       return res.json(kakaoText("권한이 없는 사용자입니다."));
     }
-    // 예약 외부발행 관리 의도면 팀장(오세라)이 직접 처리
-    const isSchedCmd = /예약/.test(utter) || (/발행|게시|올려|포스팅/.test(utter) && /(매일|매주|오전|오후|\d\s*시|\d\s*건|건수|시각|시간|취소|삭제|목록|중단|정지)/.test(utter));
-    if (isSchedCmd) {
-      const out = await opsCommand(utter, "kakao");
-      return res.json(kakaoText((out && out.reply) || "예약 발행을 처리했어요."));
+    // 콜백 지원 봇(AI 챗봇 전환 완료): 5초 제한을 넘기지 않도록 즉시 대기응답 후 백그라운드 처리
+    if (callbackUrl) {
+      res.json({ version:"2.0", useCallback:true, data:{ text:"팀장이 살펴보고 있어요… 잠시만요 🙂" } });
+      // 백그라운드에서 실제 처리 → callbackUrl로 최종 답 전송
+      (async ()=>{
+        let reply = "";
+        try { reply = await processKakaoUtterance(utter); }
+        catch(e){ reply = "처리 오류: "+(e.message||e); }
+        try {
+          await fetch(callbackUrl, {
+            method:"POST", headers:{ "Content-Type":"application/json" },
+            body: JSON.stringify(kakaoText(String(reply||"처리했습니다.").slice(0,3800)))
+          });
+        } catch(e){ logError("kakao-callback-send", e); }
+      })();
+      return;
     }
-    const job = await handleInstruction(utter, "kakao");
-    const reply = job.results.map(r=>AGENTS[r.dept].no+" "+AGENTS[r.dept].kr+":\n"+r.text).join("\n\n").slice(0,1000);
-    res.json(kakaoText(reply || "처리했습니다."));
+    // 콜백 미지원(심사 전): 동기 처리 — 5초 안에 끝나는 간단한 명령만 정상 응답
+    const reply = await processKakaoUtterance(utter);
+    res.json(kakaoText(String(reply||"처리했습니다.").slice(0,3800)));
   } catch(e){ res.json(kakaoText("처리 오류: "+(e.message||e))); }
 });
+// 카카오 발화 1건을 처리해 답변 텍스트를 돌려준다 (동기/콜백 공용)
+async function processKakaoUtterance(utter){
+  // 예약 외부발행 관리 의도면 팀장(오세라)이 직접 처리
+  const isSchedCmd = /예약/.test(utter) || (/발행|게시|올려|포스팅/.test(utter) && /(매일|매주|오전|오후|\d\s*시|\d\s*건|건수|시각|시간|취소|삭제|목록|중단|정지)/.test(utter));
+  if (isSchedCmd) {
+    const out = await opsCommand(utter, "kakao");
+    return (out && out.reply) || "예약 발행을 처리했어요.";
+  }
+  // 프로젝트 명령: "프로젝트 목록" / "프로젝트 [이름] 지시: ..." / "프로젝트 [이름] 진행"
+  if (/프로젝트/.test(utter)) {
+    const active = (DB.projects||[]).filter(p=>p.status==="active"||p.status==="awaiting");
+    if (/목록|리스트|상태|현황|뭐(가|)\s*있/.test(utter)) {
+      if(!active.length) return "진행 중인 프로젝트가 없어요. 앱에서 새로 시작할 수 있어요.";
+      const lines = active.map(p=>"• "+p.title+" (사이클 "+(p.cycle||0)+"회"+(p.status==="awaiting"?" · 🙋확인 대기":"")+")").join("\n");
+      return "📋 진행 중 프로젝트\n"+lines+"\n\n'프로젝트 [이름] 지시: 내용' 으로 지시하거나 '프로젝트 [이름] 진행' 으로 즉시 한 사이클을 돌릴 수 있어요.";
+    }
+    let target = active.find(p=> utter.indexOf(String(p.title).slice(0,6))>=0) || active[0];
+    if (!target) return "진행 중인 프로젝트가 없어요. 앱에서 먼저 시작해 주세요.";
+    const dirMatch = utter.match(/지시[:：]?\s*(.+)$/) || utter.match(/(?:해줘|하자|가자|반영|바꿔|추가|수정)\s*[:：]?\s*(.+)$/);
+    if (/진행|사이클|돌려|실행/.test(utter) && !/지시/.test(utter)) {
+      if(target.status==="awaiting"){ target.status="active"; target.holdReason=""; }
+      await runProjectCycle(target); saveDB();
+      const last=(target.log||[]).slice(-1)[0]||{};
+      return "▶ '"+target.title+"' 한 사이클 진행했어요.\n["+(AGENTS[last.dept]?AGENTS[last.dept].kr:last.dept||"")+"] "+String(last.work||"").slice(0,300);
+    }
+    const dir = dirMatch ? dirMatch[1].trim() : "";
+    if (dir) {
+      target.clientNotes=target.clientNotes||[]; target.clientNotes.push({ at:Date.now(), text:dir.slice(0,500), used:false });
+      if(target.status==="awaiting"){ target.status="active"; target.holdReason=""; }
+      await runProjectCycle(target); saveDB();
+      const last=(target.log||[]).slice(-1)[0]||{};
+      return "✅ '"+target.title+"'에 지시를 반영해 진행했어요.\n["+(AGENTS[last.dept]?AGENTS[last.dept].kr:last.dept||"")+"] "+String(last.work||"").slice(0,300);
+    }
+    // 그 외는 질문·토론으로 간주 → 팀장(오세라)이 프로젝트 맥락으로 답변
+    const q = utter.replace(/프로젝트/,"").replace(new RegExp(String(target.title).slice(0,6),"g"),"").trim() || utter;
+    target.discuss=target.discuss||[];
+    target.discuss.push({ at:Date.now(), role:"client", text:q.slice(0,600) });
+    const recent = (target.log||[]).slice(-4).map(x=>"· C"+x.cycle+" ["+(AGENTS[x.dept]?AGENTS[x.dept].kr:x.dept)+"] "+String(x.work||"").slice(0,100)).join("\n") || "(아직 진행 없음)";
+    const chat = target.discuss.slice(-8).map(m=>(m.role==="client"?"클라이언트: ":"팀장: ")+m.text).join("\n");
+    const sys="너는 이 회사 팀장 '"+AGENTS.ops.kr+"("+MEMBERS["ops"]+")'이며 최고 지능이다."+ADDRESS+clientBlock()
+      +" 아래 프로젝트에 대해 클라이언트가 카카오톡으로 질문·토론한다. 구체적이고 실질적으로, 방향·근거·다음 액션을 명확히 답하라. 되묻기만 하지 말고 네 판단을 제시하되 결정이 필요한 지점은 짚어라. 카톡이니 한국어로 2~5문장, 간결하게."
+      +"\n프로젝트: "+target.title+"\n목표: "+target.goal+"\n최근 진행:\n"+recent+"\n\n[대화]\n"+chat;
+    let reply=""; try{ reply=await genText(sys, "팀장으로서 답하라.", 500, "gemini"); }catch(e){ logError("kakao-project-discuss", e); }
+    if(!reply) reply="지금 답변을 생성하지 못했어요. 잠시 후 다시 물어봐 주세요.";
+    target.discuss.push({ at:Date.now(), role:"lead", text:String(reply).slice(0,900) });
+    if(target.discuss.length>40) target.discuss=target.discuss.slice(-40);
+    saveDB();
+    return "👑 팀장 ["+String(target.title).slice(0,20)+"]\n"+String(reply).slice(0,900);
+  }
+  // 일반 지시 → 부서 처리
+  const job = await handleInstruction(utter, "kakao");
+  return job.results.map(r=>AGENTS[r.dept].no+" "+AGENTS[r.dept].kr+":\n"+r.text).join("\n\n").slice(0,1000) || "처리했습니다.";
+}
 function kakaoText(text){ return { version:"2.0", template:{ outputs:[{ simpleText:{ text } }] } }; }
 
 // 카카오 알림 발송(상행): { text } → 나에게 보내기
@@ -2900,6 +3026,23 @@ app.get("/api/reject", (req,res)=>{
   if(!ap) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 승인입니다.");
   ap.status="rejected"; saveDB();
   res.send("<meta charset=utf-8>거절되었습니다. 발행하지 않습니다.");
+});
+// 프로젝트 승인(카톡 버튼): 승인하면 대기 해제 + 즉시 한 사이클 진행
+app.get("/api/projects/approve", async (req,res)=>{
+  const p = projectById(req.query.id);
+  if(!p || p.approveCode!==req.query.code) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 요청입니다.");
+  p.approveCode=""; p.status="active"; p.holdReason=""; p.nextAt=Date.now();
+  p.clientNotes=p.clientNotes||[]; p.clientNotes.push({ at:Date.now(), text:"[카톡 승인] 위 방향으로 승인함. 계속 진행.", used:false });
+  saveDB();
+  res.send("<meta charset=utf-8><pre>✅ 승인되었습니다. 이 방향으로 계속 진행합니다.\n('"+String(p.title||"").slice(0,40)+"')</pre>");
+  try{ runProjectCycle(p).then(()=>kakaoNotify("▶ 프로젝트 '"+p.title+"' 승인 후 한 사이클을 진행했어요.").catch(()=>{})).catch(e=>logError("proj-approve-run",e)); }catch(e){}
+});
+// 프로젝트 보류(카톡 버튼): 대기 유지, 앱에서 지시하도록 안내
+app.get("/api/projects/hold", (req,res)=>{
+  const p = projectById(req.query.id);
+  if(!p || p.approveCode!==req.query.code) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 요청입니다.");
+  p.approveCode=""; saveDB();
+  res.send("<meta charset=utf-8><pre>⏸ 보류했습니다.\n앱 프로젝트 탭에서 방향을 지시하거나 팀장과 토론해 주세요.</pre>");
 });
 // 앱에서 보는 승인 대기 목록
 app.get("/api/approvals", (req,res)=>{
@@ -3322,12 +3465,13 @@ function createProject(opts){
     title: String(opts.title||"무제 프로젝트").slice(0,120),
     goal: String(opts.goal||opts.title||"").slice(0,600),
     depts: (Array.isArray(opts.depts)&&opts.depts.length) ? opts.depts.filter(d=>AGENTS[d]&&d!=="ops") : Object.keys(AGENTS).filter(d=>d!=="ops"),
-    intervalMin: [30,60,120].indexOf(+opts.intervalMin)>=0 ? +opts.intervalMin : 60,
+    intervalMin: [60,120,180,360,720,1440].indexOf(+opts.intervalMin)>=0 ? +opts.intervalMin : 60,
     status: "active",
     cycle: 0,
     log: [],            // [{cycle, at, dept, work, review, refine}]
     research: [],       // [{at, text, sources}]
     clientNotes: [],    // [{at, text, used}]
+    discuss: [],        // [{at, role:'client'|'lead', text}] — 팀장과의 토론
     outputs: [],        // 산출물(승인 대기로 연결된 것들)
     nextAt: Date.now(), // 다음 자동 사이클 시각
     at: Date.now()
@@ -3382,7 +3526,7 @@ async function runProjectCycle(project){
     if(p.log.length>60) p.log=p.log.slice(-60);
     p.nextAt = Date.now() + p.intervalMin*60000;
     saveDB();
-    try{ kakaoNotify("🙋 프로젝트 '"+p.title+"' — 팀장이 클라이언트 확인을 요청했어요:\n"+holdReason+"\n\n앱 프로젝트 탭에서 의견을 남기면 다시 진행해요.").catch(()=>{}); }catch(e){}
+    try{ kakaoProjectApproval(p).catch(()=>{ kakaoNotify("🙋 프로젝트 '"+p.title+"' — 팀장이 클라이언트 확인을 요청했어요:\n"+holdReason+"\n\n앱 프로젝트 탭에서 의견을 남기면 다시 진행해요.").catch(()=>{}); }); }catch(e){}
     return p;
   }
   if(!pick){ pick=p.depts[p.cycle % p.depts.length]; task=p.goal; }
