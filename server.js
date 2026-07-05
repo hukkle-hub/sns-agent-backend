@@ -576,14 +576,17 @@ async function getKakaoToken(){
   if (process.env.KAKAO_ACCESS_TOKEN) return process.env.KAKAO_ACCESS_TOKEN;
   if (_kakaoCache.token && Date.now()-_kakaoCache.at < 5*60*60*1000) return _kakaoCache.token;
   if (!process.env.KAKAO_REFRESH_TOKEN) throw new Error("KAKAO_ACCESS_TOKEN/REFRESH_TOKEN 미설정");
+  const _body = {
+    grant_type:"refresh_token", client_id:process.env.KAKAO_REST_KEY, refresh_token:process.env.KAKAO_REFRESH_TOKEN
+  };
+  // 카카오 REST 키의 클라이언트 시크릿이 "사용"이면 반드시 포함해야 함(2025-12 개편으로 기본 활성).
+  if (process.env.KAKAO_CLIENT_SECRET) _body.client_secret = process.env.KAKAO_CLIENT_SECRET;
   const r = await fetch("https://kauth.kakao.com/oauth/token", {
     method:"POST", headers:{ "Content-Type":"application/x-www-form-urlencoded" },
-    body: new URLSearchParams({
-      grant_type:"refresh_token", client_id:process.env.KAKAO_REST_KEY, refresh_token:process.env.KAKAO_REFRESH_TOKEN
-    })
+    body: new URLSearchParams(_body)
   });
   const d = await r.json();
-  if (!d.access_token) throw new Error("카카오 토큰 갱신 실패");
+  if (!d.access_token) throw new Error("카카오 토큰 갱신 실패: " + (d.error_description || d.error || JSON.stringify(d)));
   _kakaoCache = { token:d.access_token, at:Date.now() };
   return d.access_token;
 }
