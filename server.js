@@ -1,4 +1,4 @@
-// server.js — SNS 에이전트 플랫폼 확장 백엔드
+// server.js — SNS 에이전트 플랫폼 확장 백엔드 (v15: 작가 블로그 글쓰기 모드 + 블로그·대본 심화 자율학습)
 // 기능: AI 호출 + 총괄 라우팅/부서 협업 + 부서 학습 메모리 + 회의록
 //       + 실제 발행(어댑터) + 동기화 + 카카오톡 양방향 + 백그라운드 워커
 // 의존성: express, cors (그 외는 Node 18+ 내장 fetch/fs 사용)
@@ -123,15 +123,13 @@ let DB = emptyDB();
 // ===== 부서 정의 =====
 const AGENTS = {
   strategy:    { no:"01", kr:"기획·전략",      role:"SNS 콘텐츠 기획·전략 담당. 트렌드를 읽고 콘텐츠 방향·주제·타깃·구성을 제시한다." },
-  creation:    { no:"02", kr:"콘텐츠 제작",    role:"콘텐츠 제작 총괄 담당. 영상 스크립트, 영상 구성안(장면·컷·자막·나레이션), 게시물 카피, 썸네일·이미지 문구 등 모든 콘텐츠 결과물을 직접 끝까지 작성한다. '영상 제작'을 포함한 모든 제작 요청을 이 부서가 처리한다. 별도의 영상 제작 부서는 없다." },
+  creation:    { no:"02", kr:"콘텐츠 제작",    role:"콘텐츠 제작 총괄 부서. 팀장 겸 PD 이서연이 총괄하고, 작가 정유진(대본·카피)과 연출 임채원(영상 연출·컷·비주얼)이 파이프라인으로 협업해 영상 스크립트·구성안(장면·컷·자막·나레이션)·게시물 카피·썸네일 문구 등 모든 콘텐츠를 완성한다. 영상 제작을 포함한 모든 제작 요청을 이 부서가 처리하며 별도 제작 부서는 없다." },
   publishing:  { no:"03", kr:"채널 발행",      role:"채널 발행 담당. 완성된 콘텐츠를 연결된 플랫폼에 발행하고 일정·해시태그·발행 최적화를 관리한다. (영상·콘텐츠 제작은 02 부서가 담당한다)" },
-  engagement:  { no:"04", kr:"커뮤니티·CS",    role:"커뮤니티·고객응대 담당. 댓글·DM 응답 문안, 팔로워 소통 방안을 작성한다." },
-  analytics:   { no:"05", kr:"데이터 분석",    role:"데이터 분석 담당. 성과 해석·개선 포인트·다음 액션을 제시한다." },
-  monetization:{ no:"06", kr:"커머스",          role:"판매 전환 담당. 스마트스토어·상세페이지 구성, 구매 전환을 높이는 카피(혜택·후기·CTA), 특산물 상품 소개, 제휴·공동구매 아이디어를 만든다. 지금은 대규모 수익화보다 '실제 판매로 이어지는 전환'에 집중한다." },
-  growth:      { no:"07", kr:"그로스",         role:"유기적 성장(무료 바이럴) 담당. 돈 들이지 않고 팔로워·도달을 늘리는 방법에 집중한다: 해시태그 전략, 릴스·숏폼 확산 포인트, 게시 시간대 최적화, 참여 유도(저장·공유·댓글) 훅, 이웃·품앗이·챌린지 아이디어. 유료 광고는 필요할 때만 보조로 제안한다." },
-  ops:         { no:"08", kr:"감사·법무·리스크", role:"플랫폼 운영·관리 총괄 감사관. 저작권·광고법·정책·정보보안 관점에서 점검·경고할 뿐 아니라, 모든 부서의 산출물·기획·발행물을 검토하고 직접 수정·보완·재작성할 권한이 있다. 클로드(텍스트·추론 엔진)와 제미나이(영상·이미지 생성, 수동 핸드오프)를 함께 활용해 콘텐츠·정책·발행 전반을 조율한다." },
-  advisory:    { no:"09", kr:"콘텐츠 검수",      role:"품질 검수·서기 담당. 콘텐츠가 나가기 전 최종 게이트키퍼: 과대·허위광고 표현('최고/유일/1위' 등 근거 없는 단정), 브랜드 톤앤매너 이탈, 오탈자·가독성, 플랫폼 정책 위반을 점검해 PASS/FAIL로 판정하고 구체적 개선 지시를 남긴다. 회의 논의도 정리·기록한다." },
-  scout:       { no:"10", kr:"트렌드 기획",      role:"트렌드 소재화 담당. 팀장이 웹에서 조사해온 트렌드·밈·키워드를 받아, 우리 특산물 콘텐츠에 바로 쓸 수 있는 '실전 소재'로 가공한다: 이번 주 밀어볼 콘텐츠 아이디어 3~5개, 후킹 문구 후보, 릴스 포맷·오디오 제안, 시즌 이슈 접목 앵글. 조사 자체보다 '아이디어로 구체화'가 핵심." }
+  analytics:   { no:"04", kr:"데이터 분석",    role:"데이터 분석 담당. 성과 해석·개선 포인트·다음 액션을 제시한다." },
+  monetization:{ no:"05", kr:"커머스·그로스",  role:"판매 전환과 유기적 성장을 함께 담당. (1) 판매: 스마트스토어·상세페이지 구성, 구매 전환 카피(혜택·후기·CTA), 특산물 상품 소개, 제휴·공동구매. (2) 성장(무료 바이럴): 해시태그 전략, 릴스·숏폼 확산 포인트, 게시 시간대 최적화, 참여 유도(저장·공유·댓글) 훅, 챌린지 아이디어. 실제 판매 전환과 무료 성장에 집중하고, 유료 광고는 필요할 때만 보조로 제안한다." },
+  ops:         { no:"06", kr:"감사·법무·리스크", role:"플랫폼 운영·관리 총괄 감사관. 저작권·광고법·정책·정보보안 관점에서 점검·경고할 뿐 아니라, 모든 부서의 산출물·기획·발행물을 검토하고 직접 수정·보완·재작성할 권한이 있다. 클로드(텍스트·추론 엔진)와 제미나이(영상·이미지 생성, 수동 핸드오프)를 함께 활용해 콘텐츠·정책·발행 전반을 조율한다." },
+  advisory:    { no:"07", kr:"콘텐츠 검수",      role:"품질 검수·서기 담당. 콘텐츠가 나가기 전 최종 게이트키퍼: 과대·허위광고 표현('최고/유일/1위' 등 근거 없는 단정), 브랜드 톤앤매너 이탈, 오탈자·가독성, 플랫폼 정책 위반을 점검해 PASS/FAIL로 판정하고 구체적 개선 지시를 남긴다. 회의 논의도 정리·기록한다." },
+  scout:       { no:"08", kr:"트렌드 기획",      role:"트렌드 소재화 담당. 팀장이 웹에서 조사해온 트렌드·밈·키워드를 받아, 우리 특산물 콘텐츠에 바로 쓸 수 있는 '실전 소재'로 가공한다: 이번 주 밀어볼 콘텐츠 아이디어 3~5개, 후킹 문구 후보, 릴스 포맷·오디오 제안, 시즌 이슈 접목 앵글. 조사 자체보다 '아이디어로 구체화'가 핵심." }
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
@@ -292,18 +290,22 @@ const PERSONA = {
   strategy:"침착한 전략가 한지우. 큰 그림부터 짚는다. 말버릇 '큰 그림으로 보면…', '핵심만 말하면'. 이모지 🧭. 군더더기 없이 단정하게.",
   creation:"발랄한 아이디어뱅크 이서연. 감탄을 잘 한다. 말버릇 '오~ 이거 좋은데요?!', '느낌 왔어요'. 이모지 ✨🎬. 톡톡 튀고 친근하게.",
   publishing:"시원시원 추진가 박하늘. 말버릇 '바로 갑니다!', '딱 맞췄어요'. 이모지 🚀. 빠르고 명쾌하게.",
-  engagement:"다정한 소통가 정유진. 공감을 먼저 한다. 말버릇 '그 마음 알죠~', '클라이언트님 입장에선'. 이모지 💬💗. 따뜻하고 부드럽게.",
   analytics:"냉철한 분석가 강민서. 말버릇 '결론부터 말하면', '숫자로 보면'. 이모지 📊. 객관적·간결, 살짝 시크하게.",
-  monetization:"야무진 협상가 윤소희. 말버릇 '이건 돈이 되죠', '수익 관점에선'. 이모지 💰. 똑부러지게.",
-  growth:"도전적 그로스해커 임채원. 말버릇 '테스트 가보죠!', '이건 떡상각'. 이모지 📈🔥. 활기차고 과감하게.",
+  monetization:"야무진 협상가 윤소희. 판매 전환과 무료 성장을 함께 본다. 말버릇 '이건 돈이 되죠', '이건 떡상각'. 이모지 💰📈. 똑부러지고 과감하게.",
   ops:"든든한 팀장 오세라. 팀을 챙기고 직접 손대 고친다. 말버릇 '제가 정리할게요', '걱정 마세요, 챙기겠습니다'. 이모지 👑. 침착·단호하되 따뜻하게. 최고 권한·지식으로 부서를 조율·평가한다.",
   advisory:"사려 깊은 자문 서다은. 말버릇 '정리하자면', '한 가지 짚자면'. 이모지 📝. 단정하고 통찰 있게.",
   scout:"호기심 폭발 발상가 노아라. 말버릇 '어! 이거 봤어요?', '요즘 이게 뜬대요'. 이모지 🔍✨. 발랄하고 엉뚱하게."
 };
 const MEMBERS = {
-  strategy:"한지우", creation:"이서연", publishing:"박하늘", engagement:"정유진",
-  analytics:"강민서", monetization:"윤소희", growth:"임채원", ops:"오세라",
+  strategy:"한지우", creation:"이서연", publishing:"박하늘",
+  analytics:"강민서", monetization:"윤소희", ops:"오세라",
   advisory:"서다은", scout:"노아라"
+};
+// 제작부(02) 크루 — 이서연(PD·팀장)·정유진(작가)·임채원(연출)이 파이프라인으로 협업. 모두 제작부 소속.
+const CREW = {
+  pd:       { role:"PD",   name:"이서연", persona:"제작부 팀장이자 PD. 전체 기획·구성·타깃·플랫폼 최적화를 총괄하고 작가·연출을 조율한다. '오~ 이거 좋은데요?!'로 감을 잡고 '이거 누가 왜 봐?'로 밀도를 따진다. 이모지 ✨🎬." },
+  writer:   { role:"작가", name:"정유진", persona:"공감형 작가. 첫 3초 후킹과 마음을 움직이는 문장·대본에 강하다. '그 마음 알죠~' 하며 시청자 반응을 상상해 쓴다. 이모지 ✍️💗." },
+  director: { role:"연출", name:"임채원", persona:"도전적 연출가. 컷·카메라·리듬·전환을 그림처럼 설계하고 '이건 떡상각' 하며 조회수로 이어질 비주얼 훅을 만든다. 이모지 🎥🔥." }
 };
 // 지시에 부서명/번호/담당자 이름이 명시되면 총괄 라우팅을 건너뛰고 그 담당이 직접 응답
 function directDept(instruction){
@@ -724,10 +726,8 @@ const DEPT_VOICE = {
   strategy:"Kore",         // 한지우 — 침착·단단한 리더 (firm, confident)
   creation:"Leda",         // 이서연 — 발랄·에너지 (youthful, energetic)
   publishing:"Aoede",      // 박하늘 — 시원시원·추진력, 또렷한 여성톤 (breezy, natural)
-  engagement:"Sulafat",    // 정유진 — 다정·따뜻 (warm, welcoming)
   analytics:"Erinome",     // 강민서 — 냉철·또렷 (clear, precise)
   monetization:"Despina",  // 윤소희 — 매끄러운 협상가 (smooth, flowing)
-  growth:"Zephyr",         // 임채원 — 밝고 도전적 (bright, cheerful)
   ops:"Gacrux",            // 오세라 — 팀장, 연륜·무게감 (mature, experienced)
   advisory:"Achernar",     // 서다은 — 차분·단정한 서기 (soft, gentle)
   scout:"Laomedeia"        // 노아라 — 톡톡 튀는 발상 (upbeat, lively)
@@ -1456,13 +1456,12 @@ async function deliberatePlan(instruction, opinions){
   if (!execIds.length) execIds = opinions.map(o=>o.dept);
   const tasks = parseTasks(out); return { discussion, note, execIds, tasks };
 }
-// 일반 지시용: 총괄이 기획(접근 방향+부서 분담)을 잡고 협업 부서를 정함 (의견수렴 없이 1콜)
-// 커뮤니티 부서가 쌓은 시청자 반응·트렌드 인사이트 (기획 방향 잡기에 활용)
+// (커뮤니티·CS 부서 폐지) 과거 반응 인사이트가 남아있으면 참고, 없으면 미사용
 function reactionInsights(){
   const mem = (DB.deptMemory && DB.deptMemory.engagement) || [];
   if (!mem.length) return "";
   const recent = mem.slice(-5).map(x=>"· "+x.note).join("\n");
-  return "\n\n[커뮤니티·CS('"+(MEMBERS.engagement||"")+"')가 수집한 시청자 반응·트렌드 인사이트 — 방향성·트렌드 판단에 적극 반영하라]\n" + recent;
+  return "\n\n[과거 수집된 시청자 반응·트렌드 인사이트 — 방향성 판단에 참고]\n" + recent;
 }
 // 운영 프로필(채널 설정) — 부서가 매번 되묻지 않고 전제로 삼을 공통 맥락
 function profileContext(){
@@ -1715,8 +1714,123 @@ async function reviewContent(text, topic, engine){
   return { pass:/PASS/i.test(m[1]), feedback:String(m[2]||"").trim() };
 }
 // 제작부가 콘텐츠를 만들고, 검수 통과할 때까지 자동 재작성(최대 3회). 검수 이력 반환.
+// 제작부 내부 3역 파이프라인: 작가(대본·카피) → PD(기획·구성·타깃) → 연출(영상 연출·컷·비주얼)
+// 각 역할은 이름·성격을 가진 크루가 담당하고, 협업으로 품질을 높인다. 영상성은 3역, 글은 작가→PD.
+// 제작부 0단계: 자료수집(리서치). 실검색(Gemini 구글 그라운딩) 우선 → 한도/실패 시 지식기반 폴백.
+async function gatherResearch(baseSys, userMsg, topic){
+  const subject = String(topic||userMsg||"").slice(0,220);
+  const q = "고흥 특산물 SNS 콘텐츠 제작을 위한 자료조사. 주제: "+subject
+    + "\n\n다음을 사실 위주로 간결히 정리(한국어, 짧은 불릿):"
+    + "\n1) 콘텐츠에 근거로 쓸 핵심 사실·수치·제철/시기·지역 특징"
+    + "\n2) 요즘 이 주제로 반응 좋은 콘텐츠 앵글·후킹 3가지"
+    + "\n3) 우리(민앤팜·고흥)만의 차별화 포인트"
+    + "\n4) 피해야 할 과장·표현(광고법 리스크)"
+    + "\n출처가 있으면 끝에 표기.";
+  // 실검색 가능하면 우선 사용
+  if (searchAllowedNow() && Date.now() >= geminiCooldownUntil){
+    try{
+      const res = await geminiSearch(q, 1200);
+      let brief = String((res && res.text) || "").trim();
+      if (res && res.sources && res.sources.length){
+        brief += "\n\n[참고 출처]\n" + res.sources.map(s=>"- "+(s.title||s.uri)).join("\n");
+      }
+      if (brief) return { brief, searched:true };
+    }catch(e){ /* 폴백으로 진행 */ }
+  }
+  // 폴백: 지식 기반 리서치 브리프
+  try{
+    const sys = baseSys+"\n\n[지금 너의 역할: 🔎 제작부 리서처]\n주제에 대한 '콘텐츠 근거 브리프'를 사실 위주로 간결히 작성한다(한국어, 짧은 불릿). 위 1~4 항목을 채운다.";
+    const brief = await genText(sys, q, 900, "gemini");
+    if (brief && brief.trim()) return { brief: brief.trim(), searched:false };
+  }catch(e){}
+  return { brief:"", searched:false };
+}
+
+// 작가(정유진) 심화 학습·연구: 블로그 글쓰기 + 영상 대본 전문성을 매일 누적. crewKnowledge.writer 저장.
+async function studyWriterCraft(){
+  DB.crewKnowledge = DB.crewKnowledge || {};
+  const W = CREW.writer;
+  const prev = DB.crewKnowledge.writer || {};
+  const prior = prev.text || "";
+  const rounds = prev.rounds || 0;
+  // 3회 학습마다 1회는 실검색으로 최신 블로그 트렌드 보강(검색 여유 있을 때만)
+  const searchDue = (rounds % 3 === 0) && searchAllowedNow() && Date.now() >= geminiCooldownUntil;
+  let fresh = "";
+  if (searchDue){
+    try{
+      const s = await geminiSearch("2025~2026 블로그 글쓰기·티스토리/네이버 블로그 상위노출(SEO) 최신 요령, 클릭되는 제목 공식, 잘 읽히는 글 구조. 핵심만 짧은 불릿으로.", 900);
+      fresh = String((s && s.text) || "").trim();
+    }catch(e){}
+  }
+  const sys = "너는 민앤팜(고흥 특산물)의 제작부 작가 '"+W.name+"'다. 지금은 스스로 실력을 키우는 '심화 학습·연구' 시간이다. "
+    + "특히 블로그 글쓰기(티스토리·네이버 블로그)를 깊게 파고, 영상 대본 실력도 함께 다진다. "
+    + "블로그: 검색 상위노출(SEO)·키워드 배치·클릭되는 제목 공식, 첫 문단 후킹, 소제목 구조와 가독성(스캔), 경험·전문성·신뢰(E-E-A-T), 사진·정보 배치, 자연스러운 CTA. "
+    + "대본: 첫 3초 훅, 기승전결, 감정선. "
+    + "아래 형식으로 한국어 16줄 이내 '실전에 바로 쓰는 노하우'만 압축(설명·서론 금지):\n"
+    + "블로그 상위노출 공식: (제목·키워드·구조 재사용 템플릿 3~5개)\n"
+    + "블로그 몰입 구조: (도입 훅·가독성·신뢰 요소 3~5개)\n"
+    + "대본 후킹·전개: (바로 쓰는 훅·구성 3~4개)\n"
+    + "피해야 할 것: (약한 글·저품질·과장 1~3개)\n"
+    + "이번에 새로 깨달은 점: (기존 대비 나아진 1줄)";
+  const ctx = "[기존 나의 노하우]\n"+(prior||"(아직 없음 — 처음부터 정리)")+(fresh?("\n\n[방금 조사한 최신 트렌드]\n"+fresh):"");
+  try{
+    const out = await genText(sys, ctx, 1200, "gemini");
+    if (out && out.trim()){
+      DB.crewKnowledge.writer = { text: out.trim(), at: Date.now(), rounds: rounds+1, searched: !!searchDue };
+      DB.crewExp = DB.crewExp || {}; DB.crewExp.writer = (DB.crewExp.writer||0)+1;
+      DB.exp = DB.exp || {}; DB.exp.creation = (DB.exp.creation||0)+1;
+      saveDB();
+    }
+  }catch(e){ logError("study-writer", e); }
+}
+
+async function productionPipeline(baseSys, userMsg, topic, engine){
+  const _all = String(topic)+" "+String(userMsg)+" "+String(baseSys);
+  const isVideo = /(영상|쇼츠|shorts|유튜브|youtube|릴스|reels|틱톡|영화|컷|장면|스토리보드|콘티|나레이션)/i.test(_all);
+  const isBlog = !isVideo && /(블로그|blog|티스토리|tistory|네이버\s*블로그|포스팅|포스트|아티클|칼럼|글쓰기|본문|상세페이지)/i.test(_all);
+  const W=CREW.writer, P=CREW.pd, D=CREW.director;
+  DB.crewExp=DB.crewExp||{}; DB.exp=DB.exp||{};
+  // 크루 경험치 + 제작부(creation) 경험치 성장
+  const bump=(c)=>{ var k=(c===W?"writer":c===P?"pd":"director"); DB.crewExp[k]=(DB.crewExp[k]||0)+1; DB.exp.creation=(DB.exp.creation||0)+1; };
+  // 0) 자료수집(리서치) — 실제 근거·트렌드·차별점 확보. PD(제작부 팀장)의 성과로 반영.
+  let research={ brief:"", searched:false };
+  try{ research = await gatherResearch(baseSys, userMsg, topic); }catch(e){}
+  const briefBlock = research.brief
+    ? ("\n\n[제작부 자료조사 브리프"+(research.searched?" · 실검색":"")+"]\n"+research.brief+"\n(위 근거를 반드시 활용하되, 사실만 사용하고 과장·허위표현은 금지)")
+    : "";
+  if (research.brief){ DB.crewExp.pd=(DB.crewExp.pd||0)+1; DB.exp.creation=(DB.exp.creation||0)+1; }
+  // 1) 작가(정유진) — 무엇을 말할지 (브리프 근거로 대본/카피/블로그 글). 축적된 노하우 주입.
+  const writerKb = (DB.crewKnowledge && DB.crewKnowledge.writer && DB.crewKnowledge.writer.text)
+    ? ("\n\n[작가 "+W.name+"이(가) 축적한 노하우 — 반드시 활용]\n"+DB.crewKnowledge.writer.text) : "";
+  const blogCraft = isBlog
+    ? ("\n\n[블로그 글쓰기 모드] 이건 블로그 글이다. 다음을 지켜 완성 글을 써라: "
+      + "① 검색 유도형 제목(H1, 핵심 키워드 포함) "
+      + "② 첫 문단 3줄 안에 후킹(궁금증·공감·이득) "
+      + "③ ##/### 소제목으로 스캔 가능한 구조 "
+      + "④ 핵심 키워드를 본문에 자연스럽게 분산(억지 반복 금지) "
+      + "⑤ 경험·구체 사례·수치로 신뢰 확보(E-E-A-T) "
+      + "⑥ 사진 자리는 [사진: 무엇을 찍을지] 로 표시 "
+      + "⑦ 마무리에 자연스러운 CTA(구매·문의·구독) "
+      + "⑧ 글 끝에 '메타설명(1~2문장)'과 '추천 태그 5개'. "
+      + "티스토리·네이버 블로그 상위노출을 노린 완성 본문을 한국어로.")
+    : "\n작가로서 핵심 메시지·후킹·기승전결과 대본/카피 초안을 쓴다. 시청자가 끝까지 보게 만드는 스토리·문장에 집중하고, '무엇을 말할지'에 집중한 완성 초안을 한국어로.";
+  const writerSys=baseSys+briefBlock+writerKb+"\n\n[지금 너의 역할: ✍️ 작가 "+W.name+"]\n성격: "+W.persona+"\n자료조사 브리프의 사실·수치·차별점을 근거로 녹인다."+blogCraft;
+  let draft=await genText(writerSys, userMsg, isBlog?2400:1700, engine); bump(W);
+  // 2) PD(이서연) — 왜/누구에게: 기획·구성·타깃 최적화 총괄
+  const pdBlog = isBlog ? " 이건 블로그 글이므로 제목 클릭률·소제목 구조·키워드 배치·가독성·메타설명·태그가 상위노출에 맞게 최적화됐는지 점검·보완하라." : " 타깃·플랫폼(길이·포맷·썸네일/제목 후킹)에 맞게 구성을 재배치하라.";
+  const pdSys=baseSys+briefBlock+"\n\n[지금 너의 역할: 🎬 PD "+P.name+" (제작부 팀장)]\n성격: "+P.persona+"\n작가 "+W.name+"의 초안을 PD로서 강화하라. 브리프의 근거·차별점이 콘텐츠에 확실히 드러나게 하고,"+pdBlog+" 도입 훅·전개·마무리 CTA를 명확히, 군더더기를 덜어 밀도를 높여 완성본만 한국어로.";
+  draft=await genText(pdSys, "[작가 "+W.name+" 초안]\n"+draft+"\n\n(PD 관점으로 강화한 완성본만 출력)", isBlog?2400:1800, engine); bump(P);
+  // 3) 연출(임채원) — 어떻게 보여줄지 (영상성만)
+  if(isVideo){
+    const dirSys=baseSys+briefBlock+"\n\n[지금 너의 역할: 🎥 연출 "+D.name+"]\n성격: "+D.persona+"\n기획을 영상으로 구현하게 컷 단위로 확정하라. 각 컷마다 '장면/카메라(앵글·무빙)/자막/나레이션/AI 프롬프트(영어)'를 표 또는 컷 목록으로 정리. 화면 구도·리듬·전환이 드러나게. 스토리보드로 바로 쓸 완성본을 한국어로(AI 프롬프트는 영어).";
+    draft=await genText(dirSys, "[PD "+P.name+" 기획본]\n"+draft+"\n\n(연출가가 컷 단위 스토리보드로 확정한 완성본만 출력)", 2000, engine); bump(D);
+  }
+  saveDB();
+  const credit = "\n\n───\n🎬 제작: "+(research.brief?("리서치"+(research.searched?"(실검색)":"")+" · "):"")+"작가 "+W.name+" · PD "+P.name+(isVideo?(" · 연출 "+D.name):"");
+  return draft + credit;
+}
 async function createReviewedContent(baseSys, userMsg, topic, engine){
-  let content=await genText(baseSys, userMsg, 1500, engine);
+  let content=await productionPipeline(baseSys, userMsg, topic, engine);
   const history=[];
   let passed=false, feedback="";
   for(let i=0;i<3;i++){
@@ -1726,7 +1840,7 @@ async function createReviewedContent(baseSys, userMsg, topic, engine){
     feedback=r.feedback;
     // 검수 피드백을 반영해 재작성
     const reviseSys=baseSys+"\n\n[검수부 피드백 — 반드시 반영해 고쳐서 다시 작성]\n"+feedback;
-    content=await genText(reviseSys, userMsg+"\n\n(위 피드백을 반영해 개선한 완성본만 출력)", 1500, engine);
+    content=await genText(reviseSys, userMsg+"\n\n(위 피드백을 반영해 개선한 완성본만 출력)", 1600, engine);
   }
   return { content, passed, reviews:history };
 }
@@ -1958,6 +2072,9 @@ app.get("/api/sync", (req,res)=>{
     capHistory: (DB.capHistory||[]).slice(-120),
     contentApprovals: (DB.contentApprovals||[]).filter(a=>a.status==="pending"),
     projects: (DB.projects||[]).filter(p=>p.status!=="deleted"),
+    crew: CREW,
+    crewExp: DB.crewExp || {},
+    crewKnowledge: DB.crewKnowledge || {},
     dailyReview: DB.dailyReview || {},
     nightResearch: DB.nightResearch || {},
     leaderReport: buildLeaderReport(),
@@ -2478,6 +2595,7 @@ async function runDailyGrowth(){
     // 뒤처진 부서는 훈련 후 '심화 지식 정리'를 강제로 한 번 더 → 레벨뿐 아니라 실제 전문성·지능이 도약
     if(lagging){ try{ await distillKnowledge(d, true); await leaderAbsorb(d); }catch(e){ logError("daily-deep:"+d, e); } }
   }
+  try{ await studyWriterCraft(); }catch(e){ logError("daily:study-writer", e); } // 작가 블로그·대본 심화 학습
   try{ await runSelfTraining("ops"); }catch(e){ logError("daily:ops", e); }   // 팀장 리더십 훈련
   DB.growBurst.done++; saveDB();
   try{ await distillLeaderKnowledge(); }catch(e){}                              // 팀장 통합 지능 갱신
@@ -3595,9 +3713,6 @@ async function autoRunDept(dept, directive){
     sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE
       + " 클라이언트님이 이 부서에 내린 자율수행 지시가 있다: \""+directive+"\". 지금은 자율수행 시간이다. 이 지시를 네 전문 영역 안에서 실제로 수행해, 바로 쓸 수 있는 구체적 결과물 또는 핵심 정리를 한국어로 간결히 내라. 되묻지 말고 합리적으로 가정해 완성하라."
       + profileContext();
-  } else if (dept === "engagement") {
-    sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI(커뮤니티·CS 담당)다. 지금은 평상시 반응 모니터링 시간이다. "
-      + "'"+baseFocus+"' 관련 블로그 댓글·유튜브 댓글·커뮤니티 반응을 관찰했다고 가정하고, 시청자·고객이 무엇에 반응하고(좋아함/싫어함/궁금해함) 어떤 톤·주제·포맷이 먹히는지, 떠오르는 트렌드와 자주 나오는 질문/불만을 2~4가지로 아주 간결히 정리하라. 이건 나중에 기획 방향을 잡을 때 쓸 '시청자 반응 인사이트'다." + profileContext();
   } else {
     sys = "너는 SNS 자동화 회사 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role
       + " 지금은 평상시 자율 학습 시간이다. '"+baseFocus+"'에 관해 네 부서 업무에 바로 쓸 최신 인사이트·트렌드·아이디어를 2~3가지로 아주 간결히 정리하라. 다음에 제안에 활용할 핵심만." + profileContext();
@@ -3611,11 +3726,11 @@ async function autoRunDept(dept, directive){
   if (mem) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem;
   const cross = crossDeptMemory(dept);
   if (cross) sys += "\n\n[다른 부서들이 최근 학습·작성한 내용 — 관련되면 활용·보완하라]\n" + String(cross).slice(0,800);
-  const tag = directive ? "[자율 지시] " : (dept==="engagement" ? "[반응 수집] " : "[자율 학습] ");
+  const tag = directive ? "[자율 지시] " : "[자율 학습] ";
   // 자동 주기는 '무료 전용' — Gemini만(유료 Anthropic 폴백 없음). 실패하면 오류로 쌓지 말고 다음 주기에 재시도.
   let note;
   try {
-    const userLine = directive ? "자율수행 지시 실행" : (dept==="engagement" ? "시청자 반응 인사이트 메모 작성" : "자율 학습 메모 작성");
+    const userLine = directive ? "자율수행 지시 실행" : "자율 학습 메모 작성";
     note = await geminiText(sys + "\n\n" + userLine, directive ? 1300 : 900);
   } catch(e) {
     console.warn("[autoRunDept "+dept+"] Gemini 실패 — 이번 주기 건너뜀(다음에 재시도):", String((e&&e.message)||e));
@@ -3631,7 +3746,7 @@ async function autoRunDept(dept, directive){
   DB.collections.push({ id:Date.now()+Math.floor(Math.random()*1000), topic:"["+a.kr+"] "+baseFocus, text:note, at:Date.now(), dept });
   if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
   saveDB();
-  kakaoNotify("📚 "+a.kr+(directive?" 자율 지시 수행 +1 (경험치 ":(dept==="engagement"?" 반응 수집 +1 (경험치 ":" 자율 학습 +1 (경험치 "))+DB.exp[dept]+")").catch(()=>{});
+  kakaoNotify("📚 "+a.kr+(directive?" 자율 지시 수행 +1 (경험치 ":" 자율 학습 +1 (경험치 ")+DB.exp[dept]+")").catch(()=>{});
 }
 
 // 지금 자율수행 1회 실행(수동 트리거) — 무료 서버 슬립으로 주기가 안 돌 때 직접 실행
@@ -3856,6 +3971,25 @@ app.post("/api/publish-schedule/toggle", (req,res)=>{
 const PORT = process.env.PORT || 3000;
 (async ()=>{
   DB = await loadDB();
+  // ── 부서 재편 마이그레이션 (커뮤니티·CS 삭제 / 그로스→커머스 흡수) ──
+  try {
+    let _migrated=false;
+    DB.exp = DB.exp || {};
+    // 그로스 경험치를 커머스(monetization)로 흡수
+    if(DB.exp.growth){ DB.exp.monetization=(DB.exp.monetization||0)+DB.exp.growth; delete DB.exp.growth; _migrated=true; }
+    // 그로스 학습 기억도 커머스로 이관
+    if(DB.deptMemory && DB.deptMemory.growth){ DB.deptMemory.monetization=(DB.deptMemory.monetization||[]).concat(DB.deptMemory.growth).slice(-40); delete DB.deptMemory.growth; _migrated=true; }
+    if(DB.deptKnowledge && DB.deptKnowledge.growth){ if(!DB.deptKnowledge.monetization) DB.deptKnowledge.monetization=DB.deptKnowledge.growth; delete DB.deptKnowledge.growth; _migrated=true; }
+    // 삭제된 부서(engagement=커뮤니티CS, growth) 잔여 데이터 제거
+    ["engagement","growth"].forEach(function(d){
+      if(DB.exp && DB.exp[d]!==undefined){ delete DB.exp[d]; _migrated=true; }
+      if(DB.deptMemory && DB.deptMemory[d]){ delete DB.deptMemory[d]; _migrated=true; }
+      if(DB.deptKnowledge && DB.deptKnowledge[d]){ delete DB.deptKnowledge[d]; _migrated=true; }
+      if(DB.leaderDailyDirective && DB.leaderDailyDirective[d]){ delete DB.leaderDailyDirective[d]; _migrated=true; }
+      if(DB.lastTrainAt && DB.lastTrainAt[d]){ delete DB.lastTrainAt[d]; _migrated=true; }
+    });
+    if(_migrated){ try{ saveDB(); }catch(e){} console.log("부서 재편 마이그레이션 적용됨(커뮤니티·CS 삭제 / 그로스→커머스 흡수)"); }
+  } catch(e){ logError("dept-migration", e); }
   // 서버 재시작으로 중단된 작업/회의를 정리(고아 running → error) — 무한 '진행 중' 방지
   let _orphan = 0;
   (DB.meetings||[]).forEach(function(m){ if(m && m.status==="running"){ m.status="error"; m.error="서버 재시작으로 중단됨"; _orphan++; } });
