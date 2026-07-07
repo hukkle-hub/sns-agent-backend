@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -926,14 +926,15 @@ async function genText(system, user, maxTok, engine){
 }
 
 function workEngine(){ return (DB.state&&DB.state.workEngine==="gemini")?"gemini":"claude"; } // 자율수행·콘텐츠·영상 엔진
-async function veoPromptFromPlan(plan){
+async function veoPromptFromPlan(plan, charBlock){
+  const consist = charBlock ? ("\n\n[등장인물 일관성 — 모든 구간에서 아래 인물의 외모·의상을 동일하게 유지하고, 영어 프롬프트에 그 특징을 매 구간 반복해 넣어라]"+charBlock) : "";
   const fmt = " 영상을 10초 단위 구간으로 끊어, 각 구간마다 아래 형식으로 출력하라.\n"
     + "◆ 구간 N (0-10초)\n<그 10초 구간의 영어 Veo 프롬프트 — 카메라 무빙·조명·분위기·피사체·동작·색감을 영화적으로>\n자막/나레이션: <해당 구간 자막·나레이션(한국어 가능)>\n"
     + "구간 사이에는 빈 줄 하나. 마지막 구간은 10초 미만이어도 된다. 설명·머리말 없이 구간들만 출력.";
-  const gp = "다음 한국어 영상 기획안을 Google Veo 3.1로 생성 가능한 영어 영상 프롬프트로 변환하라."+fmt+"\n\n[기획안]\n"+plan;
+  const gp = "다음 한국어 영상 기획안을 Google Veo 3.1로 생성 가능한 영어 영상 프롬프트로 변환하라."+fmt+consist+"\n\n[기획안]\n"+plan;
   try{ return { veoPrompt: await geminiText(gp, 1100), by:"Gemini" }; }
   catch(e){
-    const cp = "너는 영상 생성 프롬프트 전문가다. 아래 기획안을 Veo 3.1용으로 변환하라."+fmt;
+    const cp = "너는 영상 생성 프롬프트 전문가다. 아래 기획안을 Veo 3.1용으로 변환하라."+fmt+consist;
     return { veoPrompt: await anthropic(cp, "[기획안]\n"+plan, 1000), by:"Claude(Gemini 미설정/실패 대체)" };
   }
 }
@@ -1022,8 +1023,9 @@ async function publishYouTube(content){
   if (!uploadUrl) return { ok:false, note:"업로드 세션 실패: "+(await init.text()).slice(0,160) };
   // 3) 영상 업로드
   const up = await fetch(uploadUrl, { method:"PUT", headers:{ "Content-Type":"video/*" }, body: videoBuf });
-  const d = await up.json();
-  return d.id ? { ok:true, url:"https://youtu.be/"+d.id } : { ok:false, note:JSON.stringify(d).slice(0,200) };
+  if (!up.ok) return { ok:false, note:"업로드 실패("+up.status+"): "+(await up.text().catch(()=>"")).slice(0,160) };
+  let d; try { d = await up.json(); } catch(e){ return { ok:false, note:"업로드 응답 파싱 실패: "+(await up.text().catch(()=>"")).slice(0,160) }; }
+  return d && d.id ? { ok:true, url:"https://youtu.be/"+d.id } : { ok:false, note:JSON.stringify(d).slice(0,200) };
 }
 async function publishInstagram(content){
   const token = process.env.IG_ACCESS_TOKEN, user = process.env.IG_USER_ID;
@@ -1038,7 +1040,22 @@ async function publishInstagram(content){
   const c = await fetch(GV+user+"/media", { method:"POST", body:p1 });
   const cd = await c.json();
   if (!cd.id) return { ok:false, note:JSON.stringify(cd).slice(0,200) };
-  // (영상은 인코딩 대기 필요 — 운영 시 status_code=FINISHED 폴링 권장)
+  // 영상(릴스)은 인코딩이 끝나야 게시 가능 — status_code=FINISHED 될 때까지 폴링
+  if (isVideo) {
+    const deadline = Date.now() + 5*60*1000; // 최대 5분 대기
+    while (Date.now() < deadline) {
+      await new Promise(r=>setTimeout(r, 5000));
+      let st;
+      try {
+        const sres = await fetch(GV+cd.id+"?fields=status_code,status&access_token="+encodeURIComponent(token));
+        st = await sres.json();
+      } catch(e){ continue; }
+      const code = st && st.status_code;
+      if (code === "FINISHED") break;
+      if (code === "ERROR" || code === "EXPIRED") return { ok:false, note:"인스타 영상 인코딩 실패: "+(st.status||code) };
+      // IN_PROGRESS 또는 PUBLISHED가 아니면 계속 대기
+    }
+  }
   // 2) 게시
   const p2 = new URLSearchParams({ creation_id: cd.id, access_token: token });
   const pub = await fetch(GV+user+"/media_publish", { method:"POST", body:p2 });
@@ -1054,7 +1071,8 @@ async function publishWordpress(content){
     body: JSON.stringify({ title: content.title || "무제", content: content.description || content.body || "", status:"publish" })
   });
   const d = await r.json();
-  return d.id ? { ok:true, url:d.link } : { ok:false, note:JSON.stringify(d).slice(0,200) };
+  if (d.id) { try { archiveBlogPost({ title: content.title||"무제", url: d.link, topic: content.topic||content.title||"", tags: content.tags||[] }); } catch(e){} return { ok:true, url:d.link }; }
+  return { ok:false, note:JSON.stringify(d).slice(0,200) };
 }
 async function publishWebhook(content){
   const url = process.env.SITE_WEBHOOK_URL;
@@ -1062,11 +1080,63 @@ async function publishWebhook(content){
   const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json" }, body: JSON.stringify(content) });
   return { ok:r.ok, note: r.ok ? "홈페이지 웹훅 전송" : "웹훅 실패("+r.status+")" };
 }
+// ===== 페이스북 페이지 발행 (Graph API /{page-id}/feed) =====
+// 필요: FB_PAGE_ID, FB_PAGE_TOKEN(만료 없는 페이지 토큰). 영상은 /videos, 사진은 /photos, 텍스트/링크는 /feed.
+async function publishFacebook(content){
+  const pageId = process.env.FB_PAGE_ID, token = process.env.FB_PAGE_TOKEN;
+  if (!pageId || !token) return { ok:false, note:"FB_PAGE_ID/FB_PAGE_TOKEN 필요" };
+  const GV = "https://graph.facebook.com/v21.0/";
+  const msg = content.caption || content.description || content.body || content.title || "";
+  const media = content.mediaUrl;
+  const isVideo = content.mediaType==="video" || (media && /\.(mp4|mov)(\?|$)/i.test(media));
+  try {
+    let endpoint, params;
+    if (media && isVideo) {
+      endpoint = GV+pageId+"/videos";
+      params = new URLSearchParams({ file_url: media, description: msg, access_token: token });
+    } else if (media) {
+      endpoint = GV+pageId+"/photos";
+      params = new URLSearchParams({ url: media, caption: msg, access_token: token });
+    } else {
+      if (!msg) return { ok:false, note:"페이스북: 내용(text) 또는 mediaUrl 필요" };
+      endpoint = GV+pageId+"/feed";
+      params = new URLSearchParams({ message: msg, access_token: token });
+    }
+    const r = await fetch(endpoint, { method:"POST", body: params });
+    if (!r.ok) return { ok:false, note:"페이스북 실패("+r.status+"): "+(await r.text().catch(()=>"")).slice(0,160) };
+    let d; try { d = await r.json(); } catch(e){ return { ok:false, note:"페이스북 응답 파싱 실패" }; }
+    const id = d.id || d.post_id;
+    return id ? { ok:true, id, url:"https://facebook.com/"+id } : { ok:false, note:JSON.stringify(d).slice(0,200) };
+  } catch(e){ return { ok:false, note:"페이스북 오류: "+String(e.message||e) }; }
+}
+// ===== 복사용 발행함으로 라우팅하는 발행기 (API 막힌 채널) =====
+// 자동발행 대신 발행함(Publish Inbox)에 완성 글을 담는다 → 사용자가 폰에서 복사·붙여넣기.
+function inboxPublisher(channel){
+  return async function(content){
+    try {
+      const it = addToInbox({
+        channel,
+        title: content.title || content.topic || "",
+        body: content.body || content.description || content.caption || "",
+        tags: content.tags || content.hashtags || [],
+        meta: content.meta || content.metaDescription || "",
+        topic: content.topic || content.title || ""
+      });
+      const nm = (COPY_CHANNELS[channel] && COPY_CHANNELS[channel].name) || channel;
+      return { ok:true, note:"발행함에 담김("+nm+") — 앱에서 복사·붙여넣기", inbox:true, inboxId: it.id };
+    } catch(e){ return { ok:false, note:"발행함 담기 실패: "+String(e.message||e) }; }
+  };
+}
 const publishers = {
   "유튜브": publishYouTube,
   "인스타그램": publishInstagram,
+  "페이스북": publishFacebook,
   "블로그": publishWordpress,
-  "홈페이지": publishWebhook
+  "홈페이지": publishWebhook,
+  "티스토리": inboxPublisher("tistory"),
+  "네이버블로그": inboxPublisher("naver_blog"),
+  "네이버카페": inboxPublisher("naver_cafe"),
+  "다음카페": inboxPublisher("daum_cafe")
 };
 // ===== 발행 전 감사(08) + 한도 =====
 function randCode(){ return Math.random().toString(36).slice(2,6).toUpperCase(); }
@@ -1121,7 +1191,12 @@ async function doActualPublish(c, platforms){
     }
   }
   const okCount = results.filter(r=>r.ok).length;
-  DB.jobs.push({ id:Date.now(), type:"publish", platforms, ok:okCount>0, count:okCount, at:Date.now() }); saveDB();
+  // 발행 성공 결과의 URL/ID를 저장 → 나중에 분석부(04)가 성과 추적
+  const published = results.filter(r=>r.ok && (r.url||r.id)).map(r=>({
+    platform: r.platform, url: r.url||"", id: r.id||"",
+    title: (c.title||c.caption||c.description||"").slice(0,80), at: Date.now()
+  }));
+  DB.jobs.push({ id:Date.now(), type:"publish", platforms, ok:okCount>0, count:okCount, published, at:Date.now() }); saveDB();
   return results;
 }
 async function auditContent(c){
@@ -1784,6 +1859,41 @@ async function studyWriterCraft(){
   }catch(e){ logError("study-writer", e); }
 }
 
+// ===== 블로그 글 아카이브 + SEO 내부링크 =====
+// 발행/게시된 블로그 글의 제목·URL을 모아, 새 글 쓸 때 관련 과거 글로 내부링크를 걸게 한다(상위노출·체류시간 강화).
+function archiveBlogPost(item){
+  DB.blogArchive = DB.blogArchive || [];
+  const url = String(item.url||"").trim();
+  const title = String(item.title||"").trim();
+  if (!title) return null;
+  // 같은 URL 또는 같은 제목이면 갱신
+  const dup = DB.blogArchive.find(x=> (url && x.url===url) || (x.title===title));
+  const rec = { title, url, topic:String(item.topic||"").slice(0,120),
+    tags: Array.isArray(item.tags)?item.tags.slice(0,8):[], at: Date.now() };
+  if (dup) { Object.assign(dup, rec); } else { DB.blogArchive.push(rec); }
+  if (DB.blogArchive.length > 300) DB.blogArchive = DB.blogArchive.slice(-300);
+  saveDB();
+  return rec;
+}
+function _kwset(s){ return String(s||"").toLowerCase().replace(/[^\w가-힣\s]/g," ").split(/\s+/).filter(w=>w.length>=2); }
+function relatedBlogPosts(topic, extra, limit){
+  const arr = DB.blogArchive || [];
+  if (!arr.length) return [];
+  const qk = _kwset(topic+" "+(extra||""));
+  if (!qk.length) return [];
+  return arr.map(p=>{
+    const pk = _kwset(p.title+" "+p.topic+" "+(p.tags||[]).join(" "));
+    let score = 0; qk.forEach(w=>{ if(pk.indexOf(w)>=0) score++; });
+    return { p, score };
+  }).filter(x=>x.score>0).sort((a,b)=>b.score-a.score).slice(0, limit||3).map(x=>x.p);
+}
+function internalLinkBlock(topic, extra){
+  const rel = relatedBlogPosts(topic, extra, 3);
+  if (!rel.length) return "";
+  const lines = rel.map(p=> "- "+p.title + (p.url? (" ("+p.url+")") : "")).join("\n");
+  return "\n\n[내부링크용 과거 글 — 관련 있으면 본문에 자연스럽게 1~2개 링크로 언급(억지 삽입 금지, 맥락 맞을 때만)]\n"+lines
+    + "\n작성 규칙: 관련 글을 언급할 땐 '자세한 내용은 「글 제목」 글을 참고하세요' 형태로 자연스럽게. URL이 있으면 마크다운 [제목](URL)로, 없으면 제목만 큰따옴표로 표기.";
+}
 async function productionPipeline(baseSys, userMsg, topic, engine){
   const _all = String(topic)+" "+String(userMsg)+" "+String(baseSys);
   const isVideo = /(영상|쇼츠|shorts|유튜브|youtube|릴스|reels|틱톡|영화|컷|장면|스토리보드|콘티|나레이션)/i.test(_all);
@@ -1814,7 +1924,8 @@ async function productionPipeline(baseSys, userMsg, topic, engine){
       + "⑧ 글 끝에 '메타설명(1~2문장)'과 '추천 태그 5개'. "
       + "티스토리·네이버 블로그 상위노출을 노린 완성 본문을 한국어로.")
     : "\n작가로서 핵심 메시지·후킹·기승전결과 대본/카피 초안을 쓴다. 시청자가 끝까지 보게 만드는 스토리·문장에 집중하고, '무엇을 말할지'에 집중한 완성 초안을 한국어로.";
-  const writerSys=baseSys+briefBlock+writerKb+"\n\n[지금 너의 역할: ✍️ 작가 "+W.name+"]\n성격: "+W.persona+"\n자료조사 브리프의 사실·수치·차별점을 근거로 녹인다."+blogCraft;
+  const linkBlock = isBlog ? internalLinkBlock(topic, userMsg) : "";
+  const writerSys=baseSys+briefBlock+writerKb+linkBlock+"\n\n[지금 너의 역할: ✍️ 작가 "+W.name+"]\n성격: "+W.persona+"\n자료조사 브리프의 사실·수치·차별점을 근거로 녹인다."+blogCraft;
   let draft=await genText(writerSys, userMsg, isBlog?2400:1700, engine); bump(W);
   // 2) PD(이서연) — 왜/누구에게: 기획·구성·타깃 최적화 총괄
   const pdBlog = isBlog ? " 이건 블로그 글이므로 제목 클릭률·소제목 구조·키워드 배치·가독성·메타설명·태그가 상위노출에 맞게 최적화됐는지 점검·보완하라." : " 타깃·플랫폼(길이·포맷·썸네일/제목 후킹)에 맞게 구성을 재배치하라.";
@@ -1951,17 +2062,150 @@ app.post("/api/content/create", async (req,res)=>{
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 동영상 기획 — 제작부(Claude)가 기획안 → Gemini가 Veo 3.1 프롬프트로 변환(협력). 클라이언트가 Gemini 앱(Ultra)에 붙여 샘플 생성.
+// ===== 웹툰 제작 =====
+// 캐릭터 일관성: 한 번 등록한 캐릭터 시트를 모든 컷 프롬프트에 자동 삽입 → 매 컷 같은 얼굴 유지.
+function buildCharacterBlock(names){
+  const chars = DB.characters || [];
+  if (!chars.length) return "";
+  let list = chars;
+  if (Array.isArray(names) && names.length){
+    const set = names.map(n=>String(n).trim());
+    list = chars.filter(c=> set.some(n=> c.name && c.name.indexOf(n)>=0));
+    if (!list.length) list = chars; // 이름 매칭 실패 시 전체 제공
+  }
+  const rows = list.slice(0,6).map(c=>{
+    const en = c.promptEn ? (" / EN: "+c.promptEn) : "";
+    return "· "+c.name+": "+(c.look||"")+(c.outfit?(" · 의상: "+c.outfit):"")+(c.tone?(" · 분위기: "+c.tone):"")+en;
+  }).join("\n");
+  return "\n\n[캐릭터 시트 — 모든 컷에서 아래 외모·의상을 동일하게 유지(일관성 필수). 작화 프롬프트에 반드시 이 설정을 녹여라]\n"+rows;
+}
+// 웹툰 콘티 생성: 형식(4컷 단편 / 세로 스크롤 / 장편) 분기, 컷별 구도·대사·작화 프롬프트
+async function webtoonPipeline(body){
+  const topic = String(body.topic||"").slice(0,200);
+  const source = String(body.source||"").slice(0,1500);
+  // format: 4cut | scroll | long
+  let format = body.format;
+  if (format!=="4cut" && format!=="long") format = "scroll";
+  let cuts;
+  if (format==="4cut") cuts = 4;
+  else if (format==="long") cuts = Math.max(16, Math.min(40, +body.cuts || 24));
+  else cuts = Math.max(6, Math.min(15, +body.cuts || 8));
+  const engine = body.engine || workEngine();
+  const d="creation"; const a=AGENTS[d];
+  const W=CREW.writer, P=CREW.pd, D=CREW.director;
+  DB.crewExp=DB.crewExp||{}; DB.exp=DB.exp||{};
+  const bump=(k)=>{ DB.crewExp[k]=(DB.crewExp[k]||0)+1; DB.exp.creation=(DB.exp.creation||0)+1; };
+  const charBlock = buildCharacterBlock(body.characters);
+  const kb = knowledgeText(d); const kbBlock = kb ? ("\n\n[제작부 축적 전문성]\n"+kb) : "";
+  const baseSys = "너는 민앤팜(고흥 특산물·지역 홍보)의 제작부 웹툰 팀이다."+ADDRESS+STYLE+kbBlock+charBlock+profileContext();
+
+  // 1) PD 이서연 — 에피소드 구성·후킹
+  const fmtDesc = format==="4cut"
+    ? "형식: 4컷 단편(기-승-전-결). 마지막 컷에 펀치라인/반전/CTA. 홍보·정보 전달에 최적."
+    : format==="long"
+    ? "형식: 장편 웹툰("+cuts+"컷). 기승전결이 뚜렷한 하나의 완결 에피소드. 도입(인물·상황 소개)→전개(사건·갈등)→절정→마무리 구조로, 중간중간 몰입 훅을 넣어라."
+    : "형식: 세로 스크롤 웹툰("+cuts+"컷 내외). 위→아래로 자연스럽게 읽히는 흐름, 마지막에 다음 화 궁금증 또는 마무리 임팩트.";
+  const pdSys = baseSys+"\n\n[역할: 🎬 PD "+P.name+"]\n"+P.persona+"\n"+fmtDesc+" 아래 주제로 웹툰 한 편의 '구성안'을 짜라. 로그라인 1줄 / 등장인물(있으면 캐릭터 시트 활용) / "+(format==="long"?"막(도입·전개·절정·마무리)별 흐름과 ":"")+"전체 흐름을 "+cuts+"컷 기준으로 컷별 한 줄 요약. 한국어로.";
+  const plan = await genText(pdSys, "주제: "+topic+"\n참고: "+source, format==="long"?1800:1200, engine); bump("pd");
+
+  // 2) 작가 정유진 — 컷별 대사·나레이션
+  const wSys = baseSys+"\n\n[역할: ✍️ 작가 "+W.name+"]\n"+W.persona+" 아래 PD 구성안을 바탕으로, 각 컷의 '대사'와 '나레이션'을 써라. 대사는 캐릭터 성격이 드러나게 짧고 생생하게. 컷마다 [컷N] 대사/나레이션 형식으로. 한국어로.";
+  const script = await genText(wSys, "[PD 구성안]\n"+plan, format==="long"?2200:1400, engine); bump("writer");
+
+  // 3) 연출 임채원 — 콘티(칸) + 작화 프롬프트
+  const cutFormat = "각 컷마다 반드시 아래 형식으로 출력(캐릭터 시트가 있으면 외모·의상을 프롬프트에 그대로 반영해 일관성 유지):\n"
+    + "[컷 N]\n"
+    + "장면: (무슨 상황)\n"
+    + "구도: (클로즈업/롱샷/부감/정면 등)\n"
+    + "인물·표정·동작: (누가 어떤 표정·자세)\n"
+    + "대사/나레이션: (말풍선 내용, 위치 힌트)\n"
+    + "🎨 작화 프롬프트(한글): (피사체·배경·구도·조명·색감·웹툰체 스타일 구체적으로)\n"
+    + "🎨 ART PROMPT(EN): (same in English, include 'webtoon style, vertical panel, consistent character')\n"
+    + "─────\n"
+    + "AI 이미지 생성기(나노바나나/Gemini)에 바로 붙여넣어 그릴 수 있게 구체적으로. 한국어 설명 + 영문 프롬프트 병기.";
+  const dirBase = baseSys+"\n\n[역할: 🎥 연출 "+D.name+"]\n"+D.persona;
+  let storyboard;
+  if (format==="long" && cuts>10){
+    // 장편: 컷을 여러 배치로 나눠 순차 생성(품질 유지). 배치당 최대 8컷.
+    const batch = 8; const parts=[];
+    for (let start=1; start<=cuts; start+=batch){
+      const end = Math.min(cuts, start+batch-1);
+      const dirSys = dirBase+" 아래 구성안·대사를 '세로 스크롤 웹툰 콘티'로 확정하라. 지금은 전체 "+cuts+"컷 중 [컷 "+start+"]부터 [컷 "+end+"]까지"+(parts.length?" 이어서":"")+" 그 구간만 출력하라. "+cutFormat;
+      const priorNote = parts.length ? ("\n\n[이미 그린 앞부분 — 흐름·캐릭터 이어가기]\n"+parts.join("\n").slice(-1200)) : "";
+      const seg = await genText(dirSys, "[PD 구성안]\n"+plan+"\n\n[작가 대사]\n"+script+priorNote, 1900, engine);
+      parts.push(String(seg).trim());
+    }
+    storyboard = parts.join("\n\n");
+    bump("director");
+  } else {
+    const dirSys = dirBase+" 아래 구성안·대사를 '세로 스크롤 웹툰 콘티'로 확정하라. "+(format==="4cut"?"정확히 4컷.":cuts+"컷 내외.")+" "+cutFormat;
+    storyboard = await genText(dirSys, "[PD 구성안]\n"+plan+"\n\n[작가 대사]\n"+script, format==="4cut"?1800:2800, engine); bump("director");
+  }
+
+  // 학습·경험치
+  DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
+  DB.deptMemory[d].push({ at:Date.now(), instruction:"[웹툰 "+(format==="4cut"?"4컷":format==="long"?"장편":"연재")+"]", note:(topic+" — "+String(plan).slice(0,200)) });
+  DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
+  saveDB();
+  const fmtKr = format==="4cut"?"4컷 단편":format==="long"?(cuts+"컷 장편"):(cuts+"컷 연재");
+  const credit = "\n\n───\n🎨 웹툰 제작: PD "+P.name+" · 작가 "+W.name+" · 연출 "+D.name+" · "+fmtKr;
+  return { ok:true, format, cuts, plan, script, storyboard: storyboard+credit,
+    by:{ pd:P.name, writer:W.name, director:D.name } };
+}
+app.post("/api/webtoon/create", async (req,res)=>{
+  try { res.json(await webtoonPipeline(req.body||{})); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 웹툰 콘티 부분 재생성(수정 의견 반영)
+app.post("/api/webtoon/revise", async (req,res)=>{
+  try {
+    const body=req.body||{};
+    const storyboard=String(body.storyboard||""); const feedback=String(body.feedback||"");
+    if(!storyboard||!feedback) return res.json({ ok:true, storyboard });
+    const D=CREW.director; const charBlock=buildCharacterBlock(body.characters);
+    const sys="너는 민앤팜 제작부 연출 "+D.name+"다."+ADDRESS+charBlock
+      +" 아래 웹툰 콘티에 대한 클라이언트 의견을 충실히 반영해, 같은 컷 형식([컷 N]/장면/구도/인물·표정·동작/대사·나레이션/🎨작화 프롬프트 한글/🎨ART PROMPT EN)으로 '수정된 콘티 전체'를 다시 출력하라. 한국어+영문 프롬프트 병기.";
+    const revised=await genText(sys, "[현재 콘티]\n"+storyboard+"\n\n[클라이언트 의견]\n"+feedback, 2600, (body.engine||workEngine()));
+    res.json({ ok:true, storyboard:revised });
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// ===== 캐릭터 시트 관리 =====
+app.get("/api/characters", (req,res)=> res.json(DB.characters||[]));
+app.post("/api/characters", (req,res)=>{
+  try {
+    const b=req.body||{}; if(!b.name) return res.status(400).json({ error:"캐릭터 이름 필요" });
+    DB.characters = DB.characters || [];
+    const rec = { id: b.id || (Date.now()+Math.floor(Math.random()*1000)),
+      name:String(b.name).slice(0,40), look:String(b.look||"").slice(0,400),
+      outfit:String(b.outfit||"").slice(0,200), tone:String(b.tone||"").slice(0,120),
+      promptEn:String(b.promptEn||"").slice(0,400), at:Date.now() };
+    const idx=(DB.characters).findIndex(c=>c.id===rec.id || c.name===rec.name);
+    if(idx>=0) DB.characters[idx]=rec; else DB.characters.push(rec);
+    if(DB.characters.length>50) DB.characters=DB.characters.slice(-50);
+    saveDB(); res.json({ ok:true, character:rec });
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/characters/delete", (req,res)=>{
+  const id=+((req.body&&req.body.id)||0), nm=String((req.body&&req.body.name)||"");
+  const before=(DB.characters||[]).length;
+  DB.characters=(DB.characters||[]).filter(c=> !(c.id===id || (nm&&c.name===nm)) );
+  saveDB(); res.json({ ok:true, removed: before-(DB.characters||[]).length });
+});
 app.post("/api/video/plan", async (req,res)=>{
   try{
     const body=req.body||{};
     const topic=body.topic||""; const source=String(body.source||"").slice(0,1500);
     const d="creation"; const a=AGENTS[d];
-    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
+    const charBlock = buildCharacterBlock(body.characters);
+    let sys="너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d)+charBlock;
     const kb=knowledgeText(d); if(kb) sys+="\n\n[축적 전문성]\n"+kb;
-    sys+=" 아래 주제·내용으로 짧은 SNS 홍보 영상(20~30초) 기획안을 만들어라. 반드시 10초 단위 구간으로 끊어 구성하라. 형식: 콘셉트 한 줄 / 구간별(구간1: 0-10초, 구간2: 10-20초, …) 화면·자막·나레이션 / BGM·톤 / 총 길이. 한국어로, 바로 생성 가능하게 구체적으로."+profileContext();
-    const plan=await genText(sys, "주제: "+topic+"\n참고 내용: "+source, 1400, (body.engine||workEngine()));
-    // 합의·변환: 기획안 → Veo 프롬프트(10초 구간별). Gemini 협력.
-    const vp0=await veoPromptFromPlan(plan); const veoPrompt=vp0.veoPrompt, by=vp0.by;
+    // 길이: 짧은 홍보(기본 20~30초) 또는 지정 초. 캐릭터 있으면 등장인물로 명시.
+    const secs = Math.max(10, Math.min(180, +body.seconds || 30));
+    const segN = Math.ceil(secs/10);
+    sys+=" 아래 주제·내용으로 SNS 영상("+secs+"초) 기획안을 만들어라. 반드시 10초 단위 "+segN+"개 구간으로 끊어 구성하라."+(charBlock?" 주제상 등장인물이 필요하면 위 캐릭터 시트의 인물을 쓰고, 등장할 경우 모든 구간에서 외모·의상을 일관되게 유지하라.":"")+" 형식: 콘셉트 한 줄 / 구간별(구간1: 0-10초, …) 화면·자막·나레이션 / BGM·톤 / 총 길이. 한국어로, 바로 생성 가능하게 구체적으로."+profileContext();
+    const plan=await genText(sys, "주제: "+topic+"\n참고 내용: "+source, secs>60?2200:1400, (body.engine||workEngine()));
+    // 합의·변환: 기획안 → Veo 프롬프트(10초 구간별, 캐릭터 일관성 주입). Gemini 협력.
+    const vp0=await veoPromptFromPlan(plan, charBlock); const veoPrompt=vp0.veoPrompt, by=vp0.by;
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({at:Date.now(),instruction:"[영상 기획→Veo]",note:String(plan).slice(0,300)});
     DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} } saveDB();
@@ -1989,9 +2233,10 @@ app.post("/api/video/revise", async (req,res)=>{
 // 기획안 → Veo 3.1 프롬프트 변환만 다시 실행(Gemini 협력, 실패 시 Claude 대체)
 app.post("/api/video/prompt", async (req,res)=>{
   try{
-    const plan=String((req.body||{}).plan||"");
+    const body=req.body||{};
+    const plan=String(body.plan||"");
     if(!plan) return res.json({ ok:true, veoPrompt:"", by:"" });
-    const vp=await veoPromptFromPlan(plan);
+    const vp=await veoPromptFromPlan(plan, buildCharacterBlock(body.characters));
     res.json({ ok:true, veoPrompt:vp.veoPrompt, by:vp.by });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
@@ -2056,6 +2301,67 @@ app.post("/api/publish", async (req,res)=>{
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
+// ===== 복사용 발행함 (Publish Inbox) =====
+// 자동발행이 막힌 채널(티스토리·네이버블로그·네이버카페·다음카페)용.
+// 에이전트가 완성 글을 여기 담아두면, 사용자가 폰에서 한 번 탭 → 복사 → 에디터에 붙여넣기.
+const COPY_CHANNELS = {
+  tistory:    { name:"티스토리",       kind:"blog" },
+  naver_blog: { name:"네이버 블로그",   kind:"blog" },
+  naver_cafe: { name:"네이버 카페",     kind:"cafe" },
+  daum_cafe:  { name:"다음 카페",       kind:"cafe" }
+};
+// 발행함에 항목 추가 (에이전트/파이프라인이 호출)
+function addToInbox(item){
+  DB.pubInbox = DB.pubInbox || [];
+  const it = {
+    id: Date.now()+Math.floor(Math.random()*1000),
+    channel: item.channel || "tistory",
+    channelName: (COPY_CHANNELS[item.channel]&&COPY_CHANNELS[item.channel].name) || item.channel || "블로그",
+    title: item.title || "",
+    body: item.body || item.content || item.description || "",
+    tags: Array.isArray(item.tags) ? item.tags : (item.tags?String(item.tags).split(/[,#\s]+/).filter(Boolean):[]),
+    meta: item.meta || "",           // 메타설명(SEO)
+    topic: item.topic || "",
+    status: "pending",               // pending | done
+    at: Date.now()
+  };
+  DB.pubInbox.push(it);
+  if (DB.pubInbox.length > 200) DB.pubInbox = DB.pubInbox.slice(-200);
+  // 블로그 채널이면 내부링크 후보로 아카이브(제목 기준, URL은 게시 후 done에서 채움)
+  try { if ((COPY_CHANNELS[it.channel]||{}).kind==="blog" && it.title) archiveBlogPost({ title:it.title, url:"", topic:it.topic||it.title, tags:it.tags, inboxId:it.id }); } catch(e){}
+  saveDB();
+  return it;
+}
+// 목록 조회
+app.get("/api/inbox", (req,res)=>{
+  const status = req.query.status;
+  let list = (DB.pubInbox||[]);
+  if (status) list = list.filter(x=>x.status===status);
+  res.json(list.slice(-100).reverse());
+});
+// 항목 추가
+app.post("/api/inbox", (req,res)=>{
+  try { res.json({ ok:true, item: addToInbox(req.body||{}) }); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 완료 표시(붙여넣기 끝냄) / 삭제
+app.post("/api/inbox/:id/done", (req,res)=>{
+  const it = (DB.pubInbox||[]).find(x=>x.id===+req.params.id);
+  if (!it) return res.status(404).json({ error:"항목 없음" });
+  it.status = "done"; it.doneAt = Date.now();
+  // 게시 후 실제 URL을 받으면 내부링크 아카이브에 채워넣기(다음 글이 이 글로 링크 가능)
+  const url = String((req.body&&req.body.url)||"").trim();
+  if (url) { it.url = url; try { archiveBlogPost({ title:it.title, url, topic:it.topic||it.title, tags:it.tags }); } catch(e){} }
+  saveDB();
+  res.json({ ok:true });
+});
+app.post("/api/inbox/:id/delete", (req,res)=>{
+  const before = (DB.pubInbox||[]).length;
+  DB.pubInbox = (DB.pubInbox||[]).filter(x=>x.id!==+req.params.id);
+  saveDB();
+  res.json({ ok:true, removed: before-(DB.pubInbox||[]).length });
+});
+
 // 동기화 — 변경분 내려받기: ?since=timestamp
 app.get("/api/sync", (req,res)=>{
   const since = +req.query.since || 0;
@@ -2083,6 +2389,12 @@ app.get("/api/sync", (req,res)=>{
     growBurst: DB.growBurst || {active:false,total:0,done:0},
     capability: DB.capability || {},
     pubSchedules: DB.pubSchedules || [],
+    pubInbox: (DB.pubInbox||[]).filter(x=>x.status==="pending"),
+    analytics: DB.analytics || {},
+    analyticsInsight: DB.analyticsInsight || {},
+    bestTimes: DB.bestTimes || {},
+    characters: DB.characters || [],
+    blogArchive: (DB.blogArchive||[]).slice(-60),
     exp: DB.exp || {},
     collections: (DB.collections||[]).filter(c=>c.at>since),
     state: DB.state,
@@ -3326,14 +3638,239 @@ app.get("/api/errors", (req,res)=> res.json((DB.errors||[]).slice(-50)));
 
 // 성과 지표 수집 (플랫폼별 — 실제 API 연결 자리)
 app.get("/api/metrics", async (req,res)=>{
-  // TODO: 각 플랫폼 통계 API로 조회수·좋아요·댓글 수집
-  //  유튜브: YouTube Analytics API / videos.list(statistics)
-  //  인스타: Graph API insights
-  // 지금은 발행 기록 요약을 반환(실연동 전 placeholder)
   const pubs = (DB.jobs||[]).filter(j=>j.type==="publish");
   const byDay = {};
   pubs.forEach(j=>{ const d=new Date(j.at).toISOString().slice(0,10); byDay[d]=(byDay[d]||0)+(j.count||0); });
-  res.json({ totalPublishes: pubs.reduce((a,j)=>a+(j.count||0),0), byDay, note:"플랫폼 통계 API 연결 시 조회수·좋아요가 채워집니다" });
+  res.json({ totalPublishes: pubs.reduce((a,j)=>a+(j.count||0),0), byDay, analytics: DB.analytics||{}, insight: (DB.analyticsInsight||{}) });
+});
+
+// ===== 유튜브 성과 추적: 발행한 영상의 조회·좋아요·댓글 수집 =====
+// 최근 발행 기록에서 유튜브 영상 ID를 모아 videos.list(statistics)로 조회. 본인 소유 영상은 업로드 토큰으로 조회 가능.
+function collectPublishedYouTubeIds(sinceDays){
+  const since = Date.now() - (sinceDays||30)*86400000;
+  const ids = {};   // videoId -> {title, at}
+  (DB.jobs||[]).filter(j=>j.type==="publish" && j.at>=since && Array.isArray(j.published)).forEach(j=>{
+    j.published.forEach(p=>{
+      let vid = p.id || "";
+      if (!vid && /youtu\.?be/.test(p.url||"")) { const m=(p.url||"").match(/(?:youtu\.be\/|v=)([\w-]{6,})/); if(m) vid=m[1]; }
+      // 유튜브만: url에 youtu가 있거나 platform이 유튜브
+      if (vid && (/youtu/.test(p.url||"") || p.platform==="유튜브")) ids[vid] = { title:p.title||"", at:p.at||j.at };
+    });
+  });
+  return ids;
+}
+async function fetchYouTubeStats(videoIds){
+  if (!videoIds.length) return {};
+  const token = await getGoogleToken();
+  const out = {};
+  // 한 번에 50개까지
+  for (let i=0;i<videoIds.length;i+=50){
+    const batch = videoIds.slice(i,i+50);
+    const url = "https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id="+batch.join(",");
+    const r = await fetch(url, { headers:{ "Authorization":"Bearer "+token } });
+    if (!r.ok) throw new Error("유튜브 통계 조회 실패("+r.status+"): "+(await r.text().catch(()=>"")).slice(0,140));
+    const d = await r.json();
+    (d.items||[]).forEach(v=>{
+      const s=v.statistics||{};
+      out[v.id] = {
+        title: (v.snippet&&v.snippet.title)||"",
+        views: +(s.viewCount||0), likes: +(s.likeCount||0), comments: +(s.commentCount||0),
+        publishedAt: (v.snippet&&v.snippet.publishedAt)||""
+      };
+    });
+  }
+  return out;
+}
+// 인스타/페북 발행 기록에서 게시물 ID 수집
+function collectPublishedMetaIds(platform, sinceDays){
+  const since = Date.now() - (sinceDays||30)*86400000;
+  const ids = {};   // postId -> {title, at}
+  (DB.jobs||[]).filter(j=>j.type==="publish" && j.at>=since && Array.isArray(j.published)).forEach(j=>{
+    j.published.forEach(p=>{
+      if (p.platform===platform && p.id) ids[p.id] = { title:p.title||"", at:p.at||j.at };
+    });
+  });
+  return ids;
+}
+// 인스타 미디어 성과: like_count·comments_count(+가능하면 reach)
+async function fetchInstagramStats(mediaIds){
+  const token = process.env.IG_ACCESS_TOKEN;
+  if (!token || !mediaIds.length) return {};
+  const GV = "https://graph.facebook.com/v21.0/";
+  const out = {};
+  for (const id of mediaIds){
+    try {
+      const r = await fetch(GV+id+"?fields=like_count,comments_count,caption,media_type,permalink,timestamp&access_token="+encodeURIComponent(token));
+      if (!r.ok) continue;
+      const d = await r.json();
+      let reach = 0;
+      try { // reach는 insights에서만 (실패해도 무시)
+        const ri = await fetch(GV+id+"/insights?metric=reach&access_token="+encodeURIComponent(token));
+        if (ri.ok){ const ridata = await ri.json(); const m=(ridata.data||[]).find(x=>x.name==="reach"); if(m&&m.values&&m.values[0]) reach=+m.values[0].value||0; }
+      } catch(e){}
+      out[id] = {
+        title: (d.caption||"").slice(0,60), likes:+(d.like_count||0), comments:+(d.comments_count||0),
+        views: reach, permalink: d.permalink||"", publishedAt: d.timestamp||""
+      };
+    } catch(e){ /* 개별 실패 무시 */ }
+  }
+  return out;
+}
+// 페북 페이지 게시물 성과: 좋아요·댓글·공유
+async function fetchFacebookStats(postIds){
+  const token = process.env.FB_PAGE_TOKEN;
+  if (!token || !postIds.length) return {};
+  const GV = "https://graph.facebook.com/v21.0/";
+  const out = {};
+  for (const id of postIds){
+    try {
+      const r = await fetch(GV+id+"?fields=message,created_time,likes.summary(true),comments.summary(true),shares&access_token="+encodeURIComponent(token));
+      if (!r.ok) continue;
+      const d = await r.json();
+      out[id] = {
+        title: (d.message||"").slice(0,60),
+        likes: +((d.likes&&d.likes.summary&&d.likes.summary.total_count)||0),
+        comments: +((d.comments&&d.comments.summary&&d.comments.summary.total_count)||0),
+        views: +((d.shares&&d.shares.count)||0), // 공유 수를 views 칸에 표시
+        publishedAt: d.created_time||""
+      };
+    } catch(e){ /* 개별 실패 무시 */ }
+  }
+  return out;
+}
+// 성과 수집 + 분석부(04) 인사이트 생성 → 기획부(01)로 피드백 + 각 부서 학습
+async function runAnalyticsCollect(force){
+  const idMap = collectPublishedYouTubeIds(45);
+  const vids = Object.keys(idMap);
+  // 유튜브 성과
+  let ytRows = [];
+  if (vids.length){
+    try {
+      const stats = await fetchYouTubeStats(vids);
+      ytRows = Object.keys(stats).map(id=>({ id, ...stats[id] })).sort((a,b)=> b.views - a.views);
+    } catch(e){ /* 유튜브 실패해도 다른 채널 진행 */ }
+  }
+  // 인스타 성과
+  let igRows = [];
+  const igIds = Object.keys(collectPublishedMetaIds("인스타그램", 45));
+  if (igIds.length){
+    try { const s = await fetchInstagramStats(igIds); igRows = Object.keys(s).map(id=>({ id, ...s[id] })).sort((a,b)=>(b.likes+b.comments)-(a.likes+a.comments)); } catch(e){}
+  }
+  // 페북 성과
+  let fbRows = [];
+  const fbIds = Object.keys(collectPublishedMetaIds("페이스북", 45));
+  if (fbIds.length){
+    try { const s = await fetchFacebookStats(fbIds); fbRows = Object.keys(s).map(id=>({ id, ...s[id] })).sort((a,b)=>(b.likes+b.comments)-(a.likes+a.comments)); } catch(e){}
+  }
+  if (!ytRows.length && !igRows.length && !fbRows.length){
+    return { ok:true, note:"추적할 발행 기록이 없어요(유튜브·인스타·페북에 발행 후 실행하세요).", count:0 };
+  }
+  const totalize = rows => rows.reduce((a,v)=>({ views:a.views+(v.views||0), likes:a.likes+(v.likes||0), comments:a.comments+(v.comments||0) }), {views:0,likes:0,comments:0});
+  DB.analytics = DB.analytics || {};
+  const now = Date.now();
+  if (ytRows.length) DB.analytics.youtube   = { collectedAt: now, videos: ytRows, totals: totalize(ytRows) };
+  if (igRows.length) DB.analytics.instagram = { collectedAt: now, videos: igRows, totals: totalize(igRows) };
+  if (fbRows.length) DB.analytics.facebook  = { collectedAt: now, videos: fbRows, totals: totalize(fbRows) };
+  saveDB();
+  // 강민서(04) 분석 코멘트 — 채널 통합, 다음 기획에 반영할 시사점
+  try {
+    const secTop = (label, rows, viewLabel) => rows.length
+      ? ("["+label+" 상위]\n"+rows.slice(0,4).map(v=>"· "+(v.title||v.id)+" — "+viewLabel+" "+(v.views||0)+" · 좋아요 "+(v.likes||0)+" · 댓글 "+(v.comments||0)).join("\n"))
+      : "";
+    const ctx = [ secTop("유튜브", ytRows, "조회"), secTop("인스타그램", igRows, "도달"), secTop("페이스북", fbRows, "공유") ].filter(Boolean).join("\n\n");
+    const a = AGENTS["analytics"];
+    const sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 담당 "+(MEMBERS["analytics"]||"강민서")+"다. 아래 채널별 성과 데이터를 종합해, 다음 콘텐츠 기획에 바로 반영할 시사점을 뽑아라. 형식(이 형식만):\n요약: (한 줄, 전체 성과 진단)\n채널별 진단: (유튜브·인스타·페북 중 데이터 있는 채널만 한 줄씩, 어디가 잘되는지)\n잘된 것: (반응 높은 콘텐츠의 공통점 1~2개)\n다음 기획 제안: (기획부가 다음에 만들면 좋을 주제·형식·채널 2~3개, 데이터 근거와 함께)\n군더더기 없이, 숫자 근거로, 한국어로만.";
+    const insight = await genText(sys, ctx, 800, workEngine());
+    DB.analyticsInsight = { at: now, by: MEMBERS["analytics"]||"강민서", text: insight };
+    DB.state = DB.state || {};
+    DB.state.deptDirective = DB.state.deptDirective || {};
+    DB.state.deptDirective["strategy"] = "[데이터 피드백] "+String(insight).replace(/\n/g," ").slice(0,240);
+    DB.deptMemory = DB.deptMemory || {}; DB.deptMemory["analytics"] = DB.deptMemory["analytics"]||[];
+    DB.deptMemory["analytics"].push({ at:now, instruction:"[채널 성과 분석]", note:String(insight).slice(0,300) });
+    DB.exp = DB.exp || {}; DB.exp["analytics"] = (DB.exp["analytics"]||0)+1;
+    saveDB();
+  } catch(e){ /* 인사이트 실패해도 데이터는 저장됨 */ }
+  // 최적 발행시간 분석(요일×시간대) — 성과 데이터를 예약발행에 활용
+  try { computeBestTimes(); } catch(e){}
+  // 성과를 각 부서의 '학습 신호'로 주입 — 실제 숫자로 부서 전문성이 성장하게(핵심)
+  try { await injectPerformanceLearning(now); } catch(e){}
+  return { ok:true, count: ytRows.length+igRows.length+fbRows.length, analytics: DB.analytics, insight: DB.analyticsInsight, bestTimes: DB.bestTimes||{} };
+}
+// 요일×시간대별 평균 반응으로 최적 발행 시간대 산출
+function computeBestTimes(){
+  const buckets = {};   // "dow-hour" -> {score, n}
+  const add = (iso, engagement) => {
+    if(!iso) return;
+    const d = new Date(iso); if(isNaN(d)) return;
+    // KST 기준 요일·시간
+    const k = new Date(d.getTime()+9*3600000);
+    const key = k.getUTCDay()+"-"+k.getUTCHours();
+    buckets[key] = buckets[key] || { score:0, n:0 };
+    buckets[key].score += engagement; buckets[key].n += 1;
+  };
+  const an = DB.analytics || {};
+  ["youtube","instagram","facebook"].forEach(ch=>{
+    ((an[ch]&&an[ch].videos)||[]).forEach(v=>{
+      const eng = (+v.views||0)*0.2 + (+v.likes||0) + (+v.comments||0)*2; // 댓글>좋아요>조회 가중
+      add(v.publishedAt, eng);
+    });
+  });
+  const rows = Object.keys(buckets).map(key=>{
+    const [dow,hour]=key.split("-").map(Number);
+    return { dow, hour, avg: buckets[key].score/Math.max(1,buckets[key].n), n:buckets[key].n };
+  }).filter(x=>x.n>=1).sort((a,b)=>b.avg-a.avg);
+  const dowKr=["일","월","화","수","목","금","토"];
+  DB.bestTimes = { at: Date.now(),
+    top: rows.slice(0,5).map(r=>({ label: dowKr[r.dow]+"요일 "+String(r.hour).padStart(2,"0")+"시", dow:r.dow, hour:r.hour, avg:Math.round(r.avg), n:r.n })),
+    basis: rows.length };
+  saveDB();
+  return DB.bestTimes;
+}
+// 성과 데이터를 부서별 학습 신호로 변환해 주입 → distillKnowledge가 실제 숫자로 전문성 강화
+async function injectPerformanceLearning(now){
+  const an = DB.analytics || {};
+  const all = [].concat((an.youtube&&an.youtube.videos)||[], (an.instagram&&an.instagram.videos)||[], (an.facebook&&an.facebook.videos)||[]);
+  if (!all.length) return;
+  // 상·하위 콘텐츠 대비로 '무엇이 통했나'를 뽑아 각 부서에 다른 관점으로 기록
+  const scored = all.map(v=>({ v, eng:(+v.views||0)*0.2+(+v.likes||0)+(+v.comments||0)*2 })).sort((a,b)=>b.eng-a.eng);
+  const top = scored.slice(0,3).map(x=>x.v.title||x.v.id).filter(Boolean);
+  const low = scored.slice(-3).map(x=>x.v.title||x.v.id).filter(Boolean);
+  const bt = (DB.bestTimes&&DB.bestTimes.top&&DB.bestTimes.top[0]) ? DB.bestTimes.top[0].label : "";
+  DB.deptMemory = DB.deptMemory || {}; DB.exp = DB.exp || {};
+  // 부서별 맞춤 학습 신호(성과 피드백은 distillKnowledge가 강한 신호로 학습함)
+  const feed = {
+    strategy:   "[성과 피드백] 반응 높았던 주제: "+(top.join(", ")||"-")+" / 저조: "+(low.join(", ")||"-")+(bt?(" / 최적 발행시간: "+bt):"")+". 다음 기획은 반응 높은 쪽 특성을 강화하고 저조한 패턴은 피하라.",
+    creation:   "[성과 피드백] 잘 통한 콘텐츠: "+(top.join(", ")||"-")+". 이 콘텐츠들의 제목·후킹·구성 방식을 다음 제작에 재사용하라. 저조: "+(low.join(", ")||"-"),
+    publishing: "[성과 피드백] 반응 좋은 시간대: "+(bt||"데이터 축적 중")+". 예약발행을 이 시간대로 맞추면 도달이 올라간다.",
+    scout:      "[성과 피드백] 실제로 통한 소재: "+(top.join(", ")||"-")+". 이런 결의 트렌드·소재를 우선 발굴하라."
+  };
+  Object.keys(feed).forEach(d=>{
+    if(!AGENTS[d]) return;
+    DB.deptMemory[d] = DB.deptMemory[d] || [];
+    DB.deptMemory[d].push({ at:now||Date.now(), instruction:"[성과 피드백]", note:feed[d] });
+    // 성과 학습이 쌓이면 즉시 전문성 갱신(부서가 실제 숫자로 똑똑해짐)
+    distillKnowledge(d).catch(()=>{});
+  });
+  saveDB();
+}
+app.post("/api/analytics/collect", async (req,res)=>{
+  try { res.json(await runAnalyticsCollect(true)); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/analytics", (req,res)=> res.json({ analytics: DB.analytics||{}, insight: DB.analyticsInsight||{} }));
+
+// ===== 블로그 내부링크 아카이브 =====
+app.get("/api/blog-archive", (req,res)=> res.json((DB.blogArchive||[]).slice(-100).reverse()));
+app.post("/api/blog-archive", (req,res)=>{
+  try { const b=req.body||{}; if(!b.title) return res.status(400).json({ error:"제목 필요" });
+    res.json({ ok:true, item: archiveBlogPost({ title:b.title, url:b.url||"", topic:b.topic||b.title, tags:b.tags||[] }) });
+  } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/blog-archive/delete", (req,res)=>{
+  const t=String((req.body&&req.body.title)||""), u=String((req.body&&req.body.url)||"");
+  const before=(DB.blogArchive||[]).length;
+  DB.blogArchive=(DB.blogArchive||[]).filter(x=> !((u&&x.url===u)||(t&&x.title===t)) );
+  saveDB(); res.json({ ok:true, removed: before-(DB.blogArchive||[]).length });
 });
 
 // ===== OAuth 토큰 발급 도우미 =====
@@ -3441,7 +3978,16 @@ setInterval(async ()=>{
       runDailyReview().then(()=>console.log("퇴근 회고 완료")).catch(e=>logError("daily-review", e));
     }
   } catch(e){ /* 회고 실패 무시 */ }
-  // (0-f0) 야간 연구: 아침 지시(≥6시) 전 심야~새벽에 팀장이 내일 자료를 조사(무료). 하루 1회.
+  // (0-b3) 유튜브 성과 추적: 하루 1회(저녁) 발행 영상 조회·좋아요·댓글 수집 → 분석부(04)가 다음 기획에 반영
+  try {
+    const st6 = DB.state || {};
+    const anaHour = Number.isFinite(+st6.briefHour) ? +st6.briefHour : 21;
+    const kstHour3 = kstNow().getUTCHours();
+    if (leaderAuto && st6.analyticsAutoOn !== false && kstHour3 >= anaHour && DB.lastAnalyticsDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+      DB.lastAnalyticsDay = day; saveDB(); // 선점
+      runAnalyticsCollect(true).then(r=>{ if(r&&r.count) console.log("유튜브 성과 수집 완료: "+r.count+"건"); }).catch(e=>logError("analytics-collect", e));
+    }
+  } catch(e){ /* 성과 수집 실패 무시 */ }
   try {
     if (leaderAuto && DB.lastNightResearchDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
       const kh = kstNow().getUTCHours();
@@ -3858,7 +4404,7 @@ async function runAutoCycle(){
 }
 
 // ===== 예약 외부발행 (시각 지정 · 건수 · AI 자동생성 · 발행 시 카카오 확인) =====
-const PUB_PLATFORMS = ["유튜브","인스타그램","블로그","홈페이지"];
+const PUB_PLATFORMS = ["유튜브","인스타그램","페이스북","블로그","홈페이지","티스토리","네이버블로그","네이버카페","다음카페"];
 async function runScheduledPublish(ps){
   const platforms = (ps.platforms||[]).filter(p=>PUB_PLATFORMS.includes(p));
   if(!platforms.length) return;
