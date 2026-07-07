@@ -61,15 +61,19 @@ async function supaLoad(){
   const r = await fetch(SUPA_URL+"/rest/v1/"+SUPA_TABLE+"?id=eq.main&select=data", {
     headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY }
   });
+  if (!r.ok) throw new Error("supaLoad HTTP "+r.status+": "+(await r.text().catch(()=>"")).slice(0,120));
   const rows = await r.json();
-  return (Array.isArray(rows) && rows[0] && rows[0].data) ? rows[0].data : null;
+  if (!Array.isArray(rows)) throw new Error("supaLoad 예상치 못한 응답");
+  return (rows[0] && rows[0].data) ? rows[0].data : null;  // 행 없으면 null(정상), 에러는 throw
 }
 async function supaSave(data){
-  await fetch(SUPA_URL+"/rest/v1/"+SUPA_TABLE+"?on_conflict=id", {
+  const r = await fetch(SUPA_URL+"/rest/v1/"+SUPA_TABLE+"?on_conflict=id", {
     method:"POST",
     headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY, "Content-Type":"application/json", Prefer:"resolution=merge-duplicates" },
     body: JSON.stringify([{ id:"main", data, updated_at:Date.now() }])
   });
+  if (!r.ok) throw new Error("supaSave HTTP "+r.status+": "+(await r.text().catch(()=>"")).slice(0,120));
+  return true;
 }
 // 영구저장 라이브 점검: 실제로 테이블을 읽어 연결·권한·테이블 존재를 확인
 async function supaProbe(){
@@ -97,25 +101,70 @@ function loadDBFile(){
   try { return JSON.parse(fs.readFileSync(DB_FILE, "utf8")); }
   catch (e) { return emptyDB(); }
 }
+// DB가 '의미 있는 데이터'를 담고 있는지 판정 — 빈 데이터로 덮어쓰기 방지에 사용
+function dbHasContent(d){
+  if(!d || typeof d!=="object") return false;
+  const memN = d.deptMemory ? Object.values(d.deptMemory).reduce((a,arr)=>a+((arr&&arr.length)||0),0) : 0;
+  const expSum = d.exp ? Object.values(d.exp).reduce((a,v)=>a+(+v||0),0) : 0;
+  const knowN = d.deptKnowledge ? Object.keys(d.deptKnowledge).length : 0;
+  const jobN = (d.jobs&&d.jobs.length)||0;
+  const meetN = (d.meetings&&d.meetings.length)||0;
+  // 실제 축적 판정: 초기 가동 기록(부서×소수)·초기 exp를 확실히 넘는 값 + 지식/발행/회의는 무조건 콘텐츠
+  return (memN > 40) || (expSum > 60) || (knowN > 0) || (jobN > 0) || (meetN > 0);
+}
+let _bootRestoreOk = false;   // 시작 시 Supabase 복원이 성공했는지
+let _lastGoodSavedContent = false; // 마지막으로 '내용 있는' 상태를 저장한 적 있는지
 async function loadDB(){
   let d;
-  if (useSupabase) { try { d = (await supaLoad()) || emptyDB(); } catch(e){ console.error("supaLoad", e); d = emptyDB(); } }
-  else d = loadDBFile();
+  if (useSupabase) {
+    // 시작 시 Supabase 복원 — 실패하면 재시도, 그래도 안 되면 로컬 파일 폴백
+    let loaded = null, lastErr = null;
+    for (let attempt=0; attempt<3 && loaded==null; attempt++){
+      try {
+        if (attempt>0) await new Promise(r=>setTimeout(r, 3000)); // Supabase가 깨어날 시간
+        loaded = await supaLoad();
+        if (loaded != null) { _bootRestoreOk = true; console.log("Supabase 복원 성공 (시도 "+(attempt+1)+")"); }
+      } catch(e){ lastErr = e; console.error("supaLoad 시도 "+(attempt+1)+" 실패:", e.message||e); }
+    }
+    if (loaded != null) {
+      d = loaded;
+    } else {
+      // Supabase에서 못 읽음: 로컬 파일에 백업이 있으면 그걸 사용(빈 DB보다 안전)
+      const fileDB = loadDBFile();
+      if (dbHasContent(fileDB)) { d = fileDB; console.warn("⚠️ Supabase 복원 실패 → 로컬 파일 백업 사용"); }
+      else { d = emptyDB(); console.warn("⚠️ Supabase 복원 실패 & 로컬 백업 없음 → 빈 DB로 시작(저장 보류 모드)"); }
+      _bootRestoreOk = false;
+    }
+  } else {
+    d = loadDBFile();
+  }
   // 자가 보완: 버전 변경으로 생긴 누락 키를 기본값으로 채움
   const tmpl = emptyDB();
   for (const k of Object.keys(tmpl)){ if (d[k] === undefined) d[k] = tmpl[k]; }
+  if (dbHasContent(d)) _lastGoodSavedContent = true;
   return d;
 }
 let _saveTimer = null;
 function saveDB(){
   DB.updatedAt = Date.now();
+  // 항상 로컬 파일에도 저장(Supabase 실패 대비 2차 백업)
+  try { fs.mkdirSync(DATA_DIR, { recursive:true }); fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2)); }
+  catch (e) { /* 파일 저장 실패는 무시(디스크 없을 수 있음) */ }
   if (useSupabase) {
+    // 안전장치: 시작 시 복원이 실패했고(=빈 상태 의심) 현재 DB에 내용이 없으면 Supabase 덮어쓰기 금지
+    if (!_bootRestoreOk && !dbHasContent(DB)) {
+      // 좋은 데이터를 빈 데이터로 덮어쓰는 사고 방지 — 저장 보류
+      return;
+    }
+    // 한때 내용이 있었는데 지금 비었으면(비정상 소실 의심) 덮어쓰기 금지
+    if (_lastGoodSavedContent && !dbHasContent(DB)) {
+      console.warn("⚠️ 내용 없는 상태 저장 시도 차단(데이터 보호)");
+      return;
+    }
+    if (dbHasContent(DB)) _lastGoodSavedContent = true;
     // 잦은 호출을 모아 1.5초 디바운스로 업서트
     if (_saveTimer) clearTimeout(_saveTimer);
     _saveTimer = setTimeout(()=>{ supaSave(DB).catch(e=>console.error("supaSave", e)); }, 1500);
-  } else {
-    try { fs.mkdirSync(DATA_DIR, { recursive:true }); fs.writeFileSync(DB_FILE, JSON.stringify(DB, null, 2)); }
-    catch (e) { console.error("DB save error", e); }
   }
 }
 let DB = emptyDB();
@@ -463,6 +512,94 @@ function recordClient(text){
   if(DB.clientCount%6===0){ distillClient(); } // 6발화마다 백그라운드 갱신
   saveDB();
 }
+// ===== 자동 학습 루프: 각 부서가 웹에서 고품질 사례를 조사·분석해 '품질 공식'을 축적 =====
+// 부서별로 '무엇을 벤치마크하고 무엇을 배워야 하는지'를 정의. 자기 기록만 요약하는 게 아니라 밖에서 고수를 배워온다.
+// ytSearch: 유튜브에서 이 검색어로 인기 영상을 찾아 화면까지 분석해 학습(콘텐츠·트렌드 부서에 특히 유효)
+const DEPT_BENCHMARK = {
+  strategy: { what:"브랜드 SNS 마케팅 전략·캠페인", queries:[
+    "성공한 지역 특산물·농산물 브랜드 마케팅 전략 사례 2026",
+    "바이럴 된 SNS 캠페인 기획 공식, 후킹·스토리텔링 구조" ] },
+  creation: { what:"고품질 영상·릴스·콘텐츠 구성", queries:[
+    "조회수 높은 릴스·유튜브 쇼츠 구성·편집 공식 2026",
+    "잘 팔리는 브랜드 영상 콘텐츠 후킹·스토리보드 사례" ], ytSearch:[
+    "고흥 여행 브이로그", "농산물 홍보 영상", "시골 일상 브이로그 인기" ] },
+  publishing: { what:"채널 발행·SEO·상위노출", queries:[
+    "네이버 블로그·인스타 상위노출 SEO 최신 요령 2026",
+    "SNS 최적 발행 시간·해시태그·알고리즘 공략법" ] },
+  analytics: { what:"콘텐츠 성과 분석·개선", queries:[
+    "SNS 콘텐츠 성과 지표 분석·개선 프레임워크",
+    "데이터로 콘텐츠 개선하는 A/B 테스트·인사이트 도출법" ] },
+  monetization: { what:"명품·고급 상품페이지·상세페이지 디자인", queries:[
+    "샤넬 에르메스 명품 브랜드 상품페이지 웹디자인 특징 분석",
+    "전환율 높은 프리미엄 상세페이지 구성·레이아웃·카피 공식 2026",
+    "고급스러운 이커머스 랜딩페이지 UX·여백·타이포그래피 트렌드" ] },
+  advisory: { what:"콘텐츠 품질 검수·광고법", queries:[
+    "SNS 콘텐츠 광고법·표시광고 규정 체크리스트 2026",
+    "브랜드 콘텐츠 품질 검수 기준·가독성·톤 일관성" ] },
+  scout: { what:"최신 트렌드·바이럴 소재 발굴", queries:[
+    "2026 SNS 최신 트렌드·바이럴 밈·챌린지",
+    "지역·로컬 콘텐츠로 뜬 최근 사례·포맷" ], ytSearch:[
+    "요즘 뜨는 쇼츠", "바이럴 챌린지 2026", "로컬 콘텐츠 인기 영상" ] }
+};
+// 부서가 웹에서 벤치마크를 조사·분석해 '품질 공식'을 지식에 축적 (자동·무료 Gemini 검색)
+async function learnFromBenchmark(dept){
+  try{
+    const a=AGENTS[dept]; const bm=DEPT_BENCHMARK[dept];
+    if(!a || !bm) return { ok:false, note:"벤치마크 미정의" };
+    if(!geminiKey()) return { ok:false, note:"GEMINI_API_KEY 미설정 — 학습에 웹검색이 필요" };
+    if(!searchAllowedNow()) return { ok:false, note:"오늘 웹검색 한도 도달 — 내일 재개" };
+    // 1) 벤치마크 웹 조사 (여러 쿼리 중 하나 순환 선택 — 매번 다른 각도로 학습)
+    const qi = ((DB.learnIdx||0)) % bm.queries.length;
+    DB.learnIdx = (DB.learnIdx||0)+1;
+    const query = bm.queries[qi];
+    let research="", sources=[], ytNote="";
+    try{
+      const s = await geminiSearch("아래 주제를 실제 웹에서 조사해 핵심만 정리하라. 특히 '무엇이 이것을 고품질로 만드는가'의 구체적 요소(구조·구성·디자인·카피·수치 기준)를 뽑아라.\n주제: "+query, 1400);
+      research = String((s&&s.text)||"").trim();
+      sources = (s&&s.sources)||[];
+    }catch(e){ /* 웹검색 실패해도 유튜브로 학습 시도 */ }
+    // 유튜브 영상 학습(정의된 부서만): 인기 영상 1편을 화면까지 실제로 분석해 재료에 추가
+    if (bm.ytSearch && bm.ytSearch.length){
+      try{
+        const yq = bm.ytSearch[((DB.learnIdx||1)-1) % bm.ytSearch.length];
+        const vids = await ytSearchTop(yq, 3);
+        if (vids.length){
+          const v = vids[0];
+          const ay = await analyzeYouTube(v.url, null, 1400);
+          if (ay && ay.text){
+            ytNote = "\n\n[실제 유튜브 인기영상 분석 — \""+yq+"\" 검색 1위: "+v.title+"]\n"+ay.text;
+            sources = sources.concat([{ title:"YouTube: "+v.title, uri:v.url }]);
+          }
+        }
+      }catch(e){ /* 유튜브 학습 실패는 무시(웹검색 재료로 진행) */ }
+    }
+    if(!research && !ytNote) return { ok:false, note:"조사 결과 없음(웹검색·유튜브 모두 실패)" };
+    research = (research||"") + ytNote;
+    // 2) 조사 내용을 '이 부서가 결과물에 바로 적용할 품질 공식'으로 추출 → 기존 지식에 통합 (고품질 엔진=Claude)
+    const prior = knowledgeText(dept);
+    const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 방금 '"+bm.what+"'에 대해 최고 수준의 실제 사례를 조사했다. "
+      + "이 조사에서 '우리가 결과물을 만들 때 그대로 적용할 구체적 품질 공식·체크리스트'를 뽑아, 기존 축적 전문성에 통합·발전시켜라. "
+      + "추상적 조언 말고, 바로 실행 가능한 구체 기준으로(예: '히어로 이미지는 풀블리드, 여백 50%+, 첫 화면에 브랜드 스토리 한 문장', '섹션은 5개 이하, 스크롤 리듬 유지'). "
+      + "형식(이 형식만, 한국어):\n핵심 품질 공식: (결과물을 고품질로 만드는 구체 기준 5~8개, 재사용 가능한 체크리스트로)\n반드시 지킬 것: (빠뜨리면 티 나는 필수 요소 3~5개)\n피해야 할 것: (아마추어 티 나는 실수 2~4개)\n다음 학습 과제: (아직 부족해 더 배워야 할 것 1~2개)";
+    const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[방금 조사한 고품질 사례]\n"+research;
+    const formula = await anthropic(sys, ctx, 1800); // 품질 추출은 고품질 엔진(Claude)으로
+    DB.deptKnowledge = DB.deptKnowledge || {};
+    DB.deptKnowledge[dept] = { text: formula, at:Date.now(), basis:(DB.deptMemory[dept]||[]).length, exp:(DB.exp&&DB.exp[dept])||0, benchmark:bm.what, learned:true };
+    // 학습 기록 남기기(성장 체감) + 경험치
+    DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
+    DB.deptMemory[dept].push({ at:Date.now(), instruction:"[벤치마크 학습] "+bm.what, note:"조사: "+query+" → 품질 공식 갱신" });
+    if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+    DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3; // 벤치마크 학습은 실무보다 큰 성장(+3)
+    saveDB();
+    return { ok:true, dept, benchmark:bm.what, query, sources: sources.slice(0,4), knowledge: formula };
+  }catch(e){ logError("learnFromBenchmark:"+dept, e); return { ok:false, note:String(e.message||e).slice(0,100) }; }
+}
+app.post("/api/learn/benchmark", async (req,res)=>{
+  try{
+    const dept = (req.body&&req.body.dept) || "monetization";
+    res.json(await learnFromBenchmark(dept));
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
 // 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
 async function distillKnowledge(dept, forceDeep){
   try{
@@ -845,6 +982,58 @@ async function geminiSearch(prompt, maxTok){
   }
   throw new Error("gemini-search 실패: "+(lastErr||"원인 미상"));
 }
+
+// 유튜브에서 검색어로 인기 영상 URL 찾기 (YouTube Data API, Google API 키 재사용). 실패 시 [] 반환(학습은 웹검색으로 폴백).
+async function ytSearchTop(query, n){
+  try{
+    const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+    if(!key) return [];
+    const url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults="+(n||3)
+      +"&order=viewCount&q="+encodeURIComponent(query)+"&key="+key;
+    const r = await fetch(url);
+    const d = await r.json();
+    if(d.error || !d.items) return [];
+    return d.items.filter(it=>it.id&&it.id.videoId).map(it=>({
+      url:"https://www.youtube.com/watch?v="+it.id.videoId,
+      title:(it.snippet&&it.snippet.title)||""
+    }));
+  }catch(e){ return []; }
+}
+// 유튜브 영상을 화면(프레임)+음성까지 실제로 분석 (Gemini 멀티모달, 공개 영상만, 무료 프리뷰)
+async function analyzeYouTube(url, question, maxTok){
+  const key = geminiKey();
+  if (!key) throw new Error("GEMINI_API_KEY 미설정");
+  if (Date.now() < geminiCooldownUntil) throw new Error("gemini-cooldown");
+  const u = String(url||"").trim();
+  if (!/youtube\.com\/watch\?v=|youtu\.be\//.test(u)) throw new Error("유효한 유튜브 URL이 아님");
+  const models = ["gemini-2.5-flash","gemini-3.5-flash"];
+  const want = maxTok || 1500;
+  const q = question || "이 영상을 화면·구성·편집·자막까지 분석해, 무엇이 이 영상을 잘 만들어진(또는 인기 있는) 콘텐츠로 만드는지 구체적으로 정리하라. 도입 후킹, 장면 전환, 자막·카피, 길이·리듬, 썸네일급 첫 장면을 짚어라.";
+  let lastErr=null;
+  for (const mdl of models){
+    try{
+      const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
+      const body = { contents:[{ parts:[ { fileData:{ fileUri:u } }, { text:q } ] }], generationConfig:{ maxOutputTokens: want } };
+      const r = await fetch(apiUrl, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
+      const dj = await r.json();
+      if (dj.error){ lastErr=String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(lastErr,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
+      const cand = (dj.candidates||[])[0]||{};
+      const parts = (cand.content||{}).parts||[];
+      const text = parts.map(p=>p.text||"").join("").trim();
+      if (text){ noteSearch(); try{ recordGeminiUsage(dj.usageMetadata); }catch(_){} return { text, url:u }; }
+      lastErr = "빈 응답(영상이 비공개/미등록이거나 분석 불가)";
+    }catch(e){ lastErr=String(e.message||e); }
+  }
+  throw new Error("유튜브 분석 실패: "+(lastErr||"원인 미상"));
+}
+// 유튜브 URL 분석 엔드포인트(수동 테스트/학습용)
+app.post("/api/learn/youtube", async (req,res)=>{
+  try{
+    const b=req.body||{};
+    const out = await analyzeYouTube(b.url, b.question, b.maxTok);
+    res.json({ ok:true, url:out.url, analysis:out.text });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
 
 async function geminiText(prompt, maxTok){
   const key = geminiKey();
@@ -2154,6 +2343,49 @@ async function webtoonPipeline(body){
 }
 app.post("/api/webtoon/create", async (req,res)=>{
   try { res.json(await webtoonPipeline(req.body||{})); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// ===== HTML 상품페이지 생성 (커머스·그로스 부서의 학습된 품질 공식을 실제 페이지로) =====
+async function productPagePipeline(body){
+  const d="monetization"; const a=AGENTS[d];
+  const product = String(body.product||"").slice(0,120);
+  const info = String(body.info||"").slice(0,2000);
+  const photos = Array.isArray(body.photos) ? body.photos.slice(0,10) : []; // [{url, desc}] 실제 사진(있으면)
+  const price = String(body.price||"").slice(0,60);
+  const brand = String(body.brand||"민앤팜").slice(0,40);
+  if(!product) throw new Error("상품명이 필요합니다");
+  // 학습된 품질 공식(벤치마크 학습으로 축적된 것)을 그대로 주입
+  const formula = knowledgeText(d);
+  const formulaBlock = formula ? ("\n\n[이 부서가 축적한 상품페이지 품질 공식 — 반드시 이 기준을 적용해 만들어라]\n"+formula) : "";
+  // 실제 사진 자리 안내
+  let photoBlock = "";
+  if (photos.length){
+    photoBlock = "\n\n[제공된 실제 사진 — 아래 URL을 <img src>로 그대로 사용하라]\n"
+      + photos.map((p,i)=>"사진"+(i+1)+": "+(p.url||"")+(p.desc?(" ("+p.desc+")"):"")).join("\n");
+  }
+  photoBlock += "\n\n[사진이 없는 자리는 <div class=\"img-ph\">[AI이미지: 구체적 묘사]</div> 형태의 플레이스홀더로 남겨, 나중에 이미지를 넣을 수 있게 하라.]";
+  const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
+    + " 아래 상품으로, 샤넬·에르메스 같은 명품 브랜드 수준의 '실제로 바로 열리는 완성형 HTML 상품페이지' 하나를 만들어라. "
+    + "반드시 지킬 것: (1) 완전한 단일 HTML 문서(<!DOCTYPE html>부터 </html>까지, CSS는 <style>에 인라인). "
+    + "(2) 히어로 섹션(풀블리드 대형 비주얼 + 브랜드 스토리 한 문장), 상품 소개, 스토리텔링, 상세 특징, 구매 유도(CTA) 섹션 포함. "
+    + "(3) 고급스러운 여백·타이포그래피·색감, 스크롤 시 자연스러운 리듬. 모바일 반응형. "
+    + "(4) 과장광고·허위표현 금지, 실제 판매에 쓸 수 있는 신뢰감 있는 카피. "
+    + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
+    + formulaBlock + photoBlock + profileContext();
+  const user = "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n상품 정보:\n"+info;
+  let html = await anthropic(sys, user, 8000); // 페이지는 길어야 하므로 큰 토큰
+  // 혹시 코드펜스가 붙어 나오면 제거
+  html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+  // 학습·경험치
+  DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
+  DB.deptMemory[d].push({ at:Date.now(), instruction:"[상품페이지 제작]", note:product+" — "+(price||"") });
+  if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+  DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
+  saveDB();
+  return { ok:true, html, product, appliedFormula: !!formula, by:a.kr };
+}
+app.post("/api/product-page", async (req,res)=>{
+  try { res.json(await productPagePipeline(req.body||{})); }
   catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 웹툰 콘티 부분 재생성(수정 의견 반영)
@@ -3997,6 +4229,26 @@ setInterval(async ()=>{
       }
     }
   } catch(e){ /* 야간 연구 실패 무시 */ }
+  // (0-b4) 자동 벤치마크 학습: 하루 1회, 부서를 하나씩 돌아가며 웹·유튜브에서 고품질 사례를 조사·학습(품질 공식 축적)
+  try {
+    const st7 = DB.state || {};
+    if (leaderAuto && st7.benchmarkLearnOn !== false && DB.lastBenchmarkDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+      const kh4 = kstNow().getUTCHours();
+      if (kh4 >= 2 && kh4 < 6) { // 새벽 2~5시대(야간연구 후, 아침 지시 전)
+        DB.lastBenchmarkDay = day;
+        const order = Object.keys(DEPT_BENCHMARK);
+        DB.benchmarkTurn = ((DB.benchmarkTurn||0)) % order.length;
+        const dept = order[DB.benchmarkTurn];
+        DB.benchmarkTurn = (DB.benchmarkTurn+1) % order.length;
+        saveDB(); // 선점
+        learnFromBenchmark(dept).then(r=>{
+          if(r&&r.ok){ try{ kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 '"+r.benchmark+"'를 학습해 품질 공식을 갱신했어요"); }catch(_){}
+            console.log("벤치마크 학습 완료: "+dept); }
+          else console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note));
+        }).catch(e=>logError("benchmark-learn", e));
+      }
+    }
+  } catch(e){ /* 벤치마크 학습 실패 무시 */ }
   // (0-c) 24시간+ 자율수행 정체 부서: 팀장이 감지해 학습 기반으로 재지시 (자동·무료)
   if (autoOK) checkStaleDepts().catch(e=>logError("stale-check", e));
   // (0-d) 부서 간 지식 공유·성장 세션: 주기 자동 진행(기본 48시간마다) — 자동·무료
