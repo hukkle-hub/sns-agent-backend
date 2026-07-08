@@ -156,6 +156,21 @@ async function loadDB(){
   if (dbHasContent(d)) _lastGoodSavedContent = true;
   return d;
 }
+let _lastSaveOkAt = 0, _lastSaveErr = "", _saveFailStreak = 0, _saveAlertedAt = 0;
+function noteSaveOk(){ _lastSaveOkAt = Date.now(); _lastSaveErr = ""; _saveFailStreak = 0; }
+function noteSaveFail(e){
+  _lastSaveErr = String((e&&e.message)||e).slice(0,200);
+  _saveFailStreak++;
+  console.error("supaSave 실패("+_saveFailStreak+"회):", _lastSaveErr);
+  // 조용히 실패하면 데이터가 안 쌓이는 걸 모른다 → 3회 연속 실패 시 1시간에 한 번 알림
+  if (_saveFailStreak >= 3 && (Date.now() - _saveAlertedAt > 3600000)){
+    _saveAlertedAt = Date.now();
+    const hint = /42501|row-level security/i.test(_lastSaveErr)
+      ? "\n\n원인: Supabase RLS 정책이 쓰기를 막고 있어요.\n해결: Render 환경변수 SUPABASE_KEY 를 Supabase의 service_role 키로 바꾸세요."
+      : "";
+    kakaoNotify("🚨 데이터 저장 실패가 계속되고 있어요 ("+_saveFailStreak+"회)\n"+_lastSaveErr+hint).catch(()=>{});
+  }
+}
 let _saveTimer = null;
 function saveDB(){
   DB.updatedAt = Date.now();
@@ -176,7 +191,7 @@ function saveDB(){
     if (dbHasContent(DB)) _lastGoodSavedContent = true;
     // 잦은 호출을 모아 1.5초 디바운스로 업서트
     if (_saveTimer) clearTimeout(_saveTimer);
-    _saveTimer = setTimeout(()=>{ supaSave(DB).catch(e=>console.error("supaSave", e)); }, 1500);
+    _saveTimer = setTimeout(()=>{ supaSave(DB).then(noteSaveOk).catch(noteSaveFail); }, 1500);
   }
 }
 let DB = emptyDB();
@@ -2861,6 +2876,15 @@ app.get("/api/diag", (req,res)=>{
     "3_데이터_안전": {
       부팅시_상태: (typeof _bootRestoreNote!=="undefined" && _bootRestoreNote) ? _bootRestoreNote : "?",
       Supabase_접속: (typeof _bootRestoreOk!=="undefined") ? (_bootRestoreOk ? "✅ 접속 성공(저장 가능)" : "❌ 접속 실패(저장 보류 — 데이터 보호 중)") : "?",
+      실제_저장상태: (function(){
+        if(!useSupabase) return "파일 모드(Supabase 미설정)";
+        if(_lastSaveErr){
+          const rls = /42501|row-level security/i.test(_lastSaveErr);
+          return "❌ 저장 실패("+_saveFailStreak+"회): "+_lastSaveErr + (rls ? "  → 해결: Render의 SUPABASE_KEY를 Supabase service_role 키로 교체하세요" : "");
+        }
+        return _lastSaveOkAt ? ("✅ 저장 성공 — 마지막 "+new Date(_lastSaveOkAt).toLocaleString("ko-KR",{timeZone:"Asia/Seoul"}))
+                             : "⏳ 아직 저장 시도 없음(작업하면 저장됨)";
+      })(),
       현재_내용유무: (function(){ try{ return dbHasContent(DB) ? "✅ 내용 있음" : "비어있음(정상 — 작업하면 쌓임)"; }catch(e){ return "?"; } })()
     },
     "4_자동학습": {
