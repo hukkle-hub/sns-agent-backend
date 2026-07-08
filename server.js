@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], pageJobs:[], updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], pageJobs:[], learnJobs:[], updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -639,6 +639,102 @@ app.post("/api/learn/youtube-urls", (req,res)=>{
     saveDB();
     res.json({ ok:true, dept, urls });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// ===== 유튜브 URL을 직접 학습시켜 부서 전문성에 반영 =====
+async function learnFromYouTubeUrls(dept, urls){
+  const a = AGENTS[dept]; const bm = DEPT_BENCHMARK[dept];
+  if(!a) throw new Error("유효한 부서가 아닙니다");
+  if(!geminiKey()) throw new Error("GEMINI_API_KEY 미설정 — 영상 분석 불가");
+  const list = (urls||[]).slice(0,3);
+  if(!list.length) throw new Error("분석할 유튜브 URL이 없습니다");
+  const notes = [];
+  for (const u of list){
+    try{
+      const ay = await analyzeYouTube(u, "이 영상을 화면·구성·편집·자막까지 실제로 분석하라. 무엇이 이 영상을 잘 만들어진(또는 인기 있는) 콘텐츠로 만드는지 구체적으로: 도입 3초 후킹, 장면 전환·리듬, 자막·카피 스타일, 화면 구성·색감, 길이, 마무리(CTA). 추상적 표현 금지, 관찰한 사실 위주로.", 1400);
+      if(ay && ay.text) notes.push("[영상] "+u+"\n"+ay.text);
+    }catch(e){ notes.push("[영상 분석 실패] "+u+" — "+String(e.message||e).slice(0,100)); }
+  }
+  const okNotes = notes.filter(n=>!n.startsWith("[영상 분석 실패]"));
+  if(!okNotes.length) throw new Error("영상을 분석하지 못했어요 (비공개·미등록 영상이거나 키 권한 문제)");
+  const prior = knowledgeText(dept);
+  const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 방금 실제 유튜브 영상을 화면까지 직접 분석했다. "
+    + "이 분석에서 '우리가 결과물을 만들 때 그대로 적용할 구체적 품질 공식·체크리스트'를 뽑아, 기존 축적 전문성에 통합·발전시켜라. "
+    + "추상적 조언 말고 바로 실행 가능한 구체 기준으로(예: '첫 3초에 결과 화면 먼저 보여주기', '컷 길이 2~3초 유지', '자막은 2줄 이내 굵게'). "
+    + "형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
+  const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[방금 직접 분석한 유튜브 영상]\n"+okNotes.join("\n\n");
+  const formula = await anthropic(sys, ctx, 1800);
+  DB.deptKnowledge = DB.deptKnowledge || {};
+  DB.deptKnowledge[dept] = { text:formula, at:Date.now(), basis:(DB.deptMemory[dept]||[]).length,
+    exp:(DB.exp&&DB.exp[dept])||0, benchmark:"유튜브 영상 직접 학습("+okNotes.length+"편)", learned:true };
+  DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
+  DB.deptMemory[dept].push({ at:Date.now(), instruction:"[유튜브 영상 학습]", note:okNotes.length+"편 분석 → 품질 공식 갱신" });
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3;
+  saveDB();
+  return { ok:true, dept, analyzed:okNotes.length, failed:notes.length-okNotes.length, knowledge:formula };
+}
+// 학습 작업 큐(영상 분석은 몇 분 걸림 → 앱을 닫아도 계속 진행, 완료 시 카톡)
+function trimLearnJobs(){
+  DB.learnJobs = DB.learnJobs || [];
+  if(DB.learnJobs.length>15) DB.learnJobs = DB.learnJobs.slice(-15);
+}
+async function runLearnJob(id, appUrl){
+  const j = (DB.learnJobs||[]).find(x=>String(x.id)===String(id));
+  if(!j) return;
+  j.status="running"; j.startedAt=Date.now(); saveDB();
+  try{
+    const out = (j.kind==="youtube")
+      ? await learnFromYouTubeUrls(j.dept, j.urls||[])
+      : await learnFromBenchmark(j.dept);
+    if(!out || out.ok===false) throw new Error((out&&out.note)||"학습 보류");
+    j.status="done"; j.doneAt=Date.now(); j.knowledge=out.knowledge||""; j.analyzed=out.analyzed||0;
+    trimLearnJobs(); saveDB();
+    const nm = AGENTS[j.dept] ? AGENTS[j.dept].kr : j.dept;
+    kakaoNotify("📚 "+nm+" 부서 학습 완료"+(j.kind==="youtube"?(" — 유튜브 "+(out.analyzed||0)+"편 분석"):"")+"\n품질 공식이 갱신됐어요. 이제 결과물에 반영됩니다.", String(appUrl||"")).catch(()=>{});
+  }catch(e){
+    j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now(); saveDB();
+    kakaoNotify("⚠️ 학습 실패 — "+(AGENTS[j.dept]?AGENTS[j.dept].kr:j.dept)+"\n사유: "+j.error).catch(()=>{});
+  }
+}
+// 유튜브 URL 학습 접수 (즉시 응답 → 백그라운드 분석 → 부서 지식 반영)
+app.post("/api/learn/youtube-apply", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const dept=String(b.dept||"").trim();
+    if(!AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
+    const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
+      .map(u=>String(u).trim()).filter(u=>/youtube\.com\/watch\?v=|youtu\.be\//.test(u)).slice(0,3);
+    if(!urls.length) return res.status(400).json({ error:"유효한 유튜브 URL이 없어요 (youtube.com/watch?v=… 또는 youtu.be/… 형식)" });
+    DB.learnJobs = DB.learnJobs || [];
+    const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"youtube", dept, urls, status:"queued", at:Date.now() };
+    DB.learnJobs.push(job); trimLearnJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id, status:"queued", count:urls.length });
+    setImmediate(()=>{ runLearnJob(job.id, String(b.appUrl||"")).catch(e=>logError("runLearnJob", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 웹 벤치마크 학습도 백그라운드로 접수
+app.post("/api/learn/benchmark-start", (req,res)=>{
+  try{
+    const dept=String((req.body&&req.body.dept)||"monetization");
+    if(!AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
+    DB.learnJobs = DB.learnJobs || [];
+    const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"benchmark", dept, status:"queued", at:Date.now() };
+    DB.learnJobs.push(job); trimLearnJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id, status:"queued" });
+    setImmediate(()=>{ runLearnJob(job.id, String((req.body&&req.body.appUrl)||"")).catch(e=>logError("runLearnJob", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/learn/status", (req,res)=>{
+  const j=(DB.learnJobs||[]).find(x=>String(x.id)===String(req.query.id||""));
+  if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, error:j.error||"",
+    analyzed:j.analyzed||0, knowledge:(j.status==="done"?(j.knowledge||""):"") });
+});
+// 현재 부서 지식(품질 공식) 조회
+app.get("/api/learn/knowledge", (req,res)=>{
+  const dept=String(req.query.dept||"");
+  if(dept){ const k=(DB.deptKnowledge||{})[dept]; return res.json({ ok:true, dept, knowledge:(k&&k.text)||"", at:(k&&k.at)||0, source:(k&&k.benchmark)||"" }); }
+  res.json({ ok:true, all: Object.keys(DB.deptKnowledge||{}).map(d=>({ dept:d, source:(DB.deptKnowledge[d].benchmark||""), at:DB.deptKnowledge[d].at||0 })) });
 });
 // 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
 async function distillKnowledge(dept, forceDeep){
@@ -4983,7 +5079,12 @@ const PORT = process.env.PORT || 3000;
         j.status="error"; j.error="서버 재시작으로 중단됐어요 — 다시 시도해 주세요."; j.doneAt=Date.now(); _stuck++;
       }
     });
-    if(_stuck){ saveDB(); console.log("중단된 상품페이지 작업 "+_stuck+"건 정리"); }
+    (DB.learnJobs||[]).forEach(j=>{
+      if(j.status==="running" || j.status==="queued"){
+        j.status="error"; j.error="서버 재시작으로 중단됐어요 — 다시 시도해 주세요."; j.doneAt=Date.now(); _stuck++;
+      }
+    });
+    if(_stuck){ saveDB(); console.log("중단된 작업 "+_stuck+"건 정리"); }
   }catch(e){}
   // ── Supabase에 행이 없던 경우: 첫 저장으로 행 생성(다음 부팅부터 복원 가능) ──
   try{ if(_needInitialSave){ saveDB(); console.log("Supabase 첫 저장 실행(행 생성)"); } }catch(e){}
