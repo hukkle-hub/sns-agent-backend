@@ -114,29 +114,41 @@ function dbHasContent(d){
 }
 let _bootRestoreOk = false;   // 시작 시 Supabase 복원이 성공했는지
 let _lastGoodSavedContent = false; // 마지막으로 '내용 있는' 상태를 저장한 적 있는지
+let _bootRestoreNote = "";
+let _needInitialSave = false;
 async function loadDB(){
   let d;
   if (useSupabase) {
-    // 시작 시 Supabase 복원 — 실패하면 재시도, 그래도 안 되면 로컬 파일 폴백
-    let loaded = null, lastErr = null;
-    for (let attempt=0; attempt<3 && loaded==null; attempt++){
+    // 핵심 구분: 'Supabase 접속 성공'과 '저장된 데이터 존재'는 다른 문제.
+    //   접속 성공 + 행 없음 = 정상(첫 저장 시 행 생성) → 저장 허용
+    //   접속 실패            = 위험(잠들었거나 장애)      → 저장 보류(빈 데이터로 덮어쓰기 방지)
+    let loaded = null, reached = false, lastErr = null;
+    for (let attempt=0; attempt<3 && !reached; attempt++){
       try {
         if (attempt>0) await new Promise(r=>setTimeout(r, 3000)); // Supabase가 깨어날 시간
-        loaded = await supaLoad();
-        if (loaded != null) { _bootRestoreOk = true; console.log("Supabase 복원 성공 (시도 "+(attempt+1)+")"); }
+        loaded = await supaLoad();   // 행 없으면 null 반환(에러 아님), 접속 실패면 throw
+        reached = true;
       } catch(e){ lastErr = e; console.error("supaLoad 시도 "+(attempt+1)+" 실패:", e.message||e); }
     }
+    _bootRestoreOk = reached;   // 접속만 되면 저장 허용
     if (loaded != null) {
-      d = loaded;
+      d = loaded; _bootRestoreNote = "✅ Supabase에서 복원됨";
+      console.log("Supabase 복원 성공");
     } else {
-      // Supabase에서 못 읽음: 로컬 파일에 백업이 있으면 그걸 사용(빈 DB보다 안전)
       const fileDB = loadDBFile();
-      if (dbHasContent(fileDB)) { d = fileDB; console.warn("⚠️ Supabase 복원 실패 → 로컬 파일 백업 사용"); }
-      else { d = emptyDB(); console.warn("⚠️ Supabase 복원 실패 & 로컬 백업 없음 → 빈 DB로 시작(저장 보류 모드)"); }
-      _bootRestoreOk = false;
+      if (reached) {
+        if (dbHasContent(fileDB)) { d = fileDB; _bootRestoreNote = "✅ Supabase 연결됨(저장된 행 없음) → 로컬 파일 내용으로 시작, 곧 Supabase에 저장"; }
+        else { d = emptyDB(); _bootRestoreNote = "✅ Supabase 연결됨(첫 실행) → 새 DB로 시작, 곧 Supabase에 첫 저장"; }
+        _needInitialSave = true;   // 행을 만들어 두어 다음 부팅부터 복원되게
+        console.log("Supabase 연결됨 — 저장된 행 없음(첫 저장 시 생성)");
+      } else {
+        if (dbHasContent(fileDB)) { d = fileDB; _bootRestoreNote = "⚠️ Supabase 접속 실패 → 로컬 파일 백업 사용(저장 보류)"; }
+        else { d = emptyDB(); _bootRestoreNote = "❌ Supabase 접속 실패 & 로컬 백업 없음 → 빈 DB(저장 보류 모드)"; }
+        console.warn("⚠️ Supabase 접속 실패: "+((lastErr&&lastErr.message)||"원인 미상"));
+      }
     }
   } else {
-    d = loadDBFile();
+    d = loadDBFile(); _bootRestoreNote = "파일 모드(Supabase 미설정)";
   }
   // 자가 보완: 버전 변경으로 생긴 누락 키를 기본값으로 채움
   const tmpl = emptyDB();
@@ -565,12 +577,18 @@ async function learnFromBenchmark(dept){
     if (bm.ytSearch && bm.ytSearch.length){
       try{
         const yq = bm.ytSearch[((DB.learnIdx||1)-1) % bm.ytSearch.length];
-        const vids = await ytSearchTop(yq, 3);
+        let vids = await ytSearchTop(yq, 3);
+        let via = "검색 1위";
+        if(!vids.length){
+          // YouTube Data API가 막혀 검색이 안 될 때: 사용자가 등록해둔 학습용 영상 URL 사용
+          const custom = ((DB.state && DB.state.ytUrls) || {})[dept] || [];
+          if(custom.length){ vids = [{ url: custom[((DB.learnIdx||1)-1) % custom.length], title:"(등록한 학습 영상)" }]; via="등록 영상"; }
+        }
         if (vids.length){
           const v = vids[0];
           const ay = await analyzeYouTube(v.url, null, 1400);
           if (ay && ay.text){
-            ytNote = "\n\n[실제 유튜브 인기영상 분석 — \""+yq+"\" 검색 1위: "+v.title+"]\n"+ay.text;
+            ytNote = "\n\n[실제 유튜브 영상 분석 — "+via+": "+v.title+"]\n"+ay.text;
             sources = sources.concat([{ title:"YouTube: "+v.title, uri:v.url }]);
           }
         }
@@ -601,6 +619,25 @@ app.post("/api/learn/benchmark", async (req,res)=>{
   try{
     const dept = (req.body&&req.body.dept) || "monetization";
     res.json(await learnFromBenchmark(dept));
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 부서별 '학습용 유튜브 영상' 등록 (YouTube 검색 API가 막혀도 영상 학습 가능)
+//  POST {dept:"creation", urls:["https://youtu.be/xxx", ...]}   /  GET 으로 현재 목록 확인
+app.get("/api/learn/youtube-urls", (req,res)=>{
+  res.json({ ok:true, urls: ((DB.state&&DB.state.ytUrls)||{}) });
+});
+app.post("/api/learn/youtube-urls", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const dept=String(b.dept||"").trim();
+    if(!dept || !DEPT_BENCHMARK[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
+    const urls=(Array.isArray(b.urls)?b.urls:[]).map(u=>String(u).trim())
+      .filter(u=>/youtube\.com\/watch\?v=|youtu\.be\//.test(u)).slice(0,10);
+    DB.state = DB.state || {};
+    DB.state.ytUrls = DB.state.ytUrls || {};
+    DB.state.ytUrls[dept] = urls;
+    saveDB();
+    res.json({ ok:true, dept, urls });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
@@ -1896,8 +1933,9 @@ app.get("/api/diag", (req,res)=>{
       APP_PASSWORD: has("APP_PASSWORD") ? "✅ 설정됨(백엔드 보호)" : "⚠️ 없음 — 누구나 백엔드 접근 가능"
     },
     "3_데이터_안전": {
-      부팅시_복원성공: (typeof _bootRestoreOk!=="undefined") ? (_bootRestoreOk ? "✅ Supabase에서 복원됨" : "⚠️ 복원 못함(빈 상태로 시작 — 저장 보류 모드)") : "?",
-      현재_저장가능: (function(){ try{ return dbHasContent(DB) ? "✅ 내용 있음(저장됨)" : "⏸ 내용 없음(빈 데이터 덮어쓰기 차단 중)"; }catch(e){ return "?"; } })()
+      부팅시_상태: (typeof _bootRestoreNote!=="undefined" && _bootRestoreNote) ? _bootRestoreNote : "?",
+      Supabase_접속: (typeof _bootRestoreOk!=="undefined") ? (_bootRestoreOk ? "✅ 접속 성공(저장 가능)" : "❌ 접속 실패(저장 보류 — 데이터 보호 중)") : "?",
+      현재_내용유무: (function(){ try{ return dbHasContent(DB) ? "✅ 내용 있음" : "비어있음(정상 — 작업하면 쌓임)"; }catch(e){ return "?"; } })()
     },
     "4_자동학습": {
       마지막_벤치마크_학습일: DB.lastBenchmarkDay || "아직 없음",
@@ -1925,10 +1963,12 @@ app.get("/api/diag/youtube", async (req,res)=>{
     out.단계["0_키"] = key ? "✅ 있음" : "❌ 없음";
     if(!key){ out.결론="키가 없어 유튜브 학습 불가"; return res.json(out); }
     const vids = await ytSearchTop(String(req.query.q||"고흥 여행"), 2);
-    out.단계["1_유튜브검색"] = vids.length ? ("✅ 성공 — "+vids.length+"개 찾음") : "❌ 실패(YouTube Data API 미활성화 가능성) — 검색 없이도 URL 직접 분석은 가능";
+    out.단계["1_유튜브검색"] = vids.length ? ("✅ 성공 — "+vids.length+"개 찾음") : "❌ 실패(YouTube Data API 미활성화) — 검색 없이도 URL 직접 분석은 가능";
     out.찾은영상 = vids.map(v=>({ 제목:v.title, url:v.url }));
-    const target = vids.length ? vids[0].url : String(req.query.url||"");
-    if(!target){ out.결론 = "검색 실패 + 분석할 URL 없음 → /api/diag/youtube?url=유튜브주소 로 직접 테스트하세요"; return res.json(out); }
+    // 테스트 편의: ?url=https://youtu.be/ID  또는  ?v=ID  둘 다 허용
+    const vId = String(req.query.v||"").trim();
+    const target = vids.length ? vids[0].url : (vId ? ("https://youtu.be/"+vId) : String(req.query.url||""));
+    if(!target){ out.결론 = "검색 실패 + 분석할 URL 없음 → /api/diag/youtube?v=영상ID 로 직접 테스트하세요"; return res.json(out); }
     try{
       const a = await analyzeYouTube(target, "이 영상을 한 문장으로 요약하라.", 200);
       out.단계["2_영상분석(화면+음성)"] = "✅ 성공";
@@ -4945,6 +4985,8 @@ const PORT = process.env.PORT || 3000;
     });
     if(_stuck){ saveDB(); console.log("중단된 상품페이지 작업 "+_stuck+"건 정리"); }
   }catch(e){}
+  // ── Supabase에 행이 없던 경우: 첫 저장으로 행 생성(다음 부팅부터 복원 가능) ──
+  try{ if(_needInitialSave){ saveDB(); console.log("Supabase 첫 저장 실행(행 생성)"); } }catch(e){}
   // ── 부서 재편 마이그레이션 (커뮤니티·CS 삭제 / 그로스→커머스 흡수) ──
   try {
     let _migrated=false;
