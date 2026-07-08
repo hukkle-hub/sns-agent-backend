@@ -3813,14 +3813,39 @@ app.get("/api/sync", (req,res)=>{
 app.post("/api/state", (req,res)=>{ DB.state = req.body||null; saveDB(); res.json({ ok:true, updatedAt:DB.updatedAt }); });
 
 // ===== 웹 백업(클라우드) 저장·불러오기 — 기기 간 수동 동기화 =====
+// 백업 '내용 점수' — 빈 기기에서 눌러 좋은 백업을 날리는 사고 방지용
+function backupScore(d){
+  if(!d || typeof d!=="object") return 0;
+  const n = (x)=> Array.isArray(x) ? x.length : 0;
+  const expSum = d.deptExp ? Object.values(d.deptExp).reduce((a,v)=>a+(+v||0),0) : 0;
+  const knowN  = d.deptKnowledge ? Object.keys(d.deptKnowledge).length : 0;
+  const memN   = d.deptMemory ? Object.values(d.deptMemory).reduce((a,arr)=>a+n(arr),0) : 0;
+  return n(d.messages) + n(d.meetings)*3 + n(d.projects)*2 + memN + expSum*2 + knowN*10;
+}
 app.post("/api/cloud-backup", (req,res)=>{
-  try{ DB.cloudBackup = { at:Date.now(), data:(req.body&&req.body.data!==undefined)?req.body.data:(req.body||null) }; saveDB();
-    res.json({ ok:true, at:DB.cloudBackup.at }); }
-  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+  try{
+    const b = req.body||{};
+    const incoming = (b.data!==undefined) ? b.data : b;
+    const force = b.force===true;
+    const prev = (DB.cloudBackup && DB.cloudBackup.data) || null;
+    const si = backupScore(incoming), sp = backupScore(prev);
+    // 기존 백업이 있는데 새 백업이 절반도 안 되면(예: 빈 기기에서 저장) 보호
+    if(!force && sp > 20 && si < sp*0.5){
+      return res.status(409).json({
+        error:"덮어쓰기 보호: 기존 백업보다 내용이 크게 적어요.",
+        note:"다른 기기에서 저장한 백업이 지워질 수 있어요. 정말 덮어쓰려면 force 옵션이 필요합니다.",
+        기존백업: { 점수:sp, 저장시각: DB.cloudBackup.at ? new Date(DB.cloudBackup.at).toLocaleString("ko-KR",{timeZone:"Asia/Seoul"}) : "?" },
+        이번백업: { 점수:si }
+      });
+    }
+    DB.cloudBackup = { at:Date.now(), data:incoming, score:si };
+    saveDB();
+    res.json({ ok:true, at:DB.cloudBackup.at, score:si, replacedScore:sp });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 app.get("/api/cloud-backup", (req,res)=>{
   const b=DB.cloudBackup||null;
-  res.json({ ok:!!(b&&b.data), at:b?b.at:0, data:b?b.data:null });
+  res.json({ ok:!!(b&&b.data), at:b?b.at:0, score:(b&&b.score)||0, data:b?b.data:null });
 });
 
 // 조회
