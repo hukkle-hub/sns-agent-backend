@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], pageJobs:[], learnJobs:[], patchProposals:[], costApprovals:[], guidelineLog:[], updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], pageJobs:[], learnJobs:[], patchProposals:[], costApprovals:[], guidelineLog:[], appliedLog:[], updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -693,7 +693,10 @@ async function runLearnJob(id, appUrl){
   j.status="running"; j.startedAt=Date.now(); saveDB();
   beginJobMode();   // 작업 중 한도로 끊기지 않게
   try{
-    const out = (j.kind==="youtube") ? await learnFromYouTubeUrls(j.dept, j.urls||[])
+    const setStep = (st)=>{ try{ j.step=st; saveDB(); }catch(_){} };
+    const isAuto = (j.dept==="auto") && (j.kind==="youtube" || j.kind==="web");
+    const out = isAuto              ? await autoRouteLearn(j.urls||[], j.kind, setStep)
+              : (j.kind==="youtube") ? await learnFromYouTubeUrls(j.dept, j.urls||[])
               : (j.kind==="web")     ? await learnFromWebUrls(j.dept, j.urls||[])
               : (j.kind==="deep")    ? await deepLearnPipeline(j)
               : await learnFromBenchmark(j.dept);
@@ -702,8 +705,11 @@ async function runLearnJob(id, appUrl){
     if(j.kind==="deep"){ j.result = { goal:out.goal, kind:out.kind, round:out.round, score:out.score,
       depts:out.depts, guides:out.guides, example:out.example, review:out.review, updated:out.updated }; }
     trimLearnJobs(); saveDB();
-    const nm = AGENTS[j.dept] ? AGENTS[j.dept].kr : j.dept;
-    const what = (j.kind==="youtube") ? (" — 유튜브 "+(out.analyzed||0)+"편 분석")
+    if(out && out.auto){ j.autoDepts = (out.depts||[]).map(d=>d.kr); }
+    const nm = out&&out.auto ? ("자동배정("+((out.depts||[]).map(d=>d.kr).join(", ")||"-")+")")
+             : (AGENTS[j.dept] ? AGENTS[j.dept].kr : j.dept);
+    const what = (out&&out.auto) ? ("\n배운 부서: "+((out.depts||[]).map(d=>d.kr).join(", ")||"-")+"\n핵심: "+(out.reason||""))
+              : (j.kind==="youtube") ? (" — 유튜브 "+(out.analyzed||0)+"편 분석")
                : (j.kind==="web")     ? (" — 웹페이지 "+(out.analyzed||0)+"개 분석")
                : (j.kind==="deep")    ? ("\n"+out.round+"라운드 · 검수점수 "+out.score+"/100 · 갱신 부서: "+(out.updated||[]).join(", ")) : "";
     const title = (j.kind==="deep") ? "🏢 전 부서 협업 심화학습 완료" : ("📚 "+nm+" 부서 학습 완료");
@@ -727,8 +733,8 @@ async function runLearnJob(id, appUrl){
 app.post("/api/learn/youtube-apply", (req,res)=>{
   try{
     const b=req.body||{};
-    const dept=String(b.dept||"").trim();
-    if(!AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
+    const dept=String(b.dept||"auto").trim();
+    if(dept!=="auto" && !AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
     const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
       .map(u=>String(u).trim()).filter(u=>/youtube\.com\/watch\?v=|youtu\.be\//.test(u)).slice(0,3);
     if(!urls.length) return res.status(400).json({ error:"유효한 유튜브 URL이 없어요 (youtube.com/watch?v=… 또는 youtu.be/… 형식)" });
@@ -742,7 +748,12 @@ app.post("/api/learn/youtube-apply", (req,res)=>{
 // 웹 벤치마크 학습도 백그라운드로 접수
 app.post("/api/learn/benchmark-start", (req,res)=>{
   try{
-    const dept=String((req.body&&req.body.dept)||"monetization");
+    let dept=String((req.body&&req.body.dept)||"auto");
+    if(dept==="auto"){   // 팀장이 순번대로 부서를 정함
+      const order=Object.keys(DEPT_BENCHMARK);
+      dept = order[((DB.benchmarkTurn||0)) % order.length];
+      DB.benchmarkTurn = ((DB.benchmarkTurn||0)+1) % order.length;
+    }
     if(!AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
     DB.learnJobs = DB.learnJobs || [];
     const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"benchmark", dept, status:"queued", at:Date.now() };
@@ -755,7 +766,7 @@ app.get("/api/learn/status", (req,res)=>{
   const j=(DB.learnJobs||[]).find(x=>String(x.id)===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
   res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, step:j.step||"", error:j.error||"",
-    analyzed:j.analyzed||0, knowledge:(j.status==="done"?(j.knowledge||""):""),
+    analyzed:j.analyzed||0, autoDepts:j.autoDepts||null, knowledge:(j.status==="done"?(j.knowledge||""):""),
     result:(j.status==="done" && j.kind==="deep") ? (j.result||null) : null });
 });
 // 현재 부서 지식(품질 공식) 조회
@@ -816,8 +827,8 @@ async function learnFromWebUrls(dept, urls){
 app.post("/api/learn/web-apply", (req,res)=>{
   try{
     const b=req.body||{};
-    const dept=String(b.dept||"").trim();
-    if(!AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
+    const dept=String(b.dept||"auto").trim();
+    if(dept!=="auto" && !AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
     const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
       .map(u=>String(u).trim()).filter(u=>/^https?:\/\/.+/.test(u)).slice(0,3);
     if(!urls.length) return res.status(400).json({ error:"유효한 웹페이지 URL이 없어요 (https:// 로 시작)" });
@@ -1462,6 +1473,96 @@ app.get("/api/ops/guideline-log", (req,res)=>{
   res.json({ ok:true, log:(DB.guidelineLog||[]).slice(-12).map(g=>({
     title:g.title, kind:g.kind, target:g.target||"", decided:g.decided||"pending", at:g.at, source:g.source||"" })) });
 });
+// ===== 🤖 자동 배정 학습: URL만 주면 팀장이 부서를 정하고, 각 부서가 자기 관점으로 배운다 =====
+// 자료는 한 번만 분석(비용 절약) → 팀장 배정 → 부서별 품질 공식 추출 → 팀장이 한 번에 흡수
+async function autoRouteLearn(urls, srcKind, onStep){
+  const step = (s)=>{ try{ if(onStep) onStep(s); }catch(_){} };
+  step("자료 수집·분석 중");
+  const mat = await gatherMaterial(urls||[]);              // 유튜브=화면분석(무료), 웹=HTML수집(무료)
+  const material = mat.text.slice(0, 22000);
+
+  // 1) 팀장이 '어느 부서가 무엇을 배워야 하는가' 배정
+  step("팀장(오세라)이 배울 부서 배정 중");
+  const ops = AGENTS.ops;
+  const pool = ["strategy","creation","publishing","analytics","monetization","advisory","scout"];
+  const sysA = "너는 민앤팜(고흥 특산물)의 팀장 오세라('"+ops.no+" "+ops.kr+"')다."+ADDRESS
+    + " 아래 참고자료("+mat.kind+")를 보고, 우리 팀에서 '어느 부서가 무엇을 배워야 하는지' 정하라. "
+    + "자료 성격에 실제로 기여할 부서만 1~3개 고르라(억지로 채우지 마라).\n"
+    + "부서: strategy(기획·전략), creation(콘텐츠 제작), publishing(채널 발행), analytics(데이터 분석), monetization(커머스·그로스), advisory(콘텐츠 검수), scout(트렌드 기획)\n"
+    + "반드시 JSON만 출력(설명·마크다운 금지):\n"
+    + '{"reason":"이 자료에서 배울 핵심 한 줄","depts":[{"dept":"creation","focus":"이 부서가 집중해서 볼 관점 한 줄"}]}';
+  const rawA = await anthropic(sysA, "[참고자료]\n"+material.slice(0,12000), 800);
+  const defA = { reason:"참고자료의 고품질 요소 흡수", depts:[{dept:(srcKind==="youtube"?"creation":"monetization"), focus:"핵심 구성과 표현"}] };
+  const assign = safeJson(rawA, defA);
+  let picked = (Array.isArray(assign.depts)?assign.depts:[]).filter(x=>x&&pool.indexOf(x.dept)>=0).slice(0,3);
+  if(!picked.length) picked = defA.depts;
+
+  // 2) 배정된 부서가 각자 관점으로 품질 공식 추출 (같은 자료 재사용 → 자료 분석 비용 1회)
+  const learned = [];
+  for (const p of picked){
+    const a = AGENTS[p.dept]; if(!a) continue;
+    step(a.kr+" 부서가 학습 중");
+    const prior = knowledgeText(p.dept);
+    const sys = "너는 민앤팜의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 역할: "+a.role+ADDRESS+personaLine(p.dept)
+      + " 방금 "+(mat.kind==="영상"?"실제 유튜브 영상을 화면까지 직접 분석":"실제 웹페이지를 분석")+"했다."
+      + "\n[팀장 배정] 우리 부서가 집중할 관점: "+(p.focus||"")
+      + "\n이 자료에서 '우리 부서가 결과물을 만들 때 그대로 적용할 구체적 품질 공식·체크리스트'를 뽑아, 기존 전문성에 통합·발전시켜라. "
+      + "추상적 조언 금지, 바로 실행 가능한 구체 기준으로.\n"
+      + "형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
+    const formula = await anthropic(sys, "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[분석한 자료]\n"+material.slice(0,16000), 1800);
+    DB.deptKnowledge = DB.deptKnowledge || {};
+    DB.deptKnowledge[p.dept] = { text:formula, at:Date.now(), basis:(DB.deptMemory[p.dept]||[]).length,
+      exp:(DB.exp&&DB.exp[p.dept])||0, benchmark:"자동배정 학습("+mat.kind+")", learned:true };
+    DB.deptMemory = DB.deptMemory||{}; DB.deptMemory[p.dept] = DB.deptMemory[p.dept]||[];
+    DB.deptMemory[p.dept].push({ at:Date.now(), instruction:"[자동배정 학습]", note:(p.focus||"").slice(0,80) });
+    if(DB.deptMemory[p.dept].length>40) DB.deptMemory[p.dept]=DB.deptMemory[p.dept].slice(-40);
+    DB.exp = DB.exp||{}; DB.exp[p.dept] = (DB.exp[p.dept]||0)+3;
+    learned.push({ dept:p.dept, kr:a.kr, focus:p.focus||"", knowledge:formula });
+    saveDB();
+  }
+  if(!learned.length) throw new Error("배정된 부서가 없어 학습하지 못했어요");
+
+  // 3) 팀장이 한 번에 흡수 (부서마다 흡수하면 호출 낭비)
+  step("팀장이 전 부서 학습을 흡수하는 중");
+  await absorbToLeader(learned.map(l=>l.dept), "자동배정 "+mat.kind+" 학습");
+
+  return { ok:true, auto:true, kind:mat.kind, reason:String(assign.reason||"").slice(0,200),
+    analyzed:(urls||[]).length, depts:learned.map(l=>({ dept:l.dept, kr:l.kr, focus:l.focus })),
+    knowledge: learned.map(l=>"["+l.kr+"]\n"+l.knowledge).join("\n\n———\n\n") };
+}
+// ===== 🧾 학습 적용 기록: 배운 품질 공식이 '실제로 어떤 결과물에 쓰였는지' 남긴다 (추가 API 호출 없음) =====
+function logKnowledgeApplied(dept, what, note){
+  try{
+    const k = (DB.deptKnowledge||{})[dept];
+    if(!k || !k.text) return;                       // 배운 게 없으면 적용 기록도 없음
+    DB.appliedLog = DB.appliedLog || [];
+    DB.appliedLog.push({
+      at: Date.now(), dept,
+      deptKr: (AGENTS[dept]?AGENTS[dept].kr:dept),
+      what: String(what||"").slice(0,60),           // 무슨 작업에
+      note: String(note||"").slice(0,120),          // 무엇을 만들었는지
+      source: k.benchmark || "학습",                 // 어떤 학습에서 온 공식인지
+      learnedAt: k.at || 0                          // 그 공식이 언제 갱신됐는지
+    });
+    if(DB.appliedLog.length>200) DB.appliedLog = DB.appliedLog.slice(-200);
+  }catch(e){}
+}
+app.get("/api/learn/applied", (req,res)=>{
+  const dept = String(req.query.dept||"");
+  let list = (DB.appliedLog||[]);
+  if(dept && dept!=="auto") list = list.filter(x=>x.dept===dept);
+  const rows = list.slice(-30).reverse();
+  // 부서별 요약: 학습 이후 몇 번 적용됐는가
+  const summary = {};
+  (DB.appliedLog||[]).forEach(x=>{
+    const k=(DB.deptKnowledge||{})[x.dept];
+    if(!k) return;
+    summary[x.dept] = summary[x.dept] || { deptKr:x.deptKr, applied:0, sinceLearn:0, source:k.benchmark||"" };
+    summary[x.dept].applied++;
+    if(x.at >= (k.at||0)) summary[x.dept].sinceLearn++;   // 최신 공식 이후 적용 횟수
+  });
+  res.json({ ok:true, rows, summary });
+});
 // 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
 async function distillKnowledge(dept, forceDeep){
   try{
@@ -1551,6 +1652,7 @@ async function work(dept, instruction, context, images, teamLog){
     maxTok = 4000;
   }
   const text = await anthropic(sys, instruction, maxTok, images);
+  if (_kb) logKnowledgeApplied(dept, "부서 지시 수행", String(instruction||"").slice(0,80));   // 배운 공식이 이 결과물에 적용됨
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction, note: text.length>500 ? text.slice(0,500)+"…" : text });
   if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
@@ -3344,6 +3446,7 @@ async function productPagePipeline(body){
   DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?"[상품페이지 수정]":"[상품페이지 제작]"), note:product+" — "+(isRevise?feedback.slice(0,60):(price||"")) });
   if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
   DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
+  if (formula) logKnowledgeApplied(d, (isRevise?"상품페이지 수정":"상품페이지 제작"), product);
   saveDB();
   return { ok:true, html, product, appliedFormula: !!formula, by:a.kr };
 }
