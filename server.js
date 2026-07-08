@@ -223,10 +223,13 @@ async function anthropic(system, user, maxTokens = 1500, images){
   let full = "";
   let needSpace = false;
   let _rl429 = 0;
+  // 출력 길이에 비례한 타임아웃(짧은 작업 90초, 상품페이지 같은 긴 문서는 최대 8분)
+  const _timeoutMs = Math.min(480000, Math.max(90000, Math.round((maxTokens||1500) * 45)));
+  const _timeoutSec = Math.round(_timeoutMs/1000);
   // 토큰 한도로 답변이 중간에 끊기면, 끊긴 지점부터 이어서 작성하도록 최대 3번까지 연결
   for (let attempt=0; attempt<4; attempt++){
     const _ctrl = new AbortController();
-    const _to = setTimeout(()=>{ try{ _ctrl.abort(); }catch(_){}}, 90000); // 90초 안에 응답 없으면 중단
+    const _to = setTimeout(()=>{ try{ _ctrl.abort(); }catch(_){}}, _timeoutMs);
     let r;
     try {
       r = await fetch("https://api.anthropic.com/v1/messages", {
@@ -236,7 +239,7 @@ async function anthropic(system, user, maxTokens = 1500, images){
         signal: _ctrl.signal
       });
     } catch(e){
-      if (e && e.name==="AbortError") throw new Error("AI 응답 시간 초과(90초)");
+      if (e && e.name==="AbortError") throw new Error("AI 응답 시간 초과("+_timeoutSec+"초)");
       throw e;
     } finally { clearTimeout(_to); }
     if (r.status === 429){
@@ -986,7 +989,8 @@ async function geminiSearch(prompt, maxTok){
 // 유튜브에서 검색어로 인기 영상 URL 찾기 (YouTube Data API, Google API 키 재사용). 실패 시 [] 반환(학습은 웹검색으로 폴백).
 async function ytSearchTop(query, n){
   try{
-    const key = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+    // YouTube Data API는 Gemini 키와 별개로 활성화가 필요할 수 있음 → 전용 키(YT_API_KEY) 우선
+    const key = process.env.YT_API_KEY || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
     if(!key) return [];
     const url = "https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults="+(n||3)
       +"&order=viewCount&q="+encodeURIComponent(query)+"&key="+key;
@@ -1899,7 +1903,9 @@ app.get("/api/diag", (req,res)=>{
       마지막_벤치마크_학습일: DB.lastBenchmarkDay || "아직 없음",
       학습된_부서수: knows.length,
       학습된_부서: knows,
-      다음_학습_차례: (function(){ try{ const o=Object.keys(DEPT_BENCHMARK); return o[(DB.benchmarkTurn||0)%o.length]; }catch(e){ return "?"; } })()
+      다음_학습_차례: (function(){ try{ const o=Object.keys(DEPT_BENCHMARK); return o[(DB.benchmarkTurn||0)%o.length]; }catch(e){ return "?"; } })(),
+      실행조건: "서버가 깨어있는 아무 시간에 하루 1회(cron 필수)",
+      유튜브학습_검사: "/api/diag/youtube 를 열면 실제 작동 여부를 검사합니다"
     },
     "5_상품페이지_작업": {
       전체: jobs.length,
@@ -1910,6 +1916,30 @@ app.get("/api/diag", (req,res)=>{
     },
     "6_부서경험치": DB.exp || {}
   });
+});
+// 유튜브 학습이 실제로 되는지 라이브 검사 (검색 → 영상 분석 순서로 확인)
+app.get("/api/diag/youtube", async (req,res)=>{
+  const out = { ok:true, 단계:{} };
+  try{
+    const key = process.env.YT_API_KEY || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
+    out.단계["0_키"] = key ? "✅ 있음" : "❌ 없음";
+    if(!key){ out.결론="키가 없어 유튜브 학습 불가"; return res.json(out); }
+    const vids = await ytSearchTop(String(req.query.q||"고흥 여행"), 2);
+    out.단계["1_유튜브검색"] = vids.length ? ("✅ 성공 — "+vids.length+"개 찾음") : "❌ 실패(YouTube Data API 미활성화 가능성) — 검색 없이도 URL 직접 분석은 가능";
+    out.찾은영상 = vids.map(v=>({ 제목:v.title, url:v.url }));
+    const target = vids.length ? vids[0].url : String(req.query.url||"");
+    if(!target){ out.결론 = "검색 실패 + 분석할 URL 없음 → /api/diag/youtube?url=유튜브주소 로 직접 테스트하세요"; return res.json(out); }
+    try{
+      const a = await analyzeYouTube(target, "이 영상을 한 문장으로 요약하라.", 200);
+      out.단계["2_영상분석(화면+음성)"] = "✅ 성공";
+      out.분석샘플 = String(a.text||"").slice(0,200);
+      out.결론 = vids.length ? "✅ 유튜브 자동 학습 완전 작동" : "⚠️ 검색은 안 되지만 URL 직접 분석은 작동";
+    }catch(e){
+      out.단계["2_영상분석(화면+음성)"] = "❌ 실패: "+String(e.message||e).slice(0,140);
+      out.결론 = "영상 분석 불가 — Gemini 키 권한/모델 확인 필요";
+    }
+  }catch(e){ out.ok=false; out.error=String(e.message||e).slice(0,200); }
+  res.json(out);
 });
 // 수동: 팀장이 지금 정체 부서를 점검해 재지시 (오피스 버튼)
 app.post("/api/ops/check-stale", async (req,res)=>{
@@ -4368,23 +4398,21 @@ setInterval(async ()=>{
     }
   } catch(e){ /* 야간 연구 실패 무시 */ }
   // (0-b4) 자동 벤치마크 학습: 하루 1회, 부서를 하나씩 돌아가며 웹·유튜브에서 고품질 사례를 조사·학습(품질 공식 축적)
+  //   ※ 시간대를 제한하지 않음 — 무료 서버는 새벽에 잠들어 있어(cron 활성시간이 낮이면) 새벽 조건이면 영원히 안 돌기 때문
   try {
     const st7 = DB.state || {};
     if (leaderAuto && st7.benchmarkLearnOn !== false && DB.lastBenchmarkDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
-      const kh4 = kstNow().getUTCHours();
-      if (kh4 >= 2 && kh4 < 6) { // 새벽 2~5시대(야간연구 후, 아침 지시 전)
-        DB.lastBenchmarkDay = day;
-        const order = Object.keys(DEPT_BENCHMARK);
-        DB.benchmarkTurn = ((DB.benchmarkTurn||0)) % order.length;
-        const dept = order[DB.benchmarkTurn];
-        DB.benchmarkTurn = (DB.benchmarkTurn+1) % order.length;
-        saveDB(); // 선점
-        learnFromBenchmark(dept).then(r=>{
-          if(r&&r.ok){ try{ kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 '"+r.benchmark+"'를 학습해 품질 공식을 갱신했어요"); }catch(_){}
-            console.log("벤치마크 학습 완료: "+dept); }
-          else console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note));
-        }).catch(e=>logError("benchmark-learn", e));
-      }
+      DB.lastBenchmarkDay = day;
+      const order = Object.keys(DEPT_BENCHMARK);
+      DB.benchmarkTurn = ((DB.benchmarkTurn||0)) % order.length;
+      const dept = order[DB.benchmarkTurn];
+      DB.benchmarkTurn = (DB.benchmarkTurn+1) % order.length;
+      saveDB(); // 선점(중복 실행 방지)
+      learnFromBenchmark(dept).then(r=>{
+        if(r&&r.ok){ try{ kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 '"+r.benchmark+"'를 학습해 품질 공식을 갱신했어요"); }catch(_){}
+          console.log("벤치마크 학습 완료: "+dept); }
+        else { console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note)); DB.lastBenchmarkDay=""; saveDB(); } // 실패 시 오늘 재시도 허용
+      }).catch(e=>{ logError("benchmark-learn", e); DB.lastBenchmarkDay=""; try{saveDB();}catch(_){} });
     }
   } catch(e){ /* 벤치마크 학습 실패 무시 */ }
   // (0-c) 24시간+ 자율수행 정체 부서: 팀장이 감지해 학습 기반으로 재지시 (자동·무료)
