@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], pageJobs:[], learnJobs:[], updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], pageJobs:[], learnJobs:[], patchProposals:[], costApprovals:[], guidelineLog:[], updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -199,6 +199,11 @@ let _rlWinStart = Date.now();
 let _rlTokens = 0;
 let _rlChain = Promise.resolve();
 const RL_INPUT_BUDGET = Number(process.env.RL_INPUT_BUDGET || 24000); // 안전 마진(실제 30000)
+// ── 작업(백그라운드 job) 진행 중에는 한도·과부하로 절대 중단하지 않는다 ──
+let _jobMode = 0;
+function beginJobMode(){ _jobMode++; }
+function endJobMode(){ _jobMode = Math.max(0, _jobMode-1); }
+function inJobMode(){ return _jobMode > 0; }
 function _estTokens(system, user){
   const u = (typeof user==="string") ? user : JSON.stringify(user||"");
   return Math.ceil(((system||"").length + u.length)/3) + 300;
@@ -254,16 +259,18 @@ async function anthropic(system, user, maxTokens = 1500, images){
       if (e && e.name==="AbortError") throw new Error("AI 응답 시간 초과("+_timeoutSec+"초)");
       throw e;
     } finally { clearTimeout(_to); }
-    if (r.status === 429){
-      // 분당 한도 초과 — retry-after 만큼 기다렸다가 재시도(이어쓰기 attempt를 소비하지 않음)
-      if (_rl429 < 4){
+    if (r.status === 429 || r.status === 529 || r.status >= 500){
+      // 분당 한도·과부하 — 작업(백그라운드 job) 중이면 절대 중단하지 않고 계속 기다렸다 재시도한다.
+      const maxRetry = (_jobMode > 0) ? 40 : 4;      // 작업 중: 사실상 무제한(최대 ~20분 대기), 평소: 4회
+      if (_rl429 < maxRetry){
         _rl429++;
         const ra = parseInt(r.headers.get("retry-after")||"0", 10);
-        _rlWinStart = Date.now(); _rlTokens = RL_INPUT_BUDGET; // 윈도우 가득 찼다고 보고 대기
-        await _sleep(((ra && ra>0) ? ra : 22) * 1000);
+        const backoff = (ra && ra>0) ? ra : Math.min(60, 12 + _rl429*4);   // 점증 대기(최대 60초)
+        if (r.status === 429){ _rlWinStart = Date.now(); _rlTokens = RL_INPUT_BUDGET; }
+        await _sleep(backoff * 1000);
         attempt--; continue;
       }
-      throw new Error("분당 토큰 한도 초과가 반복됩니다. 잠시 후 다시 시도하거나 동시에 도는 작업을 줄여주세요.");
+      throw new Error((r.status===429 ? "분당 토큰 한도" : "AI 서버 과부하")+" 재시도가 반복됩니다. 잠시 후 다시 시도해 주세요.");
     }
     const data = await r.json();
     if (data.error) throw new Error(data.error.message || "API 오류");
@@ -612,6 +619,7 @@ async function learnFromBenchmark(dept){
     if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
     DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3; // 벤치마크 학습은 실무보다 큰 성장(+3)
     saveDB();
+    await absorbToLeader([dept], "웹 벤치마크");   // 팀장이 이 부서 학습을 흡수
     return { ok:true, dept, benchmark:bm.what, query, sources: sources.slice(0,4), knowledge: formula };
   }catch(e){ logError("learnFromBenchmark:"+dept, e); return { ok:false, note:String(e.message||e).slice(0,100) }; }
 }
@@ -671,6 +679,7 @@ async function learnFromYouTubeUrls(dept, urls){
   if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3;
   saveDB();
+  await absorbToLeader([dept], "유튜브 영상");   // 팀장이 이 부서 학습을 흡수
   return { ok:true, dept, analyzed:okNotes.length, failed:notes.length-okNotes.length, knowledge:formula };
 }
 // 학습 작업 큐(영상 분석은 몇 분 걸림 → 앱을 닫아도 계속 진행, 완료 시 카톡)
@@ -682,19 +691,37 @@ async function runLearnJob(id, appUrl){
   const j = (DB.learnJobs||[]).find(x=>String(x.id)===String(id));
   if(!j) return;
   j.status="running"; j.startedAt=Date.now(); saveDB();
+  beginJobMode();   // 작업 중 한도로 끊기지 않게
   try{
-    const out = (j.kind==="youtube")
-      ? await learnFromYouTubeUrls(j.dept, j.urls||[])
-      : await learnFromBenchmark(j.dept);
+    const out = (j.kind==="youtube") ? await learnFromYouTubeUrls(j.dept, j.urls||[])
+              : (j.kind==="web")     ? await learnFromWebUrls(j.dept, j.urls||[])
+              : (j.kind==="deep")    ? await deepLearnPipeline(j)
+              : await learnFromBenchmark(j.dept);
     if(!out || out.ok===false) throw new Error((out&&out.note)||"학습 보류");
-    j.status="done"; j.doneAt=Date.now(); j.knowledge=out.knowledge||""; j.analyzed=out.analyzed||0;
+    j.status="done"; j.doneAt=Date.now(); j.knowledge=out.knowledge||""; j.analyzed=out.analyzed||0; j.step="완료";
+    if(j.kind==="deep"){ j.result = { goal:out.goal, kind:out.kind, round:out.round, score:out.score,
+      depts:out.depts, guides:out.guides, example:out.example, review:out.review, updated:out.updated }; }
     trimLearnJobs(); saveDB();
     const nm = AGENTS[j.dept] ? AGENTS[j.dept].kr : j.dept;
-    kakaoNotify("📚 "+nm+" 부서 학습 완료"+(j.kind==="youtube"?(" — 유튜브 "+(out.analyzed||0)+"편 분석"):"")+"\n품질 공식이 갱신됐어요. 이제 결과물에 반영됩니다.", String(appUrl||"")).catch(()=>{});
+    const what = (j.kind==="youtube") ? (" — 유튜브 "+(out.analyzed||0)+"편 분석")
+               : (j.kind==="web")     ? (" — 웹페이지 "+(out.analyzed||0)+"개 분석")
+               : (j.kind==="deep")    ? ("\n"+out.round+"라운드 · 검수점수 "+out.score+"/100 · 갱신 부서: "+(out.updated||[]).join(", ")) : "";
+    const title = (j.kind==="deep") ? "🏢 전 부서 협업 심화학습 완료" : ("📚 "+nm+" 부서 학습 완료");
+    kakaoNotify(title+what+"\n품질 공식이 갱신됐어요. 이제 결과물에 반영됩니다.", String(appUrl||"")).catch(()=>{});
+    // 학습 결과를 실제로 쓰려면 앱 자체를 바꿔야 하는지 팀장이 판단 → 필요하면 '승인 요청'(승인 전 적용 금지)
+    if (j.kind==="youtube" || j.kind==="web" || j.kind==="deep"){
+      try{
+        const ctxSummary = (j.kind==="deep")
+          ? ("협업 심화학습 / 목표: "+((out.goal)||"")+" / 검수점수 "+(out.score||0)+" / 부족분: "+(((out.review||{}).gaps)||[]).join(" ; ").slice(0,600))
+          : ((j.kind==="youtube"?"유튜브 영상":"웹페이지")+" 학습 / 부서: "+nm+" / 새 품질 공식:\n"+String(out.knowledge||"").slice(0,1500));
+        const pr = await proposePlatformChange(ctxSummary, { label:(j.kind==="deep"?"협업 심화학습 결과":(j.kind==="youtube"?"유튜브 영상 학습 결과":"웹페이지 학습 결과")) });
+        if (pr){ j.proposalId = pr.id; saveDB(); notifyProposal(pr, appUrl); }
+      }catch(e){ logError("proposeAfterLearn", e); }
+    }
   }catch(e){
     j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now(); saveDB();
     kakaoNotify("⚠️ 학습 실패 — "+(AGENTS[j.dept]?AGENTS[j.dept].kr:j.dept)+"\n사유: "+j.error).catch(()=>{});
-  }
+  } finally { endJobMode(); }
 }
 // 유튜브 URL 학습 접수 (즉시 응답 → 백그라운드 분석 → 부서 지식 반영)
 app.post("/api/learn/youtube-apply", (req,res)=>{
@@ -727,14 +754,713 @@ app.post("/api/learn/benchmark-start", (req,res)=>{
 app.get("/api/learn/status", (req,res)=>{
   const j=(DB.learnJobs||[]).find(x=>String(x.id)===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, error:j.error||"",
-    analyzed:j.analyzed||0, knowledge:(j.status==="done"?(j.knowledge||""):"") });
+  res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, step:j.step||"", error:j.error||"",
+    analyzed:j.analyzed||0, knowledge:(j.status==="done"?(j.knowledge||""):""),
+    result:(j.status==="done" && j.kind==="deep") ? (j.result||null) : null });
 });
 // 현재 부서 지식(품질 공식) 조회
 app.get("/api/learn/knowledge", (req,res)=>{
   const dept=String(req.query.dept||"");
   if(dept){ const k=(DB.deptKnowledge||{})[dept]; return res.json({ ok:true, dept, knowledge:(k&&k.text)||"", at:(k&&k.at)||0, source:(k&&k.benchmark)||"" }); }
   res.json({ ok:true, all: Object.keys(DB.deptKnowledge||{}).map(d=>({ dept:d, source:(DB.deptKnowledge[d].benchmark||""), at:DB.deptKnowledge[d].at||0 })) });
+});
+// ===== 웹페이지(홈페이지·상세페이지) URL을 직접 학습시켜 부서 전문성에 반영 =====
+async function fetchPageText(url){
+  const ctrl = new AbortController();
+  const to = setTimeout(()=>{ try{ctrl.abort();}catch(_){}}, 25000);
+  try{
+    const r = await fetch(url, { signal:ctrl.signal, headers:{ "User-Agent":"Mozilla/5.0 (compatible; MinanFarmBot/1.0)" } });
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    let html = await r.text();
+    // 분석에 방해되는 것 제거(스크립트/주석/base64), 구조·카피·스타일 힌트는 보존
+    html = html.replace(/<script[\s\S]*?<\/script>/gi, " ")
+               .replace(/<noscript[\s\S]*?<\/noscript>/gi, " ")
+               .replace(/<!--[\s\S]*?-->/g, " ")
+               .replace(/data:image\/[a-z]+;base64,[A-Za-z0-9+/=]+/gi, "[이미지]")
+               .replace(/\s{2,}/g, " ");
+    return html.slice(0, 60000);   // 토큰 보호
+  } finally { clearTimeout(to); }
+}
+async function learnFromWebUrls(dept, urls){
+  const a = AGENTS[dept];
+  if(!a) throw new Error("유효한 부서가 아닙니다");
+  const list = (urls||[]).slice(0,3);
+  if(!list.length) throw new Error("분석할 웹페이지 URL이 없습니다");
+  const notes = [];
+  for (const u of list){
+    try{
+      const html = await fetchPageText(u);
+      if(html && html.length>200) notes.push("[페이지] "+u+"\n"+html);
+    }catch(e){ /* 실패한 URL은 건너뜀 */ }
+  }
+  if(!notes.length) throw new Error("페이지를 가져오지 못했어요 (접속 차단·로그인 필요·잘못된 주소)");
+  const prior = knowledgeText(dept);
+  const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 아래는 실제 웹페이지의 HTML이다. "
+    + "이 페이지가 '무엇 때문에 고품질인지'를 분석해, 우리가 결과물을 만들 때 그대로 적용할 구체적 품질 공식·체크리스트를 뽑아라. "
+    + "특히 관찰하라: 섹션 구성과 순서, 첫 화면(히어로)의 구조, 카피의 어조·문장 길이, CTA 위치·문구, 이미지와 텍스트 비율, 여백·타이포그래피 힌트(클래스명·인라인 스타일), 스크롤 흐름. "
+    + "HTML 코드를 그대로 베끼지 말고, '왜 좋은지'의 원리와 재사용 가능한 기준으로 바꿔 써라. "
+    + "기존 축적 전문성과 통합·발전시켜라. 형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
+  const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[분석할 실제 웹페이지]\n"+notes.join("\n\n---\n\n");
+  const formula = await anthropic(sys, ctx, 1800);
+  DB.deptKnowledge = DB.deptKnowledge || {};
+  DB.deptKnowledge[dept] = { text:formula, at:Date.now(), basis:(DB.deptMemory[dept]||[]).length,
+    exp:(DB.exp&&DB.exp[dept])||0, benchmark:"웹페이지 직접 학습("+notes.length+"개)", learned:true };
+  DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
+  DB.deptMemory[dept].push({ at:Date.now(), instruction:"[웹페이지 학습]", note:notes.length+"개 분석 → 품질 공식 갱신" });
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3;
+  saveDB();
+  await absorbToLeader([dept], "웹페이지");   // 팀장이 이 부서 학습을 흡수
+  return { ok:true, dept, analyzed:notes.length, knowledge:formula };
+}
+app.post("/api/learn/web-apply", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const dept=String(b.dept||"").trim();
+    if(!AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
+    const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
+      .map(u=>String(u).trim()).filter(u=>/^https?:\/\/.+/.test(u)).slice(0,3);
+    if(!urls.length) return res.status(400).json({ error:"유효한 웹페이지 URL이 없어요 (https:// 로 시작)" });
+    DB.learnJobs = DB.learnJobs || [];
+    const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"web", dept, urls, status:"queued", at:Date.now() };
+    DB.learnJobs.push(job); trimLearnJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id, status:"queued", count:urls.length });
+    setImmediate(()=>{ runLearnJob(job.id, String(b.appUrl||"")).catch(e=>logError("runLearnJob", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 학습 작업 목록(학습 탭에서 이력 표시)
+app.get("/api/learn/list", (req,res)=>{
+  res.json({ ok:true, jobs:(DB.learnJobs||[]).slice(-12).map(j=>({
+    id:j.id, kind:j.kind, dept:j.dept, status:j.status, at:j.at, doneAt:j.doneAt||0,
+    error:j.error||"", analyzed:j.analyzed||0, urls:(j.urls||[]).length })) });
+});
+// ===== 🏢 전 부서 협업 심화 학습 =====
+// 팀장 배정 → 부서별 가이드라인 → 제작부 예제 → 검수부 채점 → (부족하면 2라운드) → 부서 지식 갱신
+function stripFences(t){ return String(t||"").replace(/^```[a-z]*\s*/i,"").replace(/```\s*$/,"").trim(); }
+function safeJson(t, fallback){
+  try{ return JSON.parse(stripFences(t)); }
+  catch(e){
+    const m = String(t||"").match(/\{[\s\S]*\}/);
+    if(m){ try{ return JSON.parse(m[0]); }catch(_){} }
+    return fallback;
+  }
+}
+async function gatherMaterial(urls){
+  const isYt = (u)=>/youtube\.com\/watch\?v=|youtu\.be\//.test(u);
+  const yts = urls.filter(isYt).slice(0,2), webs = urls.filter(u=>!isYt(u)).slice(0,2);
+  const parts=[];
+  for(const u of yts){
+    try{ const a=await analyzeYouTube(u, "이 영상의 화면 구성·편집 리듬·자막 스타일·도입 후킹·마무리 CTA를 관찰한 사실 위주로 상세히 분석하라.", 1400);
+      if(a&&a.text) parts.push("[유튜브 영상] "+u+"\n"+a.text); }catch(e){}
+  }
+  for(const u of webs){
+    try{ const h=await fetchPageText(u); if(h&&h.length>200) parts.push("[웹페이지] "+u+"\n"+h.slice(0,40000)); }catch(e){}
+  }
+  if(!parts.length) throw new Error("자료를 가져오지 못했어요 (비공개 영상·접속 차단·잘못된 주소)");
+  const kind = yts.length ? (webs.length ? "혼합" : "영상") : "웹페이지";
+  return { text: parts.join("\n\n---\n\n"), kind };
+}
+const DEEP_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout"];
+async function deepLearnPipeline(job){
+  const setStep = (s)=>{ try{ job.step=s; saveDB(); }catch(_){} };
+  setStep("자료 수집·분석 중");
+  const mat = await gatherMaterial(job.urls||[]);
+  const material = mat.text.slice(0, 24000);   // 이후 여러 부서가 참조하므로 입력 절약
+
+  // 1) 팀장 오세라: 학습 목표 + 참여 부서 배정
+  setStep("팀장(오세라)이 학습 목표·부서 배정 중");
+  const ops = AGENTS.ops;
+  const sysA = "너는 민앤팜(고흥 특산물)의 '"+ops.no+" "+ops.kr+"' 팀장 오세라다."+ADDRESS
+    + " 아래 참고자료("+mat.kind+")를 보고 팀 전체의 학습을 설계하라. "
+    + "반드시 JSON만 출력(설명·머리말·마크다운 금지). 형식:\n"
+    + '{"goal":"이 자료에서 우리가 배워야 할 핵심 한 줄","depts":[{"dept":"strategy","focus":"이 부서가 집중해서 볼 관점 한 줄"}]}\n'
+    + "dept는 반드시 다음 중에서 2~3개만 고르되, 자료 성격에 실제로 기여할 부서만: strategy, publishing, analytics, monetization, scout. "
+    + "(제작·검수 부서는 뒤 단계에서 자동 참여하므로 여기 넣지 마라.)";
+  const rawA = await anthropic(sysA, "[참고자료]\n"+material, 900);
+  const defA = { goal:"참고자료의 고품질 요소 흡수", depts:[{dept:"strategy",focus:"구성과 메시지 전략"},{dept:"monetization",focus:"전환·설득 구조"}] };
+  const assign = safeJson(rawA, defA);
+  let picked = (Array.isArray(assign.depts)?assign.depts:[])
+    .filter(x=>x&&DEEP_DEPTS.indexOf(x.dept)>=0 && x.dept!=="creation" && x.dept!=="advisory").slice(0,3);
+  if(!picked.length) picked = defA.depts;
+  const goal = String(assign.goal||defA.goal).slice(0,200);
+
+  // 2) 배정 부서별 가이드라인 도출
+  const guides = {};
+  for (const p of picked){
+    const a = AGENTS[p.dept]; if(!a) continue;
+    setStep(a.kr+" 부서가 가이드라인 도출 중");
+    const prior = knowledgeText(p.dept);
+    const sys = "너는 민앤팜의 '"+a.no+" "+a.kr+"' 부서 전문가다. 역할: "+a.role+ADDRESS+personaLine(p.dept)
+      + (prior?("\n\n[기존 축적 전문성]\n"+prior):"")
+      + "\n\n[팀장 지시] 학습 목표: "+goal+" / 우리 부서 집중 관점: "+(p.focus||"")
+      + "\n아래 참고자료를 우리 부서 관점에서 분석해, 앞으로 결과물에 적용할 '실행 가이드라인'을 5~7개 항목으로 뽑아라. 추상론 금지, 구체적·검증 가능하게. 한국어로 목록만.";
+    guides[p.dept] = await genText(sys, "[참고자료]\n"+material.slice(0,16000), 900, workEngine());
+  }
+
+  // 3) 제작부: 배운 걸 즉시 적용한 '예제' 제작
+  const cre = AGENTS.creation;
+  const guideBlock = Object.keys(guides).map(d=>"["+AGENTS[d].kr+" 가이드라인]\n"+guides[d]).join("\n\n");
+  const genreHint = (mat.kind==="영상")
+    ? "출처가 영상이므로 '30초 영상 기획안 + 컷별 콘티(3~5컷)'를 예제로 만들어라."
+    : "출처가 웹페이지이므로 '핵심 섹션만 담은 간결한 HTML 상품/소개 페이지 예제'를 만들어라(완전한 <!DOCTYPE html> 단일 문서, CSS 인라인).";
+  const sysC = "너는 민앤팜의 '"+cre.no+" "+cre.kr+"' 부서다."+ADDRESS+personaLine("creation")
+    + (knowledgeText("creation")?("\n\n[기존 전문성]\n"+knowledgeText("creation")):"")
+    + "\n\n[학습 목표] "+goal+"\n\n"+guideBlock
+    + "\n\n위 가이드라인을 실제로 적용해 고흥 특산물 소재의 '예제 결과물'을 만들어라. "+genreHint
+    + " 설명 없이 결과물만 출력."+profileContext();
+  let round = 1;
+  setStep("제작부가 예제 결과물 만드는 중 (1라운드)");
+  let example = await anthropic(sysC, "[참고자료 요약]\n"+material.slice(0,8000), 3000);
+  example = stripFences(example);
+
+  // 4) 검수부: 원본 기준 채점 + 부족분
+  const adv = AGENTS.advisory;
+  const sysR = "너는 민앤팜의 '"+adv.no+" "+adv.kr+"' 부서 서다은이다."+ADDRESS
+    + " 아래 '참고자료(벤치마크)'의 수준을 기준으로 '우리 예제'를 냉정하게 채점하라. 후하게 주지 마라. "
+    + "반드시 JSON만 출력: {\"score\":0~100, \"strengths\":[\"...\"], \"gaps\":[\"부족한 점을 고칠 수 있게 구체적으로\"]}";
+  setStep("검수부(서다은)가 채점 중 (1라운드)");
+  const rawR = await anthropic(sysR, "[참고자료(벤치마크)]\n"+material.slice(0,10000)+"\n\n[우리 예제]\n"+example.slice(0,10000), 900);
+  let review = safeJson(rawR, { score:0, strengths:[], gaps:["채점 결과를 해석하지 못했어요"] });
+  let score = Math.max(0, Math.min(100, +review.score||0));
+
+  // 5) 점수가 낮으면 2라운드: 지적사항 반영 → 재제작 → 재채점 (진짜 자가개선)
+  if (score < 80){
+    round = 2;
+    setStep("제작부가 지적사항 반영해 재제작 중 (2라운드)");
+    const gapsTxt = (review.gaps||[]).map((g,i)=>(i+1)+". "+g).join("\n");
+    const example2 = stripFences(await anthropic(
+      sysC + "\n\n[검수부 지적사항 — 반드시 전부 반영]\n"+gapsTxt,
+      "[이전 예제]\n"+example.slice(0,9000)+"\n\n위 예제를 지적사항대로 고쳐 더 높은 수준으로 다시 만들어라.", 3000));
+    setStep("검수부가 재채점 중 (2라운드)");
+    const rawR2 = await anthropic(sysR, "[참고자료(벤치마크)]\n"+material.slice(0,10000)+"\n\n[우리 예제]\n"+example2.slice(0,10000), 900);
+    const review2 = safeJson(rawR2, review);
+    const score2 = Math.max(0, Math.min(100, +review2.score||0));
+    if (score2 >= score){ example = example2; review = review2; score = score2; }
+  }
+
+  // 6) 팀장 종합 → 참여 부서별 '품질 공식'을 지식에 갱신 (부족분은 다음 학습 과제로)
+  setStep("팀장이 종합해 각 부서 지식 갱신 중");
+  const parts = picked.map(p=>p.dept).concat(["creation","advisory"]);
+  const uniq = parts.filter((v,i)=>parts.indexOf(v)===i);
+  const priorBlock = uniq.map(d=>"["+AGENTS[d].kr+" 기존 전문성]\n"+(knowledgeText(d)||"(없음)")).join("\n\n");
+  const sysF = "너는 민앤팜 팀장 오세라다."+ADDRESS
+    + " 이번 학습(자료 분석 → 가이드라인 → 예제 제작 → 검수 채점)의 결과를 바탕으로, 참여 부서 각각의 '품질 공식'을 갱신하라. "
+    + "검수에서 지적된 부족분은 반드시 각 부서의 '다음 학습 과제'에 반영하라. "
+    + "각 부서 블록을 정확히 아래 형식으로만 출력(다른 말 금지):\n"
+    + uniq.map(d=>"===dept:"+d+"===\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)").join("\n\n");
+  const rawF = await anthropic(sysF,
+    "[학습 목표] "+goal+"\n\n"+priorBlock+"\n\n[부서 가이드라인]\n"+guideBlock.slice(0,6000)
+    +"\n\n[검수 채점] 점수 "+score+"/100\n강점: "+((review.strengths||[]).join(" / "))+"\n부족: "+((review.gaps||[]).join(" / ")), 2600);
+
+  // 블록 파싱 → 각 부서 지식 저장
+  const updated = [];
+  for (const d of uniq){
+    const re = new RegExp("===dept:"+d+"===([\\s\\S]*?)(?====dept:|$)");
+    const m = String(rawF).match(re);
+    const text = m ? m[1].trim() : "";
+    if(!text) continue;
+    DB.deptKnowledge = DB.deptKnowledge || {};
+    DB.deptKnowledge[d] = { text, at:Date.now(), basis:(DB.deptMemory[d]||[]).length,
+      exp:(DB.exp&&DB.exp[d])||0, benchmark:"협업 심화학습("+mat.kind+", "+round+"라운드, "+score+"점)", learned:true };
+    DB.deptMemory = DB.deptMemory||{}; DB.deptMemory[d] = DB.deptMemory[d]||[];
+    DB.deptMemory[d].push({ at:Date.now(), instruction:"[협업 심화학습]", note:goal.slice(0,80)+" → "+score+"점" });
+    if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+    DB.exp = DB.exp||{}; DB.exp[d] = (DB.exp[d]||0) + 4;   // 협업 심화학습은 +4
+    updated.push(d);
+  }
+  saveDB();
+  setStep("팀장이 전 부서 학습을 흡수해 총괄 기준 갱신 중");
+  await absorbToLeader(updated, "협업 심화학습");
+  saveDB();
+  return { ok:true, goal, kind:mat.kind, round, score,
+    depts: picked.map(p=>({ dept:p.dept, kr:AGENTS[p.dept].kr, focus:p.focus||"" })),
+    guides, example, review, updated: updated.map(d=>AGENTS[d].kr) };
+}
+app.post("/api/learn/deep-start", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
+      .map(u=>String(u).trim()).filter(u=>/^https?:\/\/.+/.test(u)).slice(0,4);
+    if(!urls.length) return res.status(400).json({ error:"유효한 URL이 없어요 (유튜브 또는 웹페이지 주소)" });
+    DB.learnJobs = DB.learnJobs || [];
+    const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"deep", dept:"ops", urls, status:"queued", step:"대기 중", at:Date.now() };
+    DB.learnJobs.push(job); trimLearnJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id, status:"queued" });
+    setImmediate(()=>{ runLearnJob(job.id, String(b.appUrl||"")).catch(e=>logError("deep-learn", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// ===== 팀장(오세라)은 모든 부서의 학습을 흡수해 '총괄 품질 기준'으로 승격한다 =====
+function allDeptKnowledgeDigest(limit){
+  const k = DB.deptKnowledge || {};
+  return Object.keys(k)
+    .filter(d => d!=="ops" && AGENTS[d] && k[d] && k[d].text)
+    .map(d => "· ["+AGENTS[d].kr+"] "+String(k[d].text).replace(/\s+/g," ").slice(0, limit||420))
+    .join("\n");
+}
+// 부서가 새로 배울 때마다 팀장이 그 지식을 통합(상위 원칙으로 승격 + 부서별 특수 기준 보존)
+async function absorbToLeader(depts, sourceLabel){
+  try{
+    const list = (Array.isArray(depts)?depts:[depts]).filter(d=> d && d!=="ops" && AGENTS[d]);
+    if(!list.length) return false;
+    DB.deptKnowledge = DB.deptKnowledge || {};
+    const newBlocks = list
+      .map(d => "["+AGENTS[d].kr+" 부서가 새로 배운 품질 공식]\n"+((DB.deptKnowledge[d]&&DB.deptKnowledge[d].text)||""))
+      .filter(b => b.split("\n")[1] && b.split("\n")[1].trim())
+      .join("\n\n");
+    if(!newBlocks.trim()) return false;
+    const ops = AGENTS.ops;
+    const prior = knowledgeText("ops");
+    const sys = "너는 민앤팜(고흥 특산물)의 팀장 오세라('"+ops.no+" "+ops.kr+"')다."+ADDRESS
+      + " 팀장은 모든 부서의 전문성을 흡수해 팀 전체에서 가장 높은 판단 기준을 갖는다. "
+      + "아래 [팀장 기존 종합 기준]에 각 부서가 새로 배운 품질 공식을 통합하라. "
+      + "단순 나열 금지 — (1) 여러 부서에 공통되는 원리는 '총괄 품질 기준'으로 승격하고, (2) 부서 간 충돌하는 지침은 팀장이 판단해 정리하고, (3) 부서 고유의 특수 기준은 부서별 항목으로 보존하라. "
+      + "형식(이 형식만, 한국어):\n"
+      + "총괄 품질 기준: (팀 전체 결과물에 적용할 상위 원칙 5~8개)\n"
+      + "부서별 핵심: (부서명 — 그 부서가 반드시 지킬 1~2줄씩)\n"
+      + "검수 체크리스트: (팀장이 결과물을 볼 때 확인할 5~7개)\n"
+      + "다음 팀 학습 과제: (1~2개)";
+    const text = await anthropic(sys, "[팀장 기존 종합 기준]\n"+(prior||"(아직 없음)")+"\n\n"+newBlocks, 2200);
+    DB.deptKnowledge.ops = { text, at:Date.now(), basis:((DB.deptMemory&&DB.deptMemory.ops)||[]).length,
+      exp:(DB.exp&&DB.exp.ops)||0, benchmark:"부서 학습 흡수("+(sourceLabel||"")+")", learned:true };
+    DB.deptMemory = DB.deptMemory || {}; DB.deptMemory.ops = DB.deptMemory.ops || [];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[팀장 흡수 학습]",
+      note: list.map(d=>AGENTS[d].kr).join(", ")+" 지식 통합 → 총괄 기준 갱신" });
+    if(DB.deptMemory.ops.length>40) DB.deptMemory.ops = DB.deptMemory.ops.slice(-40);
+    DB.exp = DB.exp || {}; DB.exp.ops = (DB.exp.ops||0) + 2;
+    saveDB();
+    console.log("팀장 흡수 학습 완료: "+list.join(","));
+    return true;
+  }catch(e){ logError("absorbToLeader", e); return false; }
+}
+// ===== 팀장의 '플랫폼 변경 제안' — 승인 없이는 절대 적용되지 않음 =====
+// 학습으로 새 기준을 얻었을 때, 그걸 제대로 쓰려면 앱 자체를 바꿔야 하는 경우 팀장이 승인을 요청한다.
+async function proposePlatformChange(ctx, opts){
+  try{
+    opts = opts || {};
+    DB.patchProposals = DB.patchProposals || [];
+    if (DB.patchProposals.filter(p=>p.status==="pending").length >= 3) return null;   // 승인 적체 방지
+    const ops = AGENTS.ops;
+    const sys = "너는 이 SNS 자동화 플랫폼의 팀장 오세라('"+ops.no+" "+ops.kr+"')다."+ADDRESS
+      + " 너는 가장 높은 자유도와 판단 권한을 가진다.\n\n"+APP_ENV_DOC+"\n\n"+BACKEND_DOC
+      + "\n\n[너의 판단 과제]\n아래 내용을 근거로, '플랫폼 자체를 바꾸면 팀의 성능·품질이 실제로 좋아지는가'를 판단하라. "
+      + "불가능한 경우에만 제안하는 게 아니라, **더 좋아질 수 있다고 판단되면 먼저 제안**하라.\n\n"
+      + "[제안 종류]\n"
+      + "· 앱 화면(입력칸·표시·워크플로) 개선 → kind='frontend-patch' : 실제 js/css 코드를 작성하라(승인 시 즉시 적용).\n"
+      + "· 서버 로직·프롬프트·파이프라인 개선 → kind='backend-change' : 패치로 못 바꾸므로 코드 대신 **개발 가이드라인**을 작성하라. "
+      + "위 [백엔드 구조]의 실제 함수명을 정확히 지목하고, 개발자가 그대로 작업할 수 있게 써라.\n"
+      + "· 프롬프트·지식만으로 이미 해결되는 것, 사소한 색상 변경은 제안하지 마라(needed:false).\n\n"
+      + "반드시 아래 JSON 하나만 출력(마크다운 펜스·설명 금지):\n"
+      + '{"needed":false} 또는\n'
+      + '{"needed":true,"kind":"frontend-patch","title":"짧은 제목","desc":"1~2문장","reason":"근거 연결 1문장","impact":"기대 효과 1문장","js":"IIFE, 내부 try/catch","css":"없으면 빈 문자열"}\n'
+      + '또는\n'
+      + '{"needed":true,"kind":"backend-change","title":"짧은 제목","desc":"1~2문장","reason":"근거 연결 1문장","impact":"기대 효과 1문장",'
+      + '"guideline":{'
+      + '"target":"수정 대상 — 예: server.js > work() 의 maxTok 설정부",'
+      + '"current":"현재 동작(코드 근거)",'
+      + '"change":"무엇을 어떻게 바꾸는지 단계별로",'
+      + '"codeSketch":"바꿀 코드의 핵심 스니펫 또는 의사코드",'
+      + '"verify":"바꾼 뒤 무엇을 보면 개선을 확인할 수 있는지",'
+      + '"risk":"부작용·주의점",'
+      + '"rollback":"문제 시 되돌리는 방법"}}'
+      + "\n주의: js는 STATE를 파괴하지 않고 try/catch로 감싼다. guideline은 추측 말고 위 [백엔드 구조]에 있는 실제 이름만 써라."
+      + (guidelineLogText() ? ("\n\n[내가 과거에 낸 제안과 운영자의 결정 — 승인된 유형은 따르고, 거절된 유형은 반복하지 마라. 이미 제안한 것을 또 내지 마라]\n"+guidelineLogText()) : "");
+    const out = await anthropic(sys, "["+(opts.label||"판단 근거")+"]\n"+String(ctx||"").slice(0,5000), 3000);
+    const p = safeJson(out, { needed:false });
+    if (!p || !p.needed) return null;
+    const kind = (p.kind==="backend-change") ? "backend-change" : "frontend-patch";
+    let guideline = null, backendRequest = "";
+    if (kind==="frontend-patch"){
+      if (!p.js || typeof p.js !== "string") return null;
+      try { new Function(p.js); } catch(e){ logError("proposePatch:문법오류", e); return null; }   // 깨진 코드는 제안 자체를 버림
+      if (p.js.length > 60000) return null;
+    } else {
+      const g = p.guideline || {};
+      const need = (v)=>String(v||"").trim().length >= 10;
+      if (!need(g.target) || !need(g.change)) return null;   // 실행 불가능한 두루뭉술한 제안은 버림
+      guideline = {
+        target:String(g.target||"").slice(0,300),
+        current:String(g.current||"").slice(0,800),
+        change:String(g.change||"").slice(0,1500),
+        codeSketch:String(g.codeSketch||"").slice(0,2000),
+        verify:String(g.verify||"").slice(0,500),
+        risk:String(g.risk||"").slice(0,500),
+        rollback:String(g.rollback||"").slice(0,400)
+      };
+      // 그대로 복사해 개발에 넘길 수 있는 요청서 텍스트 생성
+      backendRequest =
+        "【백엔드 개발 가이드라인】 "+String(p.title||"")+"\n\n"
+        +"■ 배경\n"+String(p.reason||"")+"\n"+String(p.desc||"")+"\n\n"
+        +"■ 수정 대상\n"+guideline.target+"\n\n"
+        +"■ 현재 동작\n"+(guideline.current||"(기재 없음)")+"\n\n"
+        +"■ 변경 내용\n"+guideline.change+"\n\n"
+        +(guideline.codeSketch ? ("■ 코드 스케치\n"+guideline.codeSketch+"\n\n") : "")
+        +"■ 검증 방법\n"+(guideline.verify||"(기재 없음)")+"\n\n"
+        +"■ 위험·주의\n"+(guideline.risk||"(기재 없음)")+"\n\n"
+        +"■ 롤백\n"+(guideline.rollback||"(기재 없음)")+"\n\n"
+        +"■ 기대 효과\n"+String(p.impact||"");
+    }
+    const proposal = {
+      id: Date.now(), code: crypto.randomBytes(6).toString("hex"), kind,
+      title: String(p.title||"이름 없는 변경").slice(0,60),
+      desc: String(p.desc||"").slice(0,300),
+      reason: String(p.reason||"").slice(0,200),
+      impact: String(p.impact||"").slice(0,200),
+      js: kind==="frontend-patch" ? p.js : "",
+      css: kind==="frontend-patch" ? String(p.css||"").slice(0,20000) : "",
+      guideline: guideline,
+      backendRequest: backendRequest,
+      status:"pending", at: Date.now(), source: String(opts.label||"").slice(0,60)
+    };
+    DB.patchProposals.push(proposal);
+    if (DB.patchProposals.length>15) DB.patchProposals = DB.patchProposals.slice(-15);
+    DB.deptMemory = DB.deptMemory||{}; DB.deptMemory.ops = DB.deptMemory.ops||[];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[플랫폼 변경 제안]", note:proposal.title+" ("+kind+") — 승인 대기" });
+    DB.exp = DB.exp||{}; DB.exp.ops = (DB.exp.ops||0)+1;
+    pushGuidelineLog(proposal);   // 판단 이력에 남겨 다음 판단의 재료로
+    saveDB();
+    return proposal;
+  }catch(e){ logError("proposePlatformChange", e); return null; }
+}
+function notifyProposal(pr, appUrl){
+  const base = String(process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/,"");
+  const links = base
+    ? ("\n\n승인: "+base+"/api/patch/approve?id="+pr.id+"&code="+pr.code
+      +"\n거절: "+base+"/api/patch/reject?id="+pr.id+"&code="+pr.code)
+    : "\n\n앱의 📚 학습 탭에서 승인/거절할 수 있어요.";
+  const kindTxt = (pr.kind==="backend-change") ? "📝 백엔드 변경 요청(자동 적용 불가)" : "🛠 앱 화면 변경(승인 시 즉시 적용)";
+  kakaoNotify("팀장이 플랫폼 변경 승인을 요청했어요\n"+kindTxt+"\n\n["+pr.title+"]\n"+pr.desc
+    +"\n\n근거: "+pr.reason+(pr.impact?("\n기대 효과: "+pr.impact):"")
+    +"\n\n⚠️ 승인하기 전에는 적용되지 않습니다."+links, String(appUrl||"")).catch(()=>{});
+}
+// 승인/거절 — 카톡 링크(코드 검증) 방식
+app.get("/api/patch/approve", (req,res)=>{
+  const pr=(DB.patchProposals||[]).find(x=>String(x.id)===String(req.query.id) && x.code===req.query.code && x.status==="pending");
+  if(!pr) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 요청입니다.");
+  const applied = applyProposal(pr);
+  res.send("<meta charset=utf-8><pre>"+(applied? ("✅ 승인되어 적용했습니다.\n\n"+pr.title+"\n"+pr.desc+"\n\n앱을 새로고침하면 반영됩니다.") : "적용에 실패했어요.")+"</pre>");
+});
+app.get("/api/patch/reject", (req,res)=>{
+  const pr=(DB.patchProposals||[]).find(x=>String(x.id)===String(req.query.id) && x.code===req.query.code && x.status==="pending");
+  if(!pr) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 요청입니다.");
+  pr.status="rejected"; pr.decidedAt=Date.now(); markGuidelineDecided(pr.id,"rejected"); saveDB();
+  res.send("<meta charset=utf-8><pre>거절했습니다. 플랫폼은 변경되지 않았어요.\n(팀장이 이 결정을 학습해 다음 제안이 더 좋아집니다)</pre>");
+});
+function applyProposal(pr){
+  try{
+    if (pr.kind === "backend-change"){
+      // 백엔드 변경은 패치로 자동 적용 불가 — '승인됨(반영 대기)'으로 표시하고 요청서를 남긴다
+      pr.status="approved"; pr.decidedAt=Date.now();
+      DB.exp = DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
+      markGuidelineDecided(pr.id, "approved"); saveDB();
+      kakaoNotify("📝 백엔드 변경 요청 승인됨 — "+pr.title+"\n⚠️ 자동 적용은 불가합니다. 아래 요청서를 개발에 반영해 주세요.\n\n"+String(pr.backendRequest||"").slice(0,700)).catch(()=>{});
+      return true;
+    }
+    DB.patches = DB.patches || [];
+    if (DB.patches.length >= 20) return false;
+    DB.patches.push({ id:Date.now(), title:pr.title, desc:pr.desc, js:pr.js, css:pr.css||"",
+      enabled:true, at:Date.now(), request:"[팀장 제안] "+pr.reason });
+    pr.status="approved"; pr.decidedAt=Date.now();
+    DB.exp = DB.exp||{}; DB.exp.ops = (DB.exp.ops||0)+2;
+    markGuidelineDecided(pr.id, "approved"); saveDB();
+    kakaoNotify("✅ 플랫폼 변경 적용됨 — "+pr.title+"\n앱을 새로고침하면 반영됩니다.").catch(()=>{});
+    return true;
+  }catch(e){ logError("applyProposal", e); return false; }
+}
+// 앱에서 조회·결정
+app.get("/api/patch/proposals", (req,res)=>{
+  res.json({ ok:true, proposals:(DB.patchProposals||[])
+    .filter(p=>p.status==="pending")
+    .map(p=>({ id:p.id, kind:p.kind||"frontend-patch", title:p.title, desc:p.desc, reason:p.reason,
+      impact:p.impact||"", backendRequest:p.backendRequest||"", guideline:p.guideline||null, at:p.at, source:p.source||"" })) });
+});
+// 팀장의 자유 제안(또는 운영자 요청)을 '승인 대기 변경 제안'으로 만든다 (승인 전 적용 안 됨)
+app.post("/api/patch/propose", async (req,res)=>{
+  try{
+    const request = String((req.body&&req.body.request)||"").slice(0,3000);
+    if(!request.trim()) return res.status(400).json({ error:"제안 내용을 적어주세요" });
+    const pr = await proposePlatformChange(request, { label:"운영자·팀장 제안" });
+    if(!pr) return res.json({ ok:true, needed:false, note:"팀장 판단: 지금은 플랫폼 변경이 필요하지 않아요(프롬프트·지식으로 충분)." });
+    notifyProposal(pr, String((req.body&&req.body.appUrl)||""));
+    res.json({ ok:true, needed:true, proposal:{ id:pr.id, kind:pr.kind, title:pr.title, desc:pr.desc, impact:pr.impact } });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/patch/decide", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const pr=(DB.patchProposals||[]).find(x=>String(x.id)===String(b.id) && x.status==="pending");
+    if(!pr) return res.status(404).json({ error:"대기 중인 요청을 찾을 수 없어요" });
+    if(b.approve===true){
+      const ok = applyProposal(pr);
+      return res.json({ ok, applied:ok, title:pr.title });
+    }
+    pr.status="rejected"; pr.decidedAt=Date.now(); markGuidelineDecided(pr.id,"rejected"); saveDB();
+    res.json({ ok:true, applied:false, title:pr.title });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// ===== 💸 유료 자원 사전 비용 산정 · 승인 · 무료 우회 =====
+function claudeRates(){ return { inM:+(process.env.PRICE_IN_PER_M||3), outM:+(process.env.PRICE_OUT_PER_M||15) }; }
+function usdKrwRate(){ const st=DB.state||{}; return +(st.usdKrw)||+(process.env.PRICE_USD_KRW||1540); }
+function claudeCostKrw(tin, tout){ const r=claudeRates(); return Math.round(((tin/1e6)*r.inM + (tout/1e6)*r.outM)*usdKrwRate()); }
+// 작업 종류별 예상 토큰·비용(₩) — 실제 호출 전에 미리 계산
+function estimateJob(kind, opts){
+  opts = opts || {};
+  const rows = [];
+  const add = (label, tin, tout, note) => rows.push({ 항목:label, 입력토큰:tin, 출력토큰:tout, 원화:claudeCostKrw(tin,tout), 비고:note||"" });
+  if (kind === "product-page"){
+    add("상품페이지 HTML 생성", 3000, 8000);
+    if (opts.aiImages) rows.push({ 항목:"AI 이미지 생성("+(opts.imageCount||3)+"장)", 입력토큰:0, 출력토큰:0,
+      원화: Math.round((opts.imageCount||3) * (+(process.env.PRICE_IMAGE_KRW||60))), 비고:"OpenAI 유료" });
+  } else if (kind === "deep-learn"){
+    add("팀장 배정", 6000, 900); add("부서 가이드라인 ×3", 16000*3/3, 900*3);
+    add("예제 제작", 9000, 3000); add("검수 채점", 12000, 900);
+    add("2라운드(점수 낮을 때)", 12000, 3900, "조건부");
+    add("팀장 종합·흡수", 8000, 4800);
+  } else if (kind === "learn-youtube" || kind === "learn-web"){
+    add("자료 분석", 0, 0, kind==="learn-youtube" ? "Gemini 영상분석(무료)" : "웹 수집(무료)");
+    add("품질 공식 추출", 12000, 1800);
+    add("팀장 흡수", 6000, 2200);
+  } else if (kind === "video"){
+    add("영상 기획안", 3000, 2200);
+    add("Veo 프롬프트 변환", 2000, 1100, "Gemini(무료)");
+  } else { add("일반 작업", 2000, 2000); }
+  const estKrw = rows.reduce((a,r)=>a+(r.원화||0), 0);
+  const paid = [];
+  if (opts.aiImages && process.env.OPENAI_API_KEY) paid.push("OpenAI 이미지 생성");
+  if (paidModeOn()) paid.push("유료 Gemini 키");
+  return { kind, estKrw, rows, paid, freeAlternative: paid.length ? "AI 이미지 없이 [사진 자리]로 표시 / 무료 Gemini 사용" : "" };
+}
+app.get("/api/cost/estimate", (req,res)=>{
+  const kind = String(req.query.kind||"product-page");
+  const opts = { aiImages: req.query.aiImages==="1", imageCount:+(req.query.imageCount||3) };
+  res.json({ ok:true, ...estimateJob(kind, opts) });
+});
+// 유료 자원이 필요한 작업은 실행 전 승인 요청 (승인 / 무료 우회 / 취소)
+function createCostApproval(kind, payload, est){
+  DB.costApprovals = DB.costApprovals || [];
+  const ap = { id:Date.now(), code:crypto.randomBytes(6).toString("hex"),
+    kind, payload, estKrw:est.estKrw, paid:est.paid, rows:est.rows,
+    status:"pending", at:Date.now() };
+  DB.costApprovals.push(ap);
+  if(DB.costApprovals.length>15) DB.costApprovals = DB.costApprovals.slice(-15);
+  saveDB();
+  const base = String(process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/,"");
+  const links = base ? ("\n\n승인(유료 진행): "+base+"/api/cost/approve?id="+ap.id+"&code="+ap.code
+    +"\n무료로 우회: "+base+"/api/cost/bypass?id="+ap.id+"&code="+ap.code
+    +"\n취소: "+base+"/api/cost/cancel?id="+ap.id+"&code="+ap.code) : "\n\n앱의 📚 학습 탭에서 결정할 수 있어요.";
+  kakaoNotify("💸 유료 자원이 필요한 작업이에요\n\n작업: "+kind+"\n예상 비용: 약 ₩"+ap.estKrw.toLocaleString()
+    +"\n유료 항목: "+(ap.paid.join(", ")||"-")
+    +"\n\n무료 우회: "+(est.freeAlternative||"-")
+    +"\n\n⚠️ 승인 전에는 실행되지 않습니다."+links).catch(()=>{});
+  return ap;
+}
+function runApprovedCost(ap, freeMode){
+  try{
+    if (ap.kind === "product-page"){
+      const b = Object.assign({}, ap.payload, freeMode ? { aiImages:false } : {});
+      DB.pageJobs = DB.pageJobs || [];
+      const job = { id:String(Date.now())+"_"+Math.floor(Math.random()*1000), status:"queued", kind:"create",
+        product:b.product, brand:b.brand||"", price:b.price||"", info:b.info||"", photos:b.photos||[],
+        input:b, at:Date.now() };
+      DB.pageJobs.push(job); trimPageJobs(); saveDB();
+      setImmediate(()=>{ runPageJob(job.id, ap.appUrl||"").catch(e=>logError("runPageJob", e)); });
+      return job.id;
+    }
+    return null;
+  }catch(e){ logError("runApprovedCost", e); return null; }
+}
+function decideCost(ap, mode){   // mode: approve | bypass | cancel
+  if(mode==="cancel"){ ap.status="cancelled"; ap.decidedAt=Date.now(); saveDB(); return { ok:true, started:false }; }
+  const free = (mode==="bypass");
+  ap.status = free ? "bypassed" : "approved"; ap.decidedAt=Date.now(); saveDB();
+  const jobId = runApprovedCost(ap, free);
+  kakaoNotify((free?"🆓 무료로 우회해 진행합니다":"✅ 승인되어 유료로 진행합니다")+" — "+ap.kind).catch(()=>{});
+  return { ok:true, started:!!jobId, jobId, free };
+}
+app.get("/api/cost/approve", (req,res)=>{
+  const ap=(DB.costApprovals||[]).find(x=>String(x.id)===String(req.query.id)&&x.code===req.query.code&&x.status==="pending");
+  if(!ap) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 요청입니다.");
+  const r=decideCost(ap,"approve");
+  res.send("<meta charset=utf-8><pre>✅ 승인되어 실행합니다 (약 ₩"+ap.estKrw.toLocaleString()+")\n완료되면 카카오톡으로 알려드려요.</pre>");
+});
+app.get("/api/cost/bypass", (req,res)=>{
+  const ap=(DB.costApprovals||[]).find(x=>String(x.id)===String(req.query.id)&&x.code===req.query.code&&x.status==="pending");
+  if(!ap) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 요청입니다.");
+  decideCost(ap,"bypass");
+  res.send("<meta charset=utf-8><pre>🆓 무료로 우회해 실행합니다.\n(AI 이미지 대신 [사진 자리]로 표시됩니다)</pre>");
+});
+app.get("/api/cost/cancel", (req,res)=>{
+  const ap=(DB.costApprovals||[]).find(x=>String(x.id)===String(req.query.id)&&x.code===req.query.code&&x.status==="pending");
+  if(!ap) return res.send("<meta charset=utf-8>유효하지 않거나 이미 처리된 요청입니다.");
+  decideCost(ap,"cancel");
+  res.send("<meta charset=utf-8><pre>취소했습니다. 비용이 발생하지 않았어요.</pre>");
+});
+app.get("/api/cost/pending", (req,res)=>{
+  res.json({ ok:true, approvals:(DB.costApprovals||[]).filter(a=>a.status==="pending")
+    .map(a=>({ id:a.id, kind:a.kind, estKrw:a.estKrw, paid:a.paid, rows:a.rows, at:a.at })) });
+});
+app.post("/api/cost/decide", (req,res)=>{
+  const b=req.body||{};
+  const ap=(DB.costApprovals||[]).find(x=>String(x.id)===String(b.id)&&x.status==="pending");
+  if(!ap) return res.status(404).json({ error:"대기 중인 요청을 찾을 수 없어요" });
+  const mode = (b.mode==="approve"||b.mode==="bypass"||b.mode==="cancel") ? b.mode : "cancel";
+  res.json(Object.assign({ kind:ap.kind }, decideCost(ap, mode)));
+});
+// ===== 👑 팀장의 자유 제안 (높은 자유도) — 플랫폼 전반을 스스로 살펴보고 개선안을 제시 =====
+app.post("/api/ops/suggest", async (req,res)=>{
+  try{
+    const focus = String((req.body&&req.body.focus)||"").slice(0,200);
+    const ops = AGENTS.ops;
+    const knowN = Object.keys(DB.deptKnowledge||{});
+    const expTxt = Object.keys(DB.exp||{}).map(d=>(AGENTS[d]?AGENTS[d].kr:d)+":"+DB.exp[d]).join(", ");
+    const recent = (DB.pageJobs||[]).slice(-3).map(j=>"· 상품페이지 "+j.product+" ("+j.status+")").join("\n");
+    const learns = (DB.learnJobs||[]).slice(-3).map(j=>"· 학습 "+j.kind+" ("+j.status+")").join("\n");
+    const digest = allDeptKnowledgeDigest(220);
+    const pendingP = (DB.patchProposals||[]).filter(p=>p.status==="pending").length;
+    const sys = "너는 이 플랫폼의 팀장 오세라('"+ops.no+" "+ops.kr+"')다."+ADDRESS
+      + " 너는 가장 높은 자유도와 판단 권한을 가진다. 아래 플랫폼 현황을 보고, 운영자에게 '먼저 제안'하라. "
+      + "요청받은 것만 하지 말고, 지금 이 팀이 더 좋아지려면 무엇을 해야 하는지 스스로 판단해 제시하라.\n"
+      + "제안은 실행 가능해야 한다. 각 제안마다: 무엇을 / 왜(근거는 현황에서) / 예상 효과 / 비용이 드는지 여부.\n"
+      + "형식(이 형식만, 한국어):\n"
+      + "1) [분류] 제목\n   무엇: …\n   왜: …\n   효과: …\n   비용: 무료 또는 유료(대략)\n"
+      + "(3~5개. 우선순위 높은 순. 뻔한 소리·일반론 금지, 이 플랫폼의 실제 현황에 근거할 것.)"
+      + (focus ? ("\n\n[운영자가 특별히 봐달라는 부분] "+focus) : "");
+    const user = "[부서 경험치] "+(expTxt||"없음")
+      +"\n[학습된 부서] "+(knowN.join(", ")||"없음")
+      +"\n[대기 중 플랫폼 변경 제안] "+pendingP+"건"
+      +"\n\n[최근 작업]\n"+(recent||"없음")
+      +"\n\n[최근 학습]\n"+(learns||"없음")
+      +"\n\n[전 부서 축적 전문성 요약]\n"+(digest||"아직 없음");
+    const text = await anthropic(sys, user, 2200);
+    DB.deptMemory = DB.deptMemory||{}; DB.deptMemory.ops = DB.deptMemory.ops||[];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[팀장 자유 제안]", note:String(text).slice(0,200) });
+    if(DB.deptMemory.ops.length>40) DB.deptMemory.ops=DB.deptMemory.ops.slice(-40);
+    DB.exp = DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1; saveDB();
+    res.json({ ok:true, suggestions:text });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 팀장이 '정확한' 백엔드 개선 가이드라인을 쓸 수 있도록, 실제 코드 구조를 알려주는 문서
+const BACKEND_DOC = `[백엔드 구조 — server.js 단일 파일, Node.js + Express, Render 무료 플랜, Supabase(agent_state 1행)에 전체 상태 저장]
+
+■ AI 호출
+· anthropic(system, user, maxTokens=1500, images) — Claude(claude-sonnet-4-6) 호출. 타임아웃은 maxTokens에 비례(최소 90초, 최대 8분). 429/5xx는 재시도(작업 중엔 40회까지, 평소 4회).
+· genText(system, user, maxTok, engine) — engine="claude"|"gemini"
+· geminiSearch(prompt, maxTok) — 구글검색 grounding(무료), geminiText(prompt, maxTok)
+· analyzeYouTube(url, question, maxTok) — 유튜브 영상 화면+음성 분석(Gemini 멀티모달)
+· fetchPageText(url) — 웹페이지 HTML 수집(스크립트 제거, 6만자 제한)
+
+■ 부서 작업
+· AGENTS — 8부서 정의 {no, kr, role}. ops가 팀장. MEMBERS/CREW(제작부 3인)
+· work(dept, instruction, context, images, teamLog) — 부서 실행. maxTok 2000(ops만 4000). 시스템 프롬프트에 ADDRESS+STYLE+personaLine+profileContext+knowledgeText(dept)+최근기억+타부서기억을 주입
+· deptLevel(dept) = floor(exp/5)+1, DB.exp[dept]
+· knowledgeText(dept) — 그 부서의 축적 품질 공식(DB.deptKnowledge[dept].text)
+· distillKnowledge(dept) — 자기 작업 기록을 압축(외부 학습 아님)
+
+■ 학습 (품질의 핵심)
+· DEPT_BENCHMARK — 부서별 벤치마크 주제·검색어·유튜브 검색어
+· learnFromBenchmark(dept) — 웹 조사 → 품질 공식 추출 → DB.deptKnowledge[dept] 갱신 (+exp 3)
+· learnFromYouTubeUrls(dept, urls) / learnFromWebUrls(dept, urls) — URL 직접 학습
+· deepLearnPipeline(job) — 팀장 배정 → 부서 가이드라인 → 제작부 예제 → 검수부 채점 → 80점 미만이면 2라운드 → 부서 지식 갱신
+· absorbToLeader(depts, label) — 팀장이 부서 학습을 흡수해 총괄 기준으로 승격
+· allDeptKnowledgeDigest(limit) — 팀장 프롬프트에 주입되는 전 부서 지식 요약
+
+■ 결과물 생성
+· productPagePipeline(body) — 상품페이지 HTML 생성(maxTok 8000). body.baseHtml+feedback이면 수정 모드
+· runPageJob / runLearnJob — 백그라운드 작업 큐. beginJobMode()~endJobMode() 사이에는 한도로 중단되지 않음
+· 작업 상태는 DB.pageJobs / DB.learnJobs, 완료 시 kakaoNotify(text, url)
+
+■ 데이터·안전
+· loadDB() — Supabase 접속 성공(reached)과 데이터 존재(loaded)를 구분. 접속 실패 시 저장 보류(빈 데이터 덮어쓰기 방지)
+· saveDB() — 로컬 파일 + Supabase 이중 저장, dbHasContent(DB)로 빈 데이터 저장 차단
+· 스케줄러(setInterval) — 아침/저녁 브리핑, 하루 1회 벤치마크 학습, 성과 수집
+
+■ 비용
+· estimateJob(kind, opts) → 예상 ₩, claudeCostKrw(tin,tout)
+· 유료 자원(OpenAI 이미지·유료 Gemini)은 createCostApproval()로 승인/무료우회/취소
+
+■ 바꿀 수 없는 것(패치로는 불가) — 위 함수·프롬프트·파이프라인은 모두 server.js 안에 있으며, 프론트엔드 패치로는 수정 불가. 운영자가 server.js를 수정·재배포해야 한다.`;
+// ===== 팀장의 '판단 이력' — 가이드라인을 쓰고, 승인/거절 결과로 배운다 =====
+function guidelineLogText(){
+  const lg = (DB.guidelineLog||[]).slice(-8);
+  if(!lg.length) return "";
+  return lg.map(g=>{
+    const r = g.decided==="approved" ? "✅승인됨" : (g.decided==="rejected" ? "❌거절됨" : "⏳대기");
+    return "· ["+r+"] ("+(g.kind==="backend-change"?"백엔드":"앱화면")+") "+g.title+(g.target?(" — 대상: "+g.target):"");
+  }).join("\n");
+}
+function pushGuidelineLog(pr){
+  DB.guidelineLog = DB.guidelineLog || [];
+  DB.guidelineLog.push({ id:pr.id, at:Date.now(), kind:pr.kind, title:pr.title,
+    target:(pr.guideline&&pr.guideline.target)||"", impact:pr.impact||"", source:pr.source||"", decided:null });
+  if(DB.guidelineLog.length>20) DB.guidelineLog = DB.guidelineLog.slice(-20);
+}
+function markGuidelineDecided(id, decided){
+  const g = (DB.guidelineLog||[]).find(x=>String(x.id)===String(id));
+  if(g){ g.decided = decided; g.decidedAt = Date.now(); }
+  // 결정이 3건 쌓일 때마다, 팀장이 '무엇이 좋은 개선 판단인가'를 스스로 정리해 지식으로 승격
+  const decidedN = (DB.guidelineLog||[]).filter(x=>x.decided).length;
+  if (decidedN > 0 && decidedN % 3 === 0) distillGuidelineKnowledge().catch(e=>logError("distillGuideline", e));
+}
+// 가이드라인 작성·승인/거절 경험을 '개선 판단 기준'으로 압축해 팀장 지식에 통합 (= 가이드라인 쓰는 것 자체가 학습)
+async function distillGuidelineKnowledge(){
+  try{
+    const lg = (DB.guidelineLog||[]).filter(x=>x.decided);
+    if(lg.length < 3) return false;
+    const ops = AGENTS.ops;
+    const prior = knowledgeText("ops");
+    const hist = lg.slice(-10).map(g=>
+      "· "+(g.decided==="approved"?"승인":"거절")+" | "+(g.kind==="backend-change"?"백엔드":"앱화면")+" | "+g.title
+      +(g.target?(" | 대상:"+g.target):"")+(g.impact?(" | 기대효과:"+g.impact):"")).join("\n");
+    const sys = "너는 이 플랫폼의 팀장 오세라('"+ops.no+" "+ops.kr+"')다."+ADDRESS
+      + " 너는 지금까지 여러 번 '플랫폼 개선 가이드라인'을 작성했고, 운영자가 승인하거나 거절했다. "
+      + "그 결과에서 '무엇이 좋은 개선 판단인가'를 스스로 배워라. 승인된 제안의 공통점과 거절된 제안의 공통점을 찾아, 앞으로의 판단 기준으로 만들어라.\n"
+      + "기존 [팀장 종합 기준]에 이 판단 기준을 '플랫폼 개선 판단 기준' 항목으로 통합하되, 기존 내용을 지우지 말고 발전시켜라.\n"
+      + "형식(이 형식만, 한국어):\n총괄 품질 기준: (기존 것 유지·정리)\n부서별 핵심: (기존 유지)\n검수 체크리스트: (기존 유지)\n플랫폼 개선 판단 기준: (이번에 배운 것 4~6개 — 언제 제안하고 언제 하지 말아야 하는가)\n다음 팀 학습 과제: (1~2개)";
+    const text = await anthropic(sys, "[팀장 기존 종합 기준]\n"+(prior||"(아직 없음)")+"\n\n[내가 낸 제안과 운영자의 결정]\n"+hist, 2400);
+    DB.deptKnowledge = DB.deptKnowledge || {};
+    DB.deptKnowledge.ops = { text, at:Date.now(), basis:((DB.deptMemory&&DB.deptMemory.ops)||[]).length,
+      exp:(DB.exp&&DB.exp.ops)||0, benchmark:"개선 판단 학습("+lg.length+"건 결정)", learned:true };
+    DB.deptMemory = DB.deptMemory||{}; DB.deptMemory.ops = DB.deptMemory.ops||[];
+    DB.deptMemory.ops.push({ at:Date.now(), instruction:"[개선 판단 학습]", note:lg.length+"건의 승인/거절에서 판단 기준 도출" });
+    if(DB.deptMemory.ops.length>40) DB.deptMemory.ops=DB.deptMemory.ops.slice(-40);
+    DB.exp = DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+3;
+    saveDB();
+    kakaoNotify("🧠 팀장이 '플랫폼 개선 판단 기준'을 스스로 정리했어요\n지금까지의 승인·거절 결과에서 배웠습니다.").catch(()=>{});
+    return true;
+  }catch(e){ logError("distillGuidelineKnowledge", e); return false; }
+}
+// 팀장 자가진단 — 시키지 않아도 스스로 플랫폼을 살펴보고 개선 가이드라인을 만든다
+async function selfReviewAndPropose(appUrl){
+  try{
+    if ((DB.patchProposals||[]).filter(p=>p.status==="pending").length >= 2) return null;   // 적체 시 쉬어감
+    const expTxt = Object.keys(DB.exp||{}).map(d=>(AGENTS[d]?AGENTS[d].kr:d)+":"+DB.exp[d]).join(", ");
+    const knows = Object.keys(DB.deptKnowledge||{});
+    const jobs = DB.pageJobs||[], lj = DB.learnJobs||[];
+    const fails = jobs.filter(j=>j.status==="error").slice(-3).map(j=>"· 상품페이지 실패: "+(j.error||"")).join("\n");
+    const lfails = lj.filter(j=>j.status==="error").slice(-3).map(j=>"· 학습 실패: "+(j.error||"")).join("\n");
+    const ctx = "[플랫폼 자가진단 시점] "+new Date().toLocaleString("ko-KR",{timeZone:"Asia/Seoul"})
+      +"\n[부서 경험치] "+(expTxt||"없음")
+      +"\n[학습된 부서] "+(knows.join(", ")||"없음")
+      +"\n[상품페이지 작업] 총 "+jobs.length+"건 (실패 "+jobs.filter(j=>j.status==="error").length+")"
+      +"\n[학습 작업] 총 "+lj.length+"건 (실패 "+lj.filter(j=>j.status==="error").length+")"
+      +(fails?("\n\n[최근 실패]\n"+fails):"")+(lfails?("\n"+lfails):"")
+      +"\n\n[전 부서 축적 전문성 요약]\n"+(allDeptKnowledgeDigest(260)||"아직 없음")
+      +"\n\n위 현황에서 '플랫폼을 어떻게 고치면 팀 성능이 좋아지는가'를 스스로 판단하라. 개선이 필요 없으면 needed:false.";
+    const pr = await proposePlatformChange(ctx, { label:"팀장 자가진단" });
+    if (pr) notifyProposal(pr, appUrl||"");
+    return pr;
+  }catch(e){ logError("selfReview", e); return null; }
+}
+app.post("/api/ops/self-review", async (req,res)=>{
+  try{
+    const pr = await selfReviewAndPropose(String((req.body&&req.body.appUrl)||""));
+    if(!pr) return res.json({ ok:true, needed:false, note:"팀장 판단: 지금은 플랫폼 변경이 필요하지 않아요." });
+    res.json({ ok:true, needed:true, proposal:{ id:pr.id, kind:pr.kind, title:pr.title, desc:pr.desc, impact:pr.impact } });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 팀장이 지금까지 내린 판단 이력(학습 근거) 조회
+app.get("/api/ops/guideline-log", (req,res)=>{
+  res.json({ ok:true, log:(DB.guidelineLog||[]).slice(-12).map(g=>({
+    title:g.title, kind:g.kind, target:g.target||"", decided:g.decided||"pending", at:g.at, source:g.source||"" })) });
 });
 // 부서가 쌓은 기록을 압축·갱신해 '전문성'으로 발전시킴(지식이 버려지지 않고 누적·정교화)
 async function distillKnowledge(dept, forceDeep){
@@ -820,7 +1546,9 @@ async function work(dept, instruction, context, images, teamLog){
   let maxTok = 2000;
   if (dept === "ops"){
     sys += "\n\n[너는 이 플랫폼의 실질적 팀장이며, 모든 부서 중 최고 수준의 지식과 가장 넓은 자유도를 가진다. (1) 어느 부서의 산출물이든 검토하고 직접 수정·보완·재작성할 수 있다. (2) 각 부서의 자율수행 성과와 학습 수준(메모리·경험치·기록 품질)을 평가하고, 부서별 자율수행 지시의 조정안을 제안·결정할 수 있다. (3) 플랫폼 기능 자체의 추가·변경(패치 개발)을 설계·생성할 수 있다. (4) 정책·발행·콘텐츠 전반의 방향을 조율한다. 클로드(이 플랫폼의 텍스트·추론 엔진)로 분석·작성·수정을 직접 수행하고, 제미나이로 만들 영상·이미지는 구체적 제작 프롬프트로 핸드오프하라. \'수정할 수 없다/권한이 없다\'고 하지 말고 끝까지 직접 처리하되, 실제 시스템 설정을 임의로 바꿨다고 거짓말하지는 마라.]";
-    maxTok = 3000;
+    const _digest = allDeptKnowledgeDigest(420);
+    if (_digest) sys += "\n\n[전 부서가 축적한 전문성 요약 — 팀장은 이를 모두 흡수하고 있다. 검토·지시·작성 시 각 부서의 기준을 함께 적용하라]\n" + _digest;
+    maxTok = 4000;
   }
   const text = await anthropic(sys, instruction, maxTok, images);
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
@@ -2037,6 +2765,7 @@ app.get("/api/diag", (req,res)=>{
       마지막_벤치마크_학습일: DB.lastBenchmarkDay || "아직 없음",
       학습된_부서수: knows.length,
       학습된_부서: knows,
+      팀장_총괄기준: (function(){ const o=(DB.deptKnowledge||{}).ops; return o&&o.text ? ("✅ 보유 ("+(o.benchmark||"")+")") : "아직 없음 — 부서가 학습하면 자동 흡수됩니다"; })(),
       다음_학습_차례: (function(){ try{ const o=Object.keys(DEPT_BENCHMARK); return o[(DB.benchmarkTurn||0)%o.length]; }catch(e){ return "?"; } })(),
       실행조건: "서버가 깨어있는 아무 시간에 하루 1회(cron 필수)",
       유튜브학습_검사: "/api/diag/youtube 를 열면 실제 작동 여부를 검사합니다"
@@ -2048,7 +2777,11 @@ app.get("/api/diag", (req,res)=>{
       실패: jobs.filter(j=>j.status==="error").length,
       최근: jobs.slice(-3).map(j=>({ 상품:j.product, 상태:j.status, 오류:j.error||"" }))
     },
-    "6_부서경험치": DB.exp || {}
+    "6_부서경험치": DB.exp || {},
+    "7_팀장_플랫폼변경_승인대기": (function(){
+      const p=(DB.patchProposals||[]).filter(x=>x.status==="pending");
+      return p.length ? p.map(x=>({ 제목:x.title, 이유:x.reason })) : "없음";
+    })()
   });
 });
 // 유튜브 학습이 실제로 되는지 라이브 검사 (검색 → 영상 분석 순서로 확인)
@@ -2626,6 +3359,7 @@ async function runPageJob(id, appUrl){
   const j = (DB.pageJobs||[]).find(x=>String(x.id)===String(id));
   if(!j) return;
   j.status="running"; j.startedAt=Date.now(); saveDB();
+  beginJobMode();   // 작업 중 한도로 끊기지 않게
   try{
     const out = await productPagePipeline(j.input||{});
     j.html = out.html; j.appliedFormula = !!out.appliedFormula;
@@ -2638,7 +3372,7 @@ async function runPageJob(id, appUrl){
     j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now();
     saveDB();
     kakaoNotify("⚠️ 상품페이지 생성 실패 — '"+(j.product||"상품")+"'\n사유: "+j.error).catch(()=>{});
-  }
+  } finally { endJobMode(); }
 }
 // 접수 즉시 응답 → 백그라운드 생성. baseId+feedback이면 '수정' 작업.
 app.post("/api/product-page/start", (req,res)=>{
@@ -2658,6 +3392,17 @@ app.post("/api/product-page/start", (req,res)=>{
       if(!prod) return res.status(400).json({ error:"상품명이 필요합니다" });
       input={ product:prod, brand:String(b.brand||"민앤팜").slice(0,40), price:String(b.price||"").slice(0,60),
               info:String(b.info||"").slice(0,2000), photos:Array.isArray(b.photos)?b.photos.slice(0,10):[] };
+    }
+    // 유료 자원(AI 이미지 등)이 필요하면 실행 전 비용 산정 → 승인/우회 요청
+    if (kind === "create" && (b.aiImages === true || paidModeOn())){
+      const est = estimateJob("product-page", { aiImages:!!b.aiImages, imageCount:+(b.imageCount||3) });
+      if (est.paid.length){
+        input.aiImages = !!b.aiImages;
+        const ap = createCostApproval("product-page", Object.assign({}, input, { appUrl:String(b.appUrl||"") }), est);
+        ap.appUrl = String(b.appUrl||"");  saveDB();
+        return res.json({ ok:true, pendingApproval:true, approvalId:ap.id, estKrw:est.estKrw, paid:est.paid,
+          note:"유료 자원이 필요해 승인을 요청했어요. 카카오톡 또는 앱에서 승인·무료우회·취소를 선택하세요." });
+      }
     }
     DB.pageJobs = DB.pageJobs || [];
     const job = { id: String(Date.now())+"_"+Math.floor(Math.random()*1000), status:"queued", kind,
@@ -4551,6 +5296,20 @@ setInterval(async ()=>{
       }).catch(e=>{ logError("benchmark-learn", e); DB.lastBenchmarkDay=""; try{saveDB();}catch(_){} });
     }
   } catch(e){ /* 벤치마크 학습 실패 무시 */ }
+  // (0-b5) 팀장 자가진단: 시키지 않아도 주 1회 스스로 플랫폼을 살펴보고 개선 가이드라인을 제안
+  try {
+    const st8 = DB.state || {};
+    if (leaderAuto && st8.selfReviewOn !== false && !(DB.growBurst&&DB.growBurst.active)) {
+      const weekKey = (function(){ const d=kstNow(); const oneJan=new Date(Date.UTC(d.getUTCFullYear(),0,1));
+        return d.getUTCFullYear()+"-W"+Math.ceil((((d-oneJan)/86400000)+oneJan.getUTCDay()+1)/7); })();
+      if (DB.lastSelfReviewWeek !== weekKey && (DB.patchProposals||[]).filter(p=>p.status==="pending").length < 2){
+        DB.lastSelfReviewWeek = weekKey; saveDB();   // 선점
+        selfReviewAndPropose("").then(pr=>{
+          console.log(pr ? ("팀장 자가진단 → 제안 생성: "+pr.title) : "팀장 자가진단 → 변경 불필요");
+        }).catch(e=>{ logError("self-review", e); DB.lastSelfReviewWeek=""; try{saveDB();}catch(_){} });
+      }
+    }
+  } catch(e){ /* 자가진단 실패 무시 */ }
   // (0-c) 24시간+ 자율수행 정체 부서: 팀장이 감지해 학습 기반으로 재지시 (자동·무료)
   if (autoOK) checkStaleDepts().catch(e=>logError("stale-check", e));
   // (0-d) 부서 간 지식 공유·성장 세션: 주기 자동 진행(기본 48시간마다) — 자동·무료
