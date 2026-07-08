@@ -53,7 +53,7 @@ const SUPA_URL = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/,"");    
 const SUPA_KEY = (process.env.SUPABASE_KEY || "").replace(/[^A-Za-z0-9._-]/g,"");  // JWT 허용문자만 남김(보이지 않는 문자·개행·공백 전부 제거 → 헤더 오류 방지)
 const SUPA_TABLE = (process.env.SUPABASE_TABLE || "agent_state").trim();
 const useSupabase = !!(SUPA_URL && SUPA_KEY);
-function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], updatedAt:0 }; }
+function emptyDB(){ return { jobs:[], meetings:[], meetingSchedules:[], patches:[], deptMemory:{}, deptKnowledge:{}, clientProfile:{text:"",at:0,basis:0}, clientLog:[], clientCount:0, scheduled:[], pubSchedules:[], approvals:[], contentApprovals:[], collections:[], lastCollectAt:0, usage:{ in:0, out:0, calls:0 }, usageDaily:{ date:"", in:0, out:0, calls:0 }, usageMonthly:{ month:"", in:0, out:0, calls:0, alerted:"" }, geminiUsage:{ in:0, out:0, calls:0 }, geminiDaily:{ date:"", in:0, out:0, calls:0 }, geminiMonthly:{ month:"", in:0, out:0, calls:0, alerted:"", dayAlerted:"" }, geminiSearchDaily:{ date:"", n:0 }, geminiSearchTotal:0, briefings:[], lastBriefDay:"", briefDone:{ morning:"", evening:"", weekly:"" }, leadDirectives:[], leaderDailyDirective:{}, lastLeaderDirectDay:"", dirFeedback:{}, dailyReview:{}, lastReviewDay:"", nightResearch:{}, lastNightResearchDay:"", staleHandled:{}, lastKShareAt:0, lastTrainAt:{}, lastTrainRoundAt:0, growBurst:{active:false,total:0,done:0}, lastDailyGrowthDay:"", capability:{}, capHistory:[], cloudBackup:null, errors:[], retryQueue:[], state:null, exp:{}, learnIdx:0, autoRunDay:{}, projects:[], pubInbox:[], pageJobs:[], updatedAt:0 }; }
 // Supabase REST: 단일 행(id='main')에 전체 상태를 jsonb로 저장 (의존성 0)
 //   테이블 준비(SQL):
 //   create table agent_state ( id text primary key, data jsonb, updated_at bigint );
@@ -1431,10 +1431,11 @@ async function publish(content, platforms){
 }
 
 // ===== 카카오 "나에게 보내기" (상행 알림) =====
-async function kakaoNotify(text){
+async function kakaoNotify(text, url){
   sendPush(String(text)).catch(()=>{});   // 웹푸시는 카톡 토큰과 무관하게 발송
   let token; try { token = await getKakaoToken(); } catch(e){ return { ok:false, note:String(e.message||e) }; }
-  const tpl = { object_type:"text", text:String(text).slice(0,1000), link:{ web_url:"", mobile_web_url:"" } };
+  const u = String(url||"");
+  const tpl = { object_type:"text", text:String(text).slice(0,1000), link: u ? { web_url:u, mobile_web_url:u } : { web_url:"", mobile_web_url:"" } };
   const r = await fetch("https://kapi.kakao.com/v2/api/talk/memo/default/send", {
     method:"POST",
     headers:{ "Authorization":"Bearer "+token, "Content-Type":"application/x-www-form-urlencoded" },
@@ -1852,7 +1853,11 @@ async function handleInstruction(instruction, source, images, history, shell){
 app.get("/", (req,res)=> res.send("SNS 에이전트 확장 백엔드 작동 중"));
 let KEEPALIVE_ON=false; // 자기-핑 활성 여부(서버 자동 깨우기)
 // 외부 핑(Keep-alive): 서버를 깨우고, 근무 중이고 자율수행이 밀렸으면 그 자리에서 한 사이클 실행 + 상태 보고
+let _lastPingAt = 0, _lastPingSavedAt = 0;
 app.get("/api/ping", (req,res)=>{
+  _lastPingAt = Date.now();
+  // 핑 시각을 가끔만 저장(매 핑마다 저장하면 낭비) — 재시작 후에도 cron 작동 확인 가능
+  if (Date.now() - _lastPingSavedAt > 10*60000){ _lastPingSavedAt = Date.now(); DB.lastPingAt = _lastPingAt; try{ saveDB(); }catch(e){} }
   const col = (DB.state && DB.state.collect) || {};
   const on = col.everyMin > 0;
   const working = (function(){ try{ return isWorking(); }catch(e){ return true; } })();
@@ -1861,6 +1866,50 @@ app.get("/api/ping", (req,res)=>{
   if (due) { runAutoCycle().catch(e=>logError("ping-autocycle", e)); } // 핑이 트리거가 되어 평소 수행이 이어짐
   checkStaleDepts().catch(e=>logError("ping-stale", e)); // 서버가 깰 때마다 24h+ 정체 부서를 팀장이 점검·재지시
   res.json({ ok:true, awake:true, keepAlive:KEEPALIVE_ON, working, autonomy:{ on, everyMin:col.everyMin||0, lastRunMinAgo:sinceMin, ranNow:!!due }, gemini:geminiRateInfo(), ts:Date.now() });
+});
+// 진단: 브라우저로 열어 cron·키·학습 상태를 한눈에 확인 (값은 노출하지 않고 설정 여부만)
+app.get("/api/diag", (req,res)=>{
+  const has = (k)=> !!(process.env[k] && String(process.env[k]).trim());
+  const pingAt = _lastPingAt || DB.lastPingAt || 0;
+  const pingAgoMin = pingAt ? Math.round((Date.now()-pingAt)/60000) : null;
+  const jobs = (DB.pageJobs||[]);
+  const knows = Object.keys(DB.deptKnowledge||{});
+  res.json({
+    ok:true,
+    시각: new Date().toLocaleString("ko-KR",{timeZone:"Asia/Seoul"}),
+    "1_서버깨우기(cron)": {
+      마지막_핑: pingAt ? new Date(pingAt).toLocaleString("ko-KR",{timeZone:"Asia/Seoul"}) : "없음",
+      몇분전: pingAgoMin,
+      판정: (pingAgoMin!=null && pingAgoMin<=15) ? "✅ cron 정상 작동 중" : (pingAt ? "⚠️ 최근 핑 없음 — cron 확인 필요" : "❌ 핑 기록 없음 — cron 미설정")
+    },
+    "2_API키_설정여부": {
+      ANTHROPIC_API_KEY: has("ANTHROPIC_API_KEY") ? "✅ 설정됨" : "❌ 없음",
+      GEMINI_API_KEY: has("GEMINI_API_KEY") ? "✅ 설정됨" : "❌ 없음",
+      OPENAI_API_KEY: has("OPENAI_API_KEY") ? "✅ 설정됨(이미지 생성 가능)" : "❌ 없음(🎨 이미지 생성 불가)",
+      openai_소문자_잘못된키: has("openai_api_key") ? "⚠️ 소문자 키가 남아있음 — 지워도 됩니다" : "없음(정상)",
+      KAKAO: (has("KAKAO_ACCESS_TOKEN")||has("KAKAO_REFRESH_TOKEN")) ? "✅ 설정됨(카톡 알림 가능)" : "❌ 없음(카톡 알림 불가)",
+      SUPABASE: (has("SUPABASE_URL")&&has("SUPABASE_KEY")) ? "✅ 설정됨(데이터 보존)" : "❌ 없음(데이터 유실 위험)",
+      APP_PASSWORD: has("APP_PASSWORD") ? "✅ 설정됨(백엔드 보호)" : "⚠️ 없음 — 누구나 백엔드 접근 가능"
+    },
+    "3_데이터_안전": {
+      부팅시_복원성공: (typeof _bootRestoreOk!=="undefined") ? (_bootRestoreOk ? "✅ Supabase에서 복원됨" : "⚠️ 복원 못함(빈 상태로 시작 — 저장 보류 모드)") : "?",
+      현재_저장가능: (function(){ try{ return dbHasContent(DB) ? "✅ 내용 있음(저장됨)" : "⏸ 내용 없음(빈 데이터 덮어쓰기 차단 중)"; }catch(e){ return "?"; } })()
+    },
+    "4_자동학습": {
+      마지막_벤치마크_학습일: DB.lastBenchmarkDay || "아직 없음",
+      학습된_부서수: knows.length,
+      학습된_부서: knows,
+      다음_학습_차례: (function(){ try{ const o=Object.keys(DEPT_BENCHMARK); return o[(DB.benchmarkTurn||0)%o.length]; }catch(e){ return "?"; } })()
+    },
+    "5_상품페이지_작업": {
+      전체: jobs.length,
+      진행중: jobs.filter(j=>j.status==="running"||j.status==="queued").length,
+      완료: jobs.filter(j=>j.status==="done").length,
+      실패: jobs.filter(j=>j.status==="error").length,
+      최근: jobs.slice(-3).map(j=>({ 상품:j.product, 상태:j.status, 오류:j.error||"" }))
+    },
+    "6_부서경험치": DB.exp || {}
+  });
 });
 // 수동: 팀장이 지금 정체 부서를 점검해 재지시 (오피스 버튼)
 app.post("/api/ops/check-stale", async (req,res)=>{
@@ -2364,26 +2413,115 @@ async function productPagePipeline(body){
       + photos.map((p,i)=>"사진"+(i+1)+": "+(p.url||"")+(p.desc?(" ("+p.desc+")"):"")).join("\n");
   }
   photoBlock += "\n\n[사진이 없는 자리는 <div class=\"img-ph\">[AI이미지: 구체적 묘사]</div> 형태의 플레이스홀더로 남겨, 나중에 이미지를 넣을 수 있게 하라.]";
-  const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
-    + " 아래 상품으로, 샤넬·에르메스 같은 명품 브랜드 수준의 '실제로 바로 열리는 완성형 HTML 상품페이지' 하나를 만들어라. "
-    + "반드시 지킬 것: (1) 완전한 단일 HTML 문서(<!DOCTYPE html>부터 </html>까지, CSS는 <style>에 인라인). "
-    + "(2) 히어로 섹션(풀블리드 대형 비주얼 + 브랜드 스토리 한 문장), 상품 소개, 스토리텔링, 상세 특징, 구매 유도(CTA) 섹션 포함. "
-    + "(3) 고급스러운 여백·타이포그래피·색감, 스크롤 시 자연스러운 리듬. 모바일 반응형. "
-    + "(4) 과장광고·허위표현 금지, 실제 판매에 쓸 수 있는 신뢰감 있는 카피. "
-    + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
-    + formulaBlock + photoBlock + profileContext();
-  const user = "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n상품 정보:\n"+info;
+  const baseHtml = String(body.baseHtml||"");
+  const feedback = String(body.feedback||"").slice(0,1500);
+  const isRevise = !!(baseHtml && feedback);
+  let sys, user;
+  if (isRevise){
+    sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
+      + " 아래 '기존 상품페이지 HTML'을 클라이언트 요청대로 수정·보완해, 수정된 '완전한 단일 HTML 문서'를 다시 출력하라. "
+      + "반드시 지킬 것: (1) <!DOCTYPE html>부터 </html>까지 완전한 문서, CSS는 <style>에 인라인. "
+      + "(2) 요청한 부분만 정확히 반영하고, 나머지 디자인·구조·톤은 그대로 유지하라(불필요하게 갈아엎지 말 것). "
+      + "(3) 기존의 고급스러운 여백·타이포그래피·반응형을 유지하라. (4) 과장광고 금지. "
+      + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
+      + formulaBlock + profileContext();
+    user = "[기존 상품페이지 HTML]\n"+baseHtml+"\n\n[클라이언트 수정·추가 요청]\n"+feedback;
+  } else {
+    sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
+      + " 아래 상품으로, 샤넬·에르메스 같은 명품 브랜드 수준의 '실제로 바로 열리는 완성형 HTML 상품페이지' 하나를 만들어라. "
+      + "반드시 지킬 것: (1) 완전한 단일 HTML 문서(<!DOCTYPE html>부터 </html>까지, CSS는 <style>에 인라인). "
+      + "(2) 히어로 섹션(풀블리드 대형 비주얼 + 브랜드 스토리 한 문장), 상품 소개, 스토리텔링, 상세 특징, 구매 유도(CTA) 섹션 포함. "
+      + "(3) 고급스러운 여백·타이포그래피·색감, 스크롤 시 자연스러운 리듬. 모바일 반응형. "
+      + "(4) 과장광고·허위표현 금지, 실제 판매에 쓸 수 있는 신뢰감 있는 카피. "
+      + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
+      + formulaBlock + photoBlock + profileContext();
+    user = "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n상품 정보:\n"+info;
+  }
   let html = await anthropic(sys, user, 8000); // 페이지는 길어야 하므로 큰 토큰
   // 혹시 코드펜스가 붙어 나오면 제거
   html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
   // 학습·경험치
   DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
-  DB.deptMemory[d].push({ at:Date.now(), instruction:"[상품페이지 제작]", note:product+" — "+(price||"") });
+  DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?"[상품페이지 수정]":"[상품페이지 제작]"), note:product+" — "+(isRevise?feedback.slice(0,60):(price||"")) });
   if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
   DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
   saveDB();
   return { ok:true, html, product, appliedFormula: !!formula, by:a.kr };
 }
+// ===== 상품페이지 백그라운드 작업 큐 (앱을 나가도 안 끊김) =====
+function trimPageJobs(){
+  DB.pageJobs = DB.pageJobs || [];
+  if(DB.pageJobs.length>20) DB.pageJobs = DB.pageJobs.slice(-20);
+  // 용량 보호: 최근 8건만 HTML 보관, 그보다 오래된 건 메타만 남김
+  const keep=8, n=DB.pageJobs.length;
+  DB.pageJobs.forEach((j,i)=>{ if(i < n-keep && j.html){ delete j.html; delete j.input; j.htmlDropped=true; } });
+}
+async function runPageJob(id, appUrl){
+  const j = (DB.pageJobs||[]).find(x=>String(x.id)===String(id));
+  if(!j) return;
+  j.status="running"; j.startedAt=Date.now(); saveDB();
+  try{
+    const out = await productPagePipeline(j.input||{});
+    j.html = out.html; j.appliedFormula = !!out.appliedFormula;
+    j.status="done"; j.doneAt=Date.now(); delete j.input;
+    trimPageJobs(); saveDB();
+    const link = String(appUrl||process.env.APP_URL||"");
+    const what = (j.kind==="revise") ? "수정 완료" : "완성";
+    kakaoNotify("✅ 상품페이지 "+what+" — '"+(j.product||"상품")+"'\n앱 콘텐츠 탭에서 미리보기·다운로드·수정할 수 있어요."+(link?("\n"+link):""), link).catch(()=>{});
+  }catch(e){
+    j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now();
+    saveDB();
+    kakaoNotify("⚠️ 상품페이지 생성 실패 — '"+(j.product||"상품")+"'\n사유: "+j.error).catch(()=>{});
+  }
+}
+// 접수 즉시 응답 → 백그라운드 생성. baseId+feedback이면 '수정' 작업.
+app.post("/api/product-page/start", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const feedback = String(b.feedback||"").slice(0,1500);
+    const baseId = b.baseId ? String(b.baseId) : "";
+    let input, kind="create", prod;
+    if (baseId){
+      const base=(DB.pageJobs||[]).find(x=>String(x.id)===baseId);
+      if(!base || !base.html) return res.status(400).json({ error:"원본 페이지를 찾을 수 없어요(오래된 결과는 수정 불가)" });
+      if(!feedback) return res.status(400).json({ error:"수정·추가 요청 내용을 입력하세요" });
+      kind="revise"; prod=base.product;
+      input={ product:base.product, brand:base.brand, price:base.price, info:base.info, photos:base.photos||[], baseHtml:base.html, feedback };
+    } else {
+      prod=String(b.product||"").slice(0,120);
+      if(!prod) return res.status(400).json({ error:"상품명이 필요합니다" });
+      input={ product:prod, brand:String(b.brand||"민앤팜").slice(0,40), price:String(b.price||"").slice(0,60),
+              info:String(b.info||"").slice(0,2000), photos:Array.isArray(b.photos)?b.photos.slice(0,10):[] };
+    }
+    DB.pageJobs = DB.pageJobs || [];
+    const job = { id: String(Date.now())+"_"+Math.floor(Math.random()*1000), status:"queued", kind,
+      product:prod, brand:input.brand||"", price:input.price||"", info:input.info||"", photos:input.photos||[],
+      feedback:(kind==="revise"?feedback:""), input, at:Date.now() };
+    DB.pageJobs.push(job); trimPageJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id, status:"queued", kind });
+    // 응답 후 백그라운드 실행 — 앱을 닫아도 서버가 계속 진행
+    setImmediate(()=>{ runPageJob(job.id, String(b.appUrl||"")).catch(e=>logError("runPageJob", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/product-page/status", (req,res)=>{
+  const id=String(req.query.id||"");
+  const j=(DB.pageJobs||[]).find(x=>String(x.id)===id);
+  if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"",
+    appliedFormula:!!j.appliedFormula, html:(j.status==="done"?(j.html||""):"") });
+});
+app.get("/api/product-page/list", (req,res)=>{
+  res.json({ ok:true, jobs:(DB.pageJobs||[]).slice(-12).map(j=>({
+    id:j.id, status:j.status, kind:j.kind, product:j.product, at:j.at, doneAt:j.doneAt||0,
+    error:j.error||"", hasHtml:!!j.html, appliedFormula:!!j.appliedFormula })) });
+});
+// 완성 페이지를 브라우저에서 바로 열기(카톡 링크 대상으로도 사용 가능)
+app.get("/api/product-page/html", (req,res)=>{
+  const j=(DB.pageJobs||[]).find(x=>String(x.id)===String(req.query.id||""));
+  if(!j || !j.html) return res.status(404).send("결과를 찾을 수 없어요(오래된 결과는 삭제됐을 수 있어요)");
+  res.set("Content-Type","text/html; charset=utf-8"); res.send(j.html);
+});
+// (구버전 호환) 동기 생성 — 화면을 켜둔 채 기다리는 방식
 app.post("/api/product-page", async (req,res)=>{
   try { res.json(await productPagePipeline(req.body||{})); }
   catch(e){ res.status(500).json({ error:String(e.message||e) }); }
@@ -4769,6 +4907,16 @@ app.post("/api/publish-schedule/toggle", (req,res)=>{
 const PORT = process.env.PORT || 3000;
 (async ()=>{
   DB = await loadDB();
+  // ── 서버 재시작으로 중단된 상품페이지 작업 복구(영원히 '진행 중'에 멈추는 것 방지) ──
+  try{
+    let _stuck=0;
+    (DB.pageJobs||[]).forEach(j=>{
+      if(j.status==="running" || j.status==="queued"){
+        j.status="error"; j.error="서버 재시작으로 중단됐어요 — 다시 시도해 주세요."; j.doneAt=Date.now(); _stuck++;
+      }
+    });
+    if(_stuck){ saveDB(); console.log("중단된 상품페이지 작업 "+_stuck+"건 정리"); }
+  }catch(e){}
   // ── 부서 재편 마이그레이션 (커뮤니티·CS 삭제 / 그로스→커머스 흡수) ──
   try {
     let _migrated=false;
