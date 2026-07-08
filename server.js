@@ -584,17 +584,19 @@ async function learnFromBenchmark(dept){
     const a=AGENTS[dept]; const bm=DEPT_BENCHMARK[dept];
     if(!a || !bm) return { ok:false, note:"벤치마크 미정의" };
     if(!geminiKey()) return { ok:false, note:"GEMINI_API_KEY 미설정 — 학습에 웹검색이 필요" };
-    if(!searchAllowedNow()) return { ok:false, note:"오늘 웹검색 한도 도달 — 내일 재개" };
+    const searchCapped = !searchAllowedNow();   // (유료 상한에 걸린 경우만) 유튜브 학습은 계속 시도
     // 1) 벤치마크 웹 조사 (여러 쿼리 중 하나 순환 선택 — 매번 다른 각도로 학습)
     const qi = ((DB.learnIdx||0)) % bm.queries.length;
     DB.learnIdx = (DB.learnIdx||0)+1;
     const query = bm.queries[qi];
-    let research="", sources=[], ytNote="";
+    let research="", sources=[], ytNote="", searchErr="", ytErr="";
+    if(searchCapped) searchErr = "유료 웹검색 상한("+searchDailyCap()+"회) 도달 — 무료 모드에선 제한 없음";
     try{
+      if(searchCapped) throw new Error(searchErr);
       const s = await geminiSearch("아래 주제를 실제 웹에서 조사해 핵심만 정리하라. 특히 '무엇이 이것을 고품질로 만드는가'의 구체적 요소(구조·구성·디자인·카피·수치 기준)를 뽑아라.\n주제: "+query, 1400);
       research = String((s&&s.text)||"").trim();
       sources = (s&&s.sources)||[];
-    }catch(e){ /* 웹검색 실패해도 유튜브로 학습 시도 */ }
+    }catch(e){ searchErr = String(e.message||e).slice(0,140); }   // 실제 오류 보존(원인 파악용)
     // 유튜브 영상 학습(정의된 부서만): 인기 영상 1편을 화면까지 실제로 분석해 재료에 추가
     if (bm.ytSearch && bm.ytSearch.length){
       try{
@@ -614,9 +616,12 @@ async function learnFromBenchmark(dept){
             sources = sources.concat([{ title:"YouTube: "+v.title, uri:v.url }]);
           }
         }
-      }catch(e){ /* 유튜브 학습 실패는 무시(웹검색 재료로 진행) */ }
+      }catch(e){ ytErr = String(e.message||e).slice(0,140); }
     }
-    if(!research && !ytNote) return { ok:false, note:"조사 결과 없음(웹검색·유튜브 모두 실패)" };
+    if(!research && !ytNote){
+      const why = [searchErr && ("웹검색: "+searchErr), ytErr && ("유튜브: "+ytErr)].filter(Boolean).join(" / ");
+      return { ok:false, note:"조사 결과 없음 — "+(why||"웹검색·유튜브 모두 실패(원인 미상)") };
+    }
     research = (research||"") + ytNote;
     // 2) 조사 내용을 '이 부서가 결과물에 바로 적용할 품질 공식'으로 추출 → 기존 지식에 통합 (고품질 엔진=Claude)
     const prior = knowledgeText(dept);
@@ -707,6 +712,7 @@ async function runLearnJob(id, appUrl){
   if(!j) return;
   j.status="running"; j.startedAt=Date.now(); saveDB();
   beginJobMode();   // 작업 중 한도로 끊기지 않게
+  if (j.forceFree) beginForceFree();   // 무료 우회로 승인된 작업
   try{
     const setStep = (st)=>{ try{ j.step=st; saveDB(); }catch(_){} };
     const isAuto = (j.dept==="auto") && (j.kind==="youtube" || j.kind==="web");
@@ -740,9 +746,27 @@ async function runLearnJob(id, appUrl){
       }catch(e){ logError("proposeAfterLearn", e); }
     }
   }catch(e){
-    j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now(); saveDB();
-    kakaoNotify("⚠️ 학습 실패 — "+(AGENTS[j.dept]?AGENTS[j.dept].kr:j.dept)+"\n사유: "+j.error).catch(()=>{});
-  } finally { endJobMode(); }
+    j.status="error"; j.error=String(e.message||e).slice(0,300); j.doneAt=Date.now(); saveDB();
+    const who = (j.kind==="deep") ? "협업 심화학습"
+              : (j.dept==="auto") ? "자동배정 학습"
+              : (AGENTS[j.dept] ? AGENTS[j.dept].kr+" 학습" : String(j.dept));
+    kakaoNotify("⚠️ 학습 실패 — "+who+"\n사유: "+j.error).catch(()=>{});
+  } finally { if (j.forceFree) endForceFree(); endJobMode(); }
+}
+// 유료 모드면 학습도 실행 전에 비용을 알려주고 승인받는다 (무료면 그냥 진행)
+function gatePaidLearn(res, kind, payload, appUrl){
+  if(!paidModeOn()) return false;                     // 무료 → 게이트 없음
+  const estKind = (kind==="deep") ? "deep-learn"
+                : (kind==="youtube") ? "learn-youtube"
+                : (kind==="benchmark") ? "learn-web" : "learn-web";
+  const est = estimateJob(estKind, {});
+  est.paid = est.paid.length ? est.paid : ["유료 Gemini 키"];
+  est.freeAlternative = "무료 Gemini 키로 진행(속도·한도 제한 있을 수 있음)";
+  const ap = createCostApproval("learn-"+kind, Object.assign({}, payload, { appUrl:String(appUrl||"") }), est);
+  ap.appUrl = String(appUrl||""); saveDB();
+  res.json({ ok:true, pendingApproval:true, approvalId:ap.id, estKrw:est.estKrw, paid:est.paid,
+    note:"유료 자원이 필요해 승인을 요청했어요. 카카오톡 또는 앱에서 승인·무료우회·취소를 선택하세요." });
+  return true;
 }
 // 유튜브 URL 학습 접수 (즉시 응답 → 백그라운드 분석 → 부서 지식 반영)
 app.post("/api/learn/youtube-apply", (req,res)=>{
@@ -753,6 +777,7 @@ app.post("/api/learn/youtube-apply", (req,res)=>{
     const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
       .map(u=>String(u).trim()).filter(u=>/youtube\.com\/watch\?v=|youtu\.be\//.test(u)).slice(0,3);
     if(!urls.length) return res.status(400).json({ error:"유효한 유튜브 URL이 없어요 (youtube.com/watch?v=… 또는 youtu.be/… 형식)" });
+    if(gatePaidLearn(res, "youtube", { dept, urls }, b.appUrl)) return;   // 유료면 먼저 승인
     DB.learnJobs = DB.learnJobs || [];
     const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"youtube", dept, urls, status:"queued", at:Date.now() };
     DB.learnJobs.push(job); trimLearnJobs(); saveDB();
@@ -770,6 +795,7 @@ app.post("/api/learn/benchmark-start", (req,res)=>{
       DB.benchmarkTurn = ((DB.benchmarkTurn||0)+1) % order.length;
     }
     if(!AGENTS[dept]) return res.status(400).json({ error:"유효한 부서가 필요합니다" });
+    if(gatePaidLearn(res, "benchmark", { dept }, (req.body&&req.body.appUrl))) return;   // 유료면 먼저 승인
     DB.learnJobs = DB.learnJobs || [];
     const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"benchmark", dept, status:"queued", at:Date.now() };
     DB.learnJobs.push(job); trimLearnJobs(); saveDB();
@@ -795,8 +821,18 @@ async function fetchPageText(url){
   const ctrl = new AbortController();
   const to = setTimeout(()=>{ try{ctrl.abort();}catch(_){}}, 25000);
   try{
-    const r = await fetch(url, { signal:ctrl.signal, headers:{ "User-Agent":"Mozilla/5.0 (compatible; MinanFarmBot/1.0)" } });
-    if(!r.ok) throw new Error("HTTP "+r.status);
+    const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+    const r = await fetch(url, { signal:ctrl.signal, redirect:"follow", headers:{
+      "User-Agent": UA,
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"
+    }});
+    if(!r.ok){
+      const why = (r.status===403) ? "403 접속 차단(봇 차단 사이트 — 다른 페이지를 쓰세요)"
+               : (r.status===404) ? "404 주소를 찾을 수 없음"
+               : ("HTTP "+r.status);
+      throw new Error(why);
+    }
     let html = await r.text();
     // 분석에 방해되는 것 제거(스크립트/주석/base64), 구조·카피·스타일 힌트는 보존
     html = html.replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -847,6 +883,7 @@ app.post("/api/learn/web-apply", (req,res)=>{
     const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
       .map(u=>String(u).trim()).filter(u=>/^https?:\/\/.+/.test(u)).slice(0,3);
     if(!urls.length) return res.status(400).json({ error:"유효한 웹페이지 URL이 없어요 (https:// 로 시작)" });
+    if(gatePaidLearn(res, "web", { dept, urls }, b.appUrl)) return;   // 유료면 먼저 승인
     DB.learnJobs = DB.learnJobs || [];
     const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"web", dept, urls, status:"queued", at:Date.now() };
     DB.learnJobs.push(job); trimLearnJobs(); saveDB();
@@ -874,15 +911,20 @@ function safeJson(t, fallback){
 async function gatherMaterial(urls){
   const isYt = (u)=>/youtube\.com\/watch\?v=|youtu\.be\//.test(u);
   const yts = urls.filter(isYt).slice(0,2), webs = urls.filter(u=>!isYt(u)).slice(0,2);
-  const parts=[];
+  const parts=[], errs=[];
   for(const u of yts){
     try{ const a=await analyzeYouTube(u, "이 영상의 화면 구성·편집 리듬·자막 스타일·도입 후킹·마무리 CTA를 관찰한 사실 위주로 상세히 분석하라.", 1400);
-      if(a&&a.text) parts.push("[유튜브 영상] "+u+"\n"+a.text); }catch(e){}
+      if(a&&a.text) parts.push("[유튜브 영상] "+u+"\n"+a.text);
+      else errs.push(u+" → 분석 결과 없음"); }
+    catch(e){ errs.push(u+" → "+String(e.message||e).slice(0,90)); }
   }
   for(const u of webs){
-    try{ const h=await fetchPageText(u); if(h&&h.length>200) parts.push("[웹페이지] "+u+"\n"+h.slice(0,40000)); }catch(e){}
+    try{ const h=await fetchPageText(u);
+      if(h&&h.length>200) parts.push("[웹페이지] "+u+"\n"+h.slice(0,40000));
+      else errs.push(u+" → 본문이 너무 짧음(차단 페이지일 수 있음)"); }
+    catch(e){ errs.push(u+" → "+String(e.message||e).slice(0,90)); }
   }
-  if(!parts.length) throw new Error("자료를 가져오지 못했어요 (비공개 영상·접속 차단·잘못된 주소)");
+  if(!parts.length) throw new Error("자료를 가져오지 못했어요 — "+(errs.join(" | ").slice(0,320)||"원인 미상"));
   const kind = yts.length ? (webs.length ? "혼합" : "영상") : "웹페이지";
   return { text: parts.join("\n\n---\n\n"), kind };
 }
@@ -1008,6 +1050,7 @@ app.post("/api/learn/deep-start", (req,res)=>{
     const urls=(Array.isArray(b.urls)?b.urls:String(b.urls||"").split("\n"))
       .map(u=>String(u).trim()).filter(u=>/^https?:\/\/.+/.test(u)).slice(0,4);
     if(!urls.length) return res.status(400).json({ error:"유효한 URL이 없어요 (유튜브 또는 웹페이지 주소)" });
+    if(gatePaidLearn(res, "deep", { urls }, b.appUrl)) return;   // 유료면 먼저 승인
     DB.learnJobs = DB.learnJobs || [];
     const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), kind:"deep", dept:"ops", urls, status:"queued", step:"대기 중", at:Date.now() };
     DB.learnJobs.push(job); trimLearnJobs(); saveDB();
@@ -1281,6 +1324,25 @@ function createCostApproval(kind, payload, est){
 }
 function runApprovedCost(ap, freeMode){
   try{
+    if (String(ap.kind).indexOf("learn-")===0){
+      const b = ap.payload || {};
+      const kind = String(ap.kind).slice(6);   // youtube | web | deep | benchmark
+      DB.learnJobs = DB.learnJobs || [];
+      // benchmark는 반드시 실제 부서여야 함(auto면 순번으로 결정)
+      let jdept = (kind==="deep") ? "ops" : (b.dept || "auto");
+      if (kind==="benchmark" && (!AGENTS[jdept] || jdept==="auto")){
+        const order = Object.keys(DEPT_BENCHMARK);
+        jdept = order[((DB.benchmarkTurn||0)) % order.length];
+        DB.benchmarkTurn = ((DB.benchmarkTurn||0)+1) % order.length;
+      }
+      const job = { id:String(Date.now())+"_"+Math.floor(Math.random()*1000),
+        kind: kind, dept: jdept,
+        urls: b.urls||[], status:"queued", step:"대기 중", at:Date.now(),
+        forceFree: !!freeMode };   // 무료 우회 선택 시 이 작업만 무료 키 사용
+      DB.learnJobs.push(job); trimLearnJobs(); saveDB();
+      setImmediate(()=>{ runLearnJob(job.id, ap.appUrl||"").catch(e=>logError("runLearnJob", e)); });
+      return job.id;
+    }
     if (ap.kind === "product-page"){
       const b = Object.assign({}, ap.payload, freeMode ? { aiImages:false } : {});
       DB.pageJobs = DB.pageJobs || [];
@@ -1874,10 +1936,15 @@ function geminiKey(){
   const st = DB.state || {};
   const free = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || "";
   const paid = process.env.GEMINI_API_KEY_PAID || "";
+  if (_forceFree > 0) return free;              // 이 작업은 '무료로 우회' 선택됨
   if (st.paidGeminiOn && paid) return paid;
   return free;
 }
 function paidKeyAvailable(){ return !!process.env.GEMINI_API_KEY_PAID; }
+// 특정 작업만 '무료로 우회' 실행할 때 사용 (전역 유료 모드를 건드리지 않음)
+let _forceFree = 0;
+function beginForceFree(){ _forceFree++; }
+function endForceFree(){ _forceFree = Math.max(0, _forceFree-1); }
 function paidModeOn(){ const st=DB.state||{}; return !!(st.paidGeminiOn && paidKeyAvailable()); }
 function geminiRates(){ return { inM:+(process.env.GEMINI_IN_PER_M||0.3), outM:+(process.env.GEMINI_OUT_PER_M||2.5) }; } // per 1M 토큰(USD, flash 추정)
 function geminiUsdKrw(){ const st=DB.state||{}; return +(st.usdKrw)||+(process.env.PRICE_USD_KRW||1540); }
@@ -1934,13 +2001,37 @@ function geminiAutoAllowed(){
 function searchesToday(){ const t=todayStr(); return (DB.geminiSearchDaily && DB.geminiSearchDaily.date===t) ? DB.geminiSearchDaily.n : 0; }
 function noteSearch(){ const t=todayStr(); if(!DB.geminiSearchDaily || DB.geminiSearchDaily.date!==t) DB.geminiSearchDaily={date:t,n:0}; DB.geminiSearchDaily.n++; DB.geminiSearchTotal=(DB.geminiSearchTotal||0)+1; }
 // 하루 검색 상한(폭주·과금 방지): 무료 5회 / 유료 40회
-function searchDailyCap(){ return paidModeOn() ? 40 : 5; }
-function searchAllowedNow(){ return searchesToday() < searchDailyCap(); }
+function searchDailyCap(){
+  // 무료 범위에선 우리가 한도를 두지 않는다(구글 무료 한도에 걸리면 쿨다운 후 자동 재시도).
+  // 유료 모드에서만 과금 폭주 방지를 위해 상한을 둔다. SEARCH_DAILY_CAP로 강제 지정 가능.
+  if (process.env.SEARCH_DAILY_CAP) return +process.env.SEARCH_DAILY_CAP;
+  if (paidModeOn()) return +(process.env.SEARCH_DAILY_CAP_PAID || 150);
+  return 0;   // 0 = 무제한(무료)
+}
+function searchAllowedNow(){ const cap = searchDailyCap(); return cap <= 0 ? true : (searchesToday() < cap); }
+// 작업(백그라운드 job) 중이면 Gemini 쿨다운을 기다렸다 진행 — 한도 때문에 학습이 죽지 않게
+let _cooldownNotifiedUntil = 0;
+async function waitGeminiCooldown(){
+  if (Date.now() >= geminiCooldownUntil) return;
+  const leftSec = Math.ceil((geminiCooldownUntil - Date.now())/1000);
+  if (!inJobMode()) throw new Error("무료 한도 대기 중 — 약 "+leftSec+"초 뒤 다시 시도하세요");
+  // 작업 중이면 중단하지 않고 기다렸다 자동 재시도. 지연 사실은 한 번만 알림.
+  if (geminiCooldownUntil > _cooldownNotifiedUntil){
+    _cooldownNotifiedUntil = geminiCooldownUntil;
+    const paidHint = (paidKeyAvailable() && !paidModeOn())
+      ? "\n\n유료 키가 있어요. 즉시 진행하려면 설정에서 유료 모드를 켜세요(비용 발생)."
+      : "";
+    kakaoNotify("⏳ 무료 한도에 걸려 잠시 대기합니다\n약 "+Math.max(1,Math.ceil(leftSec/60))+"분 뒤 자동으로 다시 시도해요.\n작업은 취소되지 않았습니다."+paidHint).catch(()=>{});
+  }
+  const waitMs = Math.min(11*60000, geminiCooldownUntil - Date.now() + 1000);
+  console.log("Gemini 무료 한도 대기 "+Math.ceil(waitMs/1000)+"초 → 자동 재시도");
+  await _sleep(waitMs);
+}
 async function geminiSearch(prompt, maxTok){
   const key = geminiKey();
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
-  if (Date.now() < geminiCooldownUntil) throw new Error("gemini-cooldown");
-  if (!searchAllowedNow()) throw new Error("search-daily-cap");
+  await waitGeminiCooldown();
+  if (!searchAllowedNow()) throw new Error("오늘 웹검색 한도("+searchDailyCap()+"회) 도달 — 내일 재개하거나 SEARCH_DAILY_CAP를 올리세요");
   const models = ["gemini-2.5-flash","gemini-3.5-flash"]; // 구글검색 grounding 지원 모델
   const want = maxTok || 1400;
   let lastErr=null;
@@ -1985,7 +2076,7 @@ async function ytSearchTop(query, n){
 async function analyzeYouTube(url, question, maxTok){
   const key = geminiKey();
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
-  if (Date.now() < geminiCooldownUntil) throw new Error("gemini-cooldown");
+  await waitGeminiCooldown();
   const u = String(url||"").trim();
   if (!/youtube\.com\/watch\?v=|youtu\.be\//.test(u)) throw new Error("유효한 유튜브 URL이 아님");
   const models = ["gemini-2.5-flash","gemini-3.5-flash"];
@@ -2020,8 +2111,8 @@ app.post("/api/learn/youtube", async (req,res)=>{
 async function geminiText(prompt, maxTok){
   const key = geminiKey();
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
-  // 무료 한도 쿨다운 중이면 호출하지 않고 즉시 스킵(하머링 방지)
-  if (Date.now() < geminiCooldownUntil) throw new Error("gemini-cooldown:"+geminiRateInfo().secondsLeft+"s");
+  // 무료 한도 쿨다운: 작업 중이면 기다렸다 진행(끊지 않음), 평소엔 즉시 스킵(하머링 방지)
+  await waitGeminiCooldown();
   // 살아있는 모델만 (gemini-2.0/1.5는 2026년 종료=404). 1순위 3.5 Flash → 2.5 Flash → 2.5 Flash-Lite
   const models = ["gemini-3.5-flash","gemini-2.5-flash","gemini-2.5-flash-lite"];
   const want = maxTok || 1200;
@@ -2909,6 +3000,50 @@ app.get("/api/diag", (req,res)=>{
       return p.length ? p.map(x=>({ 제목:x.title, 이유:x.reason })) : "없음";
     })()
   });
+});
+// Gemini가 실제로 되는지 라이브 검사 (기본 호출 / 웹검색 grounding) — 실패하면 원문 오류를 그대로 보여준다
+app.get("/api/diag/gemini", async (req,res)=>{
+  const out = { ok:true, 단계:{} };
+  try{
+    out.단계["0_키"] = geminiKey() ? "✅ 있음" : "❌ 없음";
+    out.쿨다운 = (Date.now() < geminiCooldownUntil)
+      ? ("⏳ 한도 초과로 대기 중 — "+Math.ceil((geminiCooldownUntil-Date.now())/1000)+"초 남음")
+      : "없음";
+    out.오늘_웹검색_횟수 = (DB.geminiSearchDaily && DB.geminiSearchDaily.n) || 0;
+    out.요금_모드 = paidModeOn() ? "유료(승인 필요)" : "무료";
+    out.웹검색_한도 = (function(){ const c=searchDailyCap(); return c<=0 ? "무제한(무료)" : (c+"회/일"); })();
+    out.웹검색_허용 = (function(){ try{ return searchAllowedNow() ? "✅ 가능" : "❌ 상한 도달"; }catch(e){ return "?"; } })();
+    if(!geminiKey()){ out.결론="GEMINI_API_KEY가 없어 학습 불가"; return res.json(out); }
+    try{
+      const t = await geminiText("한 단어로만 답하라: 사과의 색은?", 20);
+      out.단계["1_기본_호출"] = "✅ 성공 — 응답: "+String(t).slice(0,40);
+    }catch(e){ out.단계["1_기본_호출"] = "❌ 실패: "+String(e.message||e).slice(0,220); }
+    try{
+      const s = await geminiSearch("오늘 대한민국 날씨를 한 줄로", 200);
+      out.단계["2_웹검색(grounding)"] = "✅ 성공 — "+String((s&&s.text)||"").slice(0,60);
+      out.검색_출처수 = ((s&&s.sources)||[]).length;
+    }catch(e){ out.단계["2_웹검색(grounding)"] = "❌ 실패: "+String(e.message||e).slice(0,220); }
+    const ok1 = String(out.단계["1_기본_호출"]||"").startsWith("✅");
+    const ok2 = String(out.단계["2_웹검색(grounding)"]||"").startsWith("✅");
+    out.결론 = (ok1&&ok2) ? "✅ Gemini 정상 — 학습 가능"
+             : (!ok1 ? "❌ Gemini 기본 호출부터 실패 (키 권한·모델명·한도 확인)"
+                     : "⚠️ 기본 호출은 되지만 웹검색(grounding)이 실패 — 벤치마크 학습 불가");
+  }catch(e){ out.ok=false; out.error=String(e.message||e).slice(0,220); }
+  res.json(out);
+});
+// 웹페이지를 실제로 가져올 수 있는지 검사 (차단·403 확인)
+app.get("/api/diag/fetch", async (req,res)=>{
+  const url = String(req.query.url||"");
+  if(!/^https?:\/\/.+/.test(url)) return res.json({ ok:false, note:"?url=https://... 형식으로 주소를 주세요" });
+  try{
+    const t0 = Date.now();
+    const html = await fetchPageText(url);
+    res.json({ ok:true, url, 소요초: Math.round((Date.now()-t0)/1000),
+      본문길이: html.length,
+      판정: html.length>200 ? "✅ 수집 성공 — 학습에 쓸 수 있어요" : "⚠️ 본문이 너무 짧음(차단 페이지·JS 렌더링 사이트일 수 있음)",
+      미리보기: html.replace(/<[^>]+>/g," ").replace(/\s+/g," ").slice(0,200) });
+  }catch(e){ res.json({ ok:false, url, 오류:String(e.message||e).slice(0,220),
+      힌트:"403/봇 차단이면 그 사이트는 학습에 못 씁니다. 다른 페이지를 쓰세요." }); }
 });
 // 유튜브 학습이 실제로 되는지 라이브 검사 (검색 → 영상 분석 순서로 확인)
 app.get("/api/diag/youtube", async (req,res)=>{
