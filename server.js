@@ -1179,14 +1179,27 @@ function extractScore(t){
   return null;
 }
 // 검수부 채점 파싱: JSON 우선 → 실패 시 텍스트에서 점수 추출. strengths/gaps는 가능한 만큼 보존.
+// 채점 텍스트에서 '부족 항목(gaps)'을 추출 — JSON이 깨졌을 때도 2라운드 방향을 잡을 수 있게
+function extractGaps(t){
+  const s = String(t||"").replace(/\r/g,"");
+  const m = s.match(/(?:부족한?\s*점?|부족분|개선점?|보완|gaps?)\s*[:：]?\s*([\s\S]*?)(?:\n\s*(?:강점|점수|score|코칭|총평|strengths)\s*[:：\s]|$)/i);
+  const seg = m ? m[1] : "";
+  const out = [];
+  seg.split(/\n|·|•|;|、|,|\d+[.)]\s*|(?:^|\s)-\s+/m)
+     .map(x=>x.replace(/^[\s"'\-–—•·]+|[\s"']+$/g,"").trim())
+     .filter(x=>x && x.length>=4 && !/^\d+$/.test(x))
+     .slice(0,6).forEach(x=>out.push(x.slice(0,140)));
+  return out;
+}
 function parseReviewScore(raw, fallback){
   const clamp = n => Math.max(0, Math.min(100, Math.round(+n||0)));
   const j = safeJson(raw, null);
   const strengths = (j && Array.isArray(j.strengths)) ? j.strengths : [];
-  const gaps = (j && Array.isArray(j.gaps)) ? j.gaps : [];
+  let gaps = (j && Array.isArray(j.gaps)) ? j.gaps.filter(Boolean) : [];
+  if (!gaps.length){ const eg = extractGaps(raw); if (eg.length) gaps = eg; }   // JSON에 gaps 없으면 텍스트에서 추출
   if (j && j.score!=null && !isNaN(+j.score)) return { score:clamp(j.score), strengths, gaps, parsed:"json" };
   const s = extractScore(raw);
-  if (s!=null) return { score:clamp(s), strengths, gaps:(gaps.length?gaps:[]), parsed:"regex" };
+  if (s!=null) return { score:clamp(s), strengths, gaps, parsed:"regex" };
   return fallback || { score:0, strengths:[], gaps:["채점 결과를 해석하지 못했어요"], parsed:"fail" };
 }
 async function gatherMaterial(urls){
@@ -1266,7 +1279,8 @@ async function deepLearnPipeline(job){
   const adv = AGENTS.advisory;
   const sysR = "너는 민앤팜의 '"+adv.no+" "+adv.kr+"' 부서 서다은이다."+ADDRESS
     + " 아래 '참고자료(벤치마크)'의 수준을 기준으로 '우리 예제'를 냉정하게 채점하라. 후하게 주지 마라. "
-    + "반드시 JSON만 출력: {\"score\":0~100, \"strengths\":[\"...\"], \"gaps\":[\"부족한 점을 고칠 수 있게 구체적으로\"]}";
+    + "반드시 JSON만 출력: {\"score\":0~100, \"strengths\":[\"...\"], \"gaps\":[\"부족한 점을 고칠 수 있게 구체적으로\"]}. "
+    + "점수가 90 미만이면 gaps를 반드시 1개 이상, '무엇을 어떻게 고쳐야 하는지' 실행 가능하게 채워라(빈 배열 금지).";
   setStep("검수부(서다은)가 채점 중 (1라운드)");
   const rawR = await anthropic(sysR, "[참고자료(벤치마크)]\n"+material.slice(0,10000)+"\n\n[우리 예제]\n"+example.slice(0,10000), 900);
   let review = parseReviewScore(rawR, { score:0, strengths:[], gaps:["채점 결과를 해석하지 못했어요"] });
@@ -1276,7 +1290,10 @@ async function deepLearnPipeline(job){
   if (score < 80){
     round = 2;
     setStep("제작부가 지적사항 반영해 재제작 중 (2라운드)");
-    const gapsTxt = (review.gaps||[]).map((g,i)=>(i+1)+". "+g).join("\n");
+    const gapsList = (review.gaps||[]).filter(Boolean);
+    const gapsTxt = gapsList.length
+      ? gapsList.map((g,i)=>(i+1)+". "+g).join("\n")
+      : "· 참고자료(벤치마크) 대비 우리 예제에서 약한 부분을 스스로 찾아 구체적으로 개선하라: 구성·정보 위계, 여백·타이포, 카피의 설득력, CTA 명확성, 디테일·완성도. 현재 "+score+"점 → 85점 이상을 목표로 확실히 끌어올려라.";
     const example2 = stripFences(await anthropic(
       sysC + "\n\n[검수부 지적사항 — 반드시 전부 반영]\n"+gapsTxt,
       "[이전 예제]\n"+example.slice(0,9000)+"\n\n위 예제를 지적사항대로 고쳐 더 높은 수준으로 다시 만들어라.", 3000));
@@ -4521,7 +4538,7 @@ async function runDailyReview(){
   catch(e){ logError("daily-review", e); return null; }
   DB.dailyReview = DB.dailyReview || {};
   const now = Date.now();
-  let n=0, gradeSum={상:0,중:0,하:0};
+  let n=0, gradeSum={상:0,중:0,하:0}; const reviewedList=[];
   for(const line of String(out).split(/\n+/)){
     const m = line.match(/REVIEW:\s*([a-z]+)\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*(.+)$/);
     if(!m) continue;
@@ -4531,6 +4548,7 @@ async function runDailyReview(){
     const tomorrow=String(m[4]||"").trim().replace(/^["'“]|["'”]$/g,"").slice(0,120);
     DB.dailyReview[d]={ grade, improve, tomorrow, at:now, day:today };
     if(gradeSum[grade]!=null) gradeSum[grade]++;
+    reviewedList.push({ d, kr:(AGENTS[d]?AGENTS[d].kr:d), grade, improve });
     if(improve){
       DB.deptMemory[d]=DB.deptMemory[d]||[];
       DB.deptMemory[d].push({ at:now, instruction:"[팀장 회고]", note:"오늘 회고("+grade+"): "+improve+(tomorrow?(" / 내일: "+tomorrow):"") });
@@ -4543,7 +4561,9 @@ async function runDailyReview(){
   DB.lastReviewDay = today;
   ensureLeaderLead(); saveDB();
   if(n>0){
-    const s = "🌙 퇴근 회고 완료 — 오세라가 오늘 "+n+"개 부서를 평가했어요 (상 "+gradeSum.상+" · 중 "+gradeSum.중+" · 하 "+gradeSum.하+"). 보완점을 학습해 내일 지시에 반영해요.";
+    const ic = g => g==="상"?"🟢":(g==="하"?"🔴":"🟡");
+    const lines = reviewedList.map(r=>ic(r.grade)+" "+r.kr+"("+r.grade+"): "+String(r.improve||"보완점 없음").slice(0,70)).join("\n");
+    const s = "🌙 퇴근 회고 완료 — 오늘 "+n+"개 부서 평가 (상 "+gradeSum.상+" · 중 "+gradeSum.중+" · 하 "+gradeSum.하+")\n\n"+lines+"\n\n↑ 각 부서 보완점을 학습해 내일 지시에 반영해요.";
     kakaoNotify(s).catch(()=>{});
   }
   return DB.dailyReview;
