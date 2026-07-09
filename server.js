@@ -595,23 +595,30 @@ function commitKnowledge(dept, newText, benchmark){
     benchmark: benchmark||"", learned:true };
   return { saved:true };
 }
+// 학습 이력 기록: 언제·어떤 소스(유튜브/웹/벤치마크)로·무슨 결과를 냈는지 정확히 남긴다(감사·추적용)
+function recordLearnLog(entry){
+  try{
+    DB.learnLog = DB.learnLog || [];
+    DB.learnLog.push(Object.assign({ at: Date.now() }, entry||{}));
+    if(DB.learnLog.length > 60) DB.learnLog = DB.learnLog.slice(-60);
+  }catch(_){}
+}
 async function learnFromBenchmark(dept){
   try{
     const a=AGENTS[dept]; const bm=DEPT_BENCHMARK[dept];
     if(!a || !bm) return { ok:false, note:"벤치마크 미정의" };
     if(!geminiKey()) return { ok:false, note:"GEMINI_API_KEY 미설정 — 학습에 웹검색이 필요" };
-    const searchCapped = !searchAllowedNow();   // (유료 상한에 걸린 경우만) 유튜브 학습은 계속 시도
+    // (조사는 researchWeb이 grounding→무료웹→모델 순으로 알아서 폴백)
     // 1) 벤치마크 웹 조사 (여러 쿼리 중 하나 순환 선택 — 매번 다른 각도로 학습)
     const qi = ((DB.learnIdx||0)) % bm.queries.length;
     DB.learnIdx = (DB.learnIdx||0)+1;
     const query = bm.queries[qi];
-    let research="", sources=[], ytNote="", searchErr="", ytErr="";
-    if(searchCapped) searchErr = "유료 웹검색 상한("+searchDailyCap()+"회) 도달 — 무료 모드에선 제한 없음";
+    let research="", sources=[], ytNote="", searchErr="", ytErr="", researchVia="";
     try{
-      if(searchCapped) throw new Error(searchErr);
-      const s = await geminiSearch("아래 주제를 실제 웹에서 조사해 핵심만 정리하라. 특히 '무엇이 이것을 고품질로 만드는가'의 구체적 요소(구조·구성·디자인·카피·수치 기준)를 뽑아라.\n주제: "+query, 1400);
+      const s = await researchWeb("아래 주제를 실제 웹에서 조사해 핵심만 정리하라. 특히 '무엇이 이것을 고품질로 만드는가'의 구체적 요소(구조·구성·디자인·카피·수치 기준)를 뽑아라.\n주제: "+query, 1400);
       research = String((s&&s.text)||"").trim();
       sources = (s&&s.sources)||[];
+      researchVia = (s&&s.via)||"";
     }catch(e){ searchErr = String(e.message||e).slice(0,140); }   // 실제 오류 보존(원인 파악용)
     // 유튜브 영상 학습(정의된 부서만): 인기 영상 1편을 화면까지 실제로 분석해 재료에 추가
     if (bm.ytSearch && bm.ytSearch.length){
@@ -650,7 +657,7 @@ async function learnFromBenchmark(dept){
     commitKnowledge(dept, formula, bm.what);
     // 학습 기록 남기기(성장 체감) + 경험치
     DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
-    DB.deptMemory[dept].push({ at:Date.now(), instruction:"[벤치마크 학습] "+bm.what, note:"조사: "+query+" → 품질 공식 갱신" });
+    DB.deptMemory[dept].push({ at:Date.now(), instruction:"[벤치마크 학습] "+bm.what, note:"조사("+(researchVia||"?")+"): "+query+" → 품질 공식 갱신" });
     if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
     DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3; // 벤치마크 학습은 실무보다 큰 성장(+3)
     saveDB();
@@ -684,36 +691,79 @@ app.post("/api/learn/youtube-urls", (req,res)=>{
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // ===== 유튜브 URL을 직접 학습시켜 부서 전문성에 반영 =====
+// 영상 1편을 '학습의 사고 사슬'로 구조화: 어느 구간에서 → 무슨 요점을 파악 → 어떻게 이해 → 무엇을 추론(근거) → 앞으로 어떻게 적용(비전)
+async function learnFromYouTubeVideo(url){
+  const q = "너는 민앤팜(전남 고흥 특산물)의 SNS 콘텐츠 학습 담당이다. 이 유튜브 영상을 실제로 보고(화면·자막·음성) 배울 점을 아래 JSON으로만 출력하라. 설명·머리말·마크다운·코드펜스 금지.\n"
+    + '{"keyMoments":[{"at":"영상의 정확한 구간/타임스탬프(예: 0:00~0:03 도입, 1:12 전환컷)","observed":"그 부분에서 실제로 관찰한 구체적 사실"}],'
+    + '"keyPoint":"이 영상이 잘 만들어진(또는 인기 있는) 핵심 이유 1~2문장 — 요점",'
+    + '"understanding":"그 요점을 우리(고흥 특산물 SNS) 관점에서 어떻게 이해했는지 1~2문장",'
+    + '"reasoning":"그래서 우리가 도출한 규칙과 그 근거(왜 이게 통하는가) 1~2문장",'
+    + '"vision":"앞으로 우리 콘텐츠·결과물에 이걸 어떻게 적용·발전시킬지(미래 비전) 1~2문장"}\n'
+    + "keyMoments는 3~5개, 반드시 '영상의 어느 부분인지'를 명시하라. 추상론 금지, 관찰한 사실 기반으로만.";
+  const ay = await analyzeYouTube(url, q, 1600);
+  const raw = String((ay && ay.text) || "");
+  const p = safeJson(raw, null);
+  const clip = (s,n)=>String(s||"").trim().slice(0,n);
+  if(p && (p.keyPoint || (Array.isArray(p.keyMoments) && p.keyMoments.length))){
+    return { url, ok:true,
+      keyMoments: (Array.isArray(p.keyMoments)?p.keyMoments:[]).slice(0,6).map(m=>({ at:clip(m&&m.at,60), observed:clip(m&&m.observed,220) })).filter(m=>m.at||m.observed),
+      keyPoint: clip(p.keyPoint,320),
+      understanding: clip(p.understanding,320),
+      reasoning: clip(p.reasoning,320),
+      vision: clip(p.vision,320) };
+  }
+  // JSON 파싱 실패 시에도 원문 관찰은 보존(구조화만 실패)
+  return { url, ok:true, unstructured:true, keyMoments:[], keyPoint:"", understanding:"", reasoning:"", vision:"", raw: clip(raw,900) };
+}
 async function learnFromYouTubeUrls(dept, urls){
   const a = AGENTS[dept]; const bm = DEPT_BENCHMARK[dept];
   if(!a) throw new Error("유효한 부서가 아닙니다");
   if(!geminiKey()) throw new Error("GEMINI_API_KEY 미설정 — 영상 분석 불가");
   const list = (urls||[]).slice(0,3);
   if(!list.length) throw new Error("분석할 유튜브 URL이 없습니다");
-  const notes = [];
+  const videos = [];   // 영상별 구조화 학습 결과(어디서 → 요점 → 이해 → 추리 → 비전)
   for (const u of list){
-    try{
-      const ay = await analyzeYouTube(u, "이 영상을 화면·구성·편집·자막까지 실제로 분석하라. 무엇이 이 영상을 잘 만들어진(또는 인기 있는) 콘텐츠로 만드는지 구체적으로: 도입 3초 후킹, 장면 전환·리듬, 자막·카피 스타일, 화면 구성·색감, 길이, 마무리(CTA). 추상적 표현 금지, 관찰한 사실 위주로.", 1400);
-      if(ay && ay.text) notes.push("[영상] "+u+"\n"+ay.text);
-    }catch(e){ notes.push("[영상 분석 실패] "+u+" — "+String(e.message||e).slice(0,100)); }
+    try{ videos.push(await learnFromYouTubeVideo(u)); }
+    catch(e){ videos.push({ url:u, ok:false, error:String(e.message||e).slice(0,140) }); }
   }
-  const okNotes = notes.filter(n=>!n.startsWith("[영상 분석 실패]"));
-  if(!okNotes.length) throw new Error("영상을 분석하지 못했어요 (비공개·미등록 영상이거나 키 권한 문제)");
+  const okVids = videos.filter(v=>v.ok);
+  const okCount = okVids.length;
+  if(!okCount){
+    recordLearnLog({ dept, deptKr:a.kr, kind:"youtube", ok:false, analyzed:0, failed:videos.length, videos, note:"영상 분석 전부 실패" });
+    saveDB();
+    throw new Error("영상을 분석하지 못했어요 (비공개·미등록 영상이거나 키 권한 문제)");
+  }
   const prior = knowledgeText(dept);
-  const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 방금 실제 유튜브 영상을 화면까지 직접 분석했다. "
-    + "이 분석에서 '우리가 결과물을 만들 때 그대로 적용할 구체적 품질 공식·체크리스트'를 뽑아, 기존 축적 전문성에 통합·발전시켜라. "
+  const priorLen = (prior||"").length;
+  // 구조화된 학습 사슬을 재료로 합쳐 Claude가 품질 공식으로 통합·발전
+  const learnBlock = okVids.map((v,i)=>{
+    if(v.unstructured) return "[영상 "+(i+1)+"] "+v.url+"\n관찰: "+(v.raw||"");
+    const mm = (v.keyMoments||[]).map(m=>"  - ["+(m.at||"")+"] "+(m.observed||"")).join("\n");
+    return "[영상 "+(i+1)+"] "+v.url
+      + (mm?("\n· 주목 구간:\n"+mm):"")
+      + (v.keyPoint?("\n· 요점: "+v.keyPoint):"")
+      + (v.understanding?("\n· 이해: "+v.understanding):"")
+      + (v.reasoning?("\n· 추론·근거: "+v.reasoning):"")
+      + (v.vision?("\n· 적용 비전: "+v.vision):"");
+  }).join("\n\n");
+  const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 방금 실제 유튜브 영상을 화면까지 직접 분석해 '주목 구간 → 요점 → 이해 → 추론 → 적용 비전'으로 정리했다. "
+    + "이 학습을 '우리가 결과물을 만들 때 그대로 적용할 구체적 품질 공식·체크리스트'로 뽑아, 기존 축적 전문성에 통합·발전시켜라. "
     + "추상적 조언 말고 바로 실행 가능한 구체 기준으로(예: '첫 3초에 결과 화면 먼저 보여주기', '컷 길이 2~3초 유지', '자막은 2줄 이내 굵게'). "
     + "형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
-  const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[방금 직접 분석한 유튜브 영상]\n"+okNotes.join("\n\n");
+  const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[방금 직접 분석·학습한 유튜브 영상]\n"+learnBlock;
   const formula = await anthropic(sys, ctx, 1800);
-  commitKnowledge(dept, formula, "유튜브 영상 직접 학습("+okNotes.length+"편)");
+  const cr = commitKnowledge(dept, formula, "유튜브 영상 직접 학습("+okCount+"편)");
   DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
-  DB.deptMemory[dept].push({ at:Date.now(), instruction:"[유튜브 영상 학습]", note:okNotes.length+"편 분석 → 품질 공식 갱신" });
+  DB.deptMemory[dept].push({ at:Date.now(), instruction:"[유튜브 영상 학습]", note:okCount+"편 분석: "+okVids.map(v=>v.keyPoint||v.url).join(" / ").slice(0,180) });
   if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3;
+  // 정확한 학습 이력: 언제 · 어떤 영상 · 어느 구간에서 무슨 요점→추론→비전 · 지식 갱신량 · 새 공식
+  recordLearnLog({ dept, deptKr:a.kr, kind:"youtube", ok:(cr.saved!==false), kept:(cr.kept===true),
+    analyzed:okCount, failed:videos.length-okCount, videos, priorLen, resultLen:(formula||"").length,
+    result:String(formula||"").slice(0,500) });
   saveDB();
   await absorbToLeader([dept], "유튜브 영상");   // 팀장이 이 부서 학습을 흡수
-  return { ok:true, dept, analyzed:okNotes.length, failed:notes.length-okNotes.length, knowledge:formula };
+  return { ok:true, dept, analyzed:okCount, failed:videos.length-okCount, videos, knowledge:formula };
 }
 // 학습 작업 큐(영상 분석은 몇 분 걸림 → 앱을 닫아도 계속 진행, 완료 시 카톡)
 function trimLearnJobs(){
@@ -736,7 +786,7 @@ async function runLearnJob(id, appUrl){
               : await learnFromBenchmark(j.dept);
     if(!out || out.ok===false) throw new Error((out&&out.note)||"학습 보류");
     j.status="done"; j.doneAt=Date.now(); j.knowledge=out.knowledge||""; j.analyzed=out.analyzed||0; j.step="완료";
-    if(j.kind==="deep"){ j.result = { goal:out.goal, kind:out.kind, round:out.round, score:out.score,
+    if(j.kind==="deep"){ j.result = { goal:out.goal, kind:out.kind, round:out.round, score:out.score, scored:out.scored,
       depts:out.depts, guides:out.guides, example:out.example, review:out.review, updated:out.updated }; }
     trimLearnJobs(); saveDB();
     if(out && out.auto){ j.autoDepts = (out.depts||[]).map(d=>d.kr); }
@@ -745,9 +795,25 @@ async function runLearnJob(id, appUrl){
     const what = (out&&out.auto) ? ("\n배운 부서: "+((out.depts||[]).map(d=>d.kr).join(", ")||"-")+"\n핵심: "+(out.reason||""))
               : (j.kind==="youtube") ? (" — 유튜브 "+(out.analyzed||0)+"편 분석")
                : (j.kind==="web")     ? (" — 웹페이지 "+(out.analyzed||0)+"개 분석")
-               : (j.kind==="deep")    ? ("\n"+out.round+"라운드 · 검수점수 "+out.score+"/100 · 갱신 부서: "+(out.updated||[]).join(", ")) : "";
+               : (j.kind==="deep")    ? ("\n"+out.round+"라운드 · "+(out.scored===false?"검수 채점 불가(형식 오류 — 자료 학습은 반영됨)":("검수점수 "+out.score+"/100"))+" · 갱신 부서: "+(out.updated||[]).join(", ")) : "";
     const title = (j.kind==="deep") ? "🏢 전 부서 협업 심화학습 완료" : ("📚 "+nm+" 부서 학습 완료");
-    kakaoNotify(title+what+"\n품질 공식이 갱신됐어요. 이제 결과물에 반영됩니다.", String(appUrl||"")).catch(()=>{});
+    if (j.kind==="youtube" && out && Array.isArray(out.videos) && out.videos.length){
+      // 유튜브 학습은 '어떤 영상 → 무슨 요점→근거→비전'을 카톡에 그대로 담아 보낸다
+      const clip=(s,n)=>String(s||"").trim().slice(0,n);
+      const blocks = out.videos.map(function(v){
+        if(!v.ok) return "🎬 "+v.url+"\n  ❌ 학습 실패: "+clip(v.error,90);
+        if(v.unstructured) return "🎬 "+v.url+"\n  · "+clip(v.raw,140);
+        let s = "🎬 "+v.url;
+        if(v.keyPoint)  s += "\n  💡 요점: "+clip(v.keyPoint,110);
+        if(v.reasoning) s += "\n  🔗 근거: "+clip(v.reasoning,110);
+        if(v.vision)    s += "\n  🚀 비전: "+clip(v.vision,110);
+        return s;
+      });
+      const msg = "📚 "+nm+" 유튜브 학습 완료 ("+(out.analyzed||0)+"편)\n\n"+blocks.join("\n\n")+"\n\n✅ 품질 공식이 갱신됐어요.";
+      kakaoNotify(msg, String(appUrl||"")).catch(()=>{});
+    } else {
+      kakaoNotify(title+what+"\n품질 공식이 갱신됐어요. 이제 결과물에 반영됩니다.", String(appUrl||"")).catch(()=>{});
+    }
     // 학습 결과를 실제로 쓰려면 앱 자체를 바꿔야 하는지 팀장이 판단 → 필요하면 '승인 요청'(승인 전 적용 금지)
     if (j.kind==="youtube" || j.kind==="web" || j.kind==="deep"){
       try{
@@ -875,9 +941,42 @@ app.get("/api/learn/diagnose", async (req,res)=>{
     searchesToday: (typeof searchesToday==="function") ? searchesToday() : 0
   };
   try{ out.search = await probeGeminiSearch(); }catch(e){ out.search={ ok:false, reason:String(e.message||e).slice(0,280) }; }
+  try{ const u = await freeSearchUrls("고흥 특산물 유자 마케팅", 5); out.freeSearch = { ok:u.length>0, count:u.length, urls:u.slice(0,3) }; }catch(e){ out.freeSearch={ ok:false, reason:String(e.message||e).slice(0,200) }; }
   if(ytUrl){ try{ out.youtube = await probeYouTube(ytUrl); }catch(e){ out.youtube={ ok:false, reason:String(e.message||e).slice(0,280) }; } }
   try{ out.web = await probeWeb(webUrl); }catch(e){ out.web={ ok:false, reason:String(e.message||e).slice(0,280) }; }
   res.json({ ok:true, diagnose: out });
+});
+// 유료(grounding) 웹조사 예상 비용 — 소비 토큰·구글검색 요금을 원화로 산출해 보여준다
+app.get("/api/research/cost", (req,res)=>{
+  const rates = geminiRates();                 // per 1M USD (in/out)
+  const fx = geminiUsdKrw();
+  const GQ_USD = +(process.env.GROUNDING_PER_QUERY_USD || 0.035);   // 구글검색 grounding 1건 $0.035
+  const FREE_GQ = +(process.env.GROUNDING_FREE_PER_DAY || 1500);    // 결제 프로젝트 무료 1,500건/일
+  const today = todayStr();
+  const gd = (DB.geminiDaily && DB.geminiDaily.date===today) ? DB.geminiDaily : { in:0, out:0, calls:0 };
+  const gSearch = searchesToday();
+  const tokKrw = (tin,tout)=> Math.round(((tin/1e6)*rates.inM + (tout/1e6)*rates.outM) * fx);
+  const calls = gd.calls||0;
+  const avgIn = calls ? Math.round(gd.in/calls) : 400;    // 조사 1회 추정 입력 토큰
+  const avgOut = calls ? Math.round(gd.out/calls) : 1400; // 조사 1회 추정 출력 토큰
+  const perCallTokenKrw = tokKrw(avgIn, avgOut);
+  const perCallGroundKrw = Math.round(GQ_USD * fx);
+  const todayTokenKrw = tokKrw(gd.in, gd.out);
+  const paidGround = Math.max(0, gSearch - FREE_GQ);
+  const todayGroundKrw = Math.round(paidGround * GQ_USD * fx);
+  res.json({ ok:true,
+    rates:{ inPerM:rates.inM, outPerM:rates.outM, usdKrw:fx, groundingPerQueryUsd:GQ_USD, freeGroundingPerDay:FREE_GQ },
+    today:{ groundingSearches:gSearch, tokIn:gd.in, tokOut:gd.out, calls },
+    perCall:{ avgIn, avgOut, tokenKrw:perCallTokenKrw, groundingKrw:perCallGroundKrw, totalKrw:perCallTokenKrw+perCallGroundKrw },
+    todayCost:{ tokenKrw:todayTokenKrw, groundingKrw:todayGroundKrw, totalKrw:todayTokenKrw+todayGroundKrw, freeGroundingLeft:Math.max(0, FREE_GQ-gSearch) }
+  });
+});
+// 학습 이력 조회: 언제·어떤 영상/페이지로·무슨 결과를 냈는지 (유튜브는 영상별 상세 포함)
+app.get("/api/learn/history", (req,res)=>{
+  const dept = String((req.query&&req.query.dept)||"").trim();
+  let list = (DB.learnLog||[]);
+  if(dept && dept!=="auto" && dept!=="ops") list = list.filter(x=>x.dept===dept);
+  res.json({ ok:true, rows: list.slice(-20).reverse() });
 });
 // 현재 부서 지식(품질 공식) 조회
 app.get("/api/learn/knowledge", (req,res)=>{
@@ -911,6 +1010,70 @@ async function fetchPageText(url){
                .replace(/\s{2,}/g, " ");
     return html.slice(0, 60000);   // 토큰 보호
   } finally { clearTimeout(to); }
+}
+// ===== 무료 웹조사 계층 =====
+// DuckDuckGo 결과 HTML에서 결과 URL 추출(리다이렉트 uddg 디코딩 + 직접링크 폴백)
+function extractDdgUrls(html){
+  const out=[], seen={};
+  const re=/[?&]uddg=([^&"']+)/g; let m;
+  while((m=re.exec(html))){ try{ const u=decodeURIComponent(m[1]); if(/^https?:\/\//.test(u)&&!/duckduckgo\.com/.test(u)&&!seen[u]){ seen[u]=1; out.push(u);} }catch(_){} }
+  if(out.length<3){ const re2=/href="(https?:\/\/[^"]+)"/g; let m2; while((m2=re2.exec(html))){ const u=m2[1]; if(!/duckduckgo\.com|w3\.org/.test(u)&&!seen[u]){ seen[u]=1; out.push(u);} } }
+  return out;
+}
+// 무료 웹검색: 검색어 → 결과 URL 목록. 여러 무료 제공자를 순차 시도, 실패 시 [].
+async function freeSearchUrls(query, n){
+  const want = n||5;
+  const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+  const providers = [
+    "https://lite.duckduckgo.com/lite/?q="+encodeURIComponent(query),
+    "https://html.duckduckgo.com/html/?q="+encodeURIComponent(query)
+  ];
+  for(const purl of providers){
+    const ctrl=new AbortController(); const to=setTimeout(()=>{try{ctrl.abort();}catch(_){}}, 12000);
+    try{
+      const r = await fetch(purl, { signal:ctrl.signal, redirect:"follow", headers:{ "User-Agent":UA, "Accept":"text/html,application/xhtml+xml", "Accept-Language":"ko-KR,ko;q=0.9,en;q=0.8" }});
+      if(!r.ok){ clearTimeout(to); continue; }
+      const html = await r.text(); clearTimeout(to);
+      const urls = extractDdgUrls(html).slice(0, want);
+      if(urls.length) return urls;
+    }catch(e){ clearTimeout(to); }
+  }
+  return [];
+}
+// 통합 웹조사: 모드에 따라 ①(유료)grounding 먼저 → ②무료검색+본문+종합 → ③모델기억. 하드 실패 없음.
+//  mode: "paid"=grounding 시도(결제/유료키 필요, 진짜 구글검색) / "free"=grounding 건너뛰고 바로 무료검색(비용·429 없음)
+async function researchWeb(query, maxTok, mode){
+  const want = maxTok || 1400;
+  const m = mode || ((DB.state && DB.state.researchMode) || "free");
+  let groundedText = "", groundErr = "";
+  // ① 유료 모드에서만 grounding 시도 (무료 모드는 429 낭비·비용 없이 곧장 무료검색)
+  if (m === "paid"){
+    try{
+      const g = await geminiSearch(query, want);
+      const txt = String((g&&g.text)||"").trim();
+      const src = (g&&g.sources)||[];
+      if(txt && src.length) return { text:txt, sources:src, via:"grounding" };
+      groundedText = txt;   // 근거 없이 텍스트만 = 모델기억 → 무료검색 먼저 시도 후 폴백
+    }catch(e){ groundErr = String(e.message||e).slice(0,120); }
+  }
+  // ② 무료 웹검색 → 상위 페이지 본문 읽기 → Claude가 사실 위주로 종합
+  try{
+    const urls = await freeSearchUrls(query, 5);
+    if(urls.length){
+      const picked = urls.slice(0,3), pages=[];
+      for(const u of picked){ try{ const h=await fetchPageText(u); if(h && h.length>200) pages.push("[출처] "+u+"\n"+h.slice(0,12000)); }catch(_){} }
+      if(pages.length){
+        const sys = "아래는 '"+query+"'로 실제 웹에서 찾은 페이지들이다. 핵심 사실만 근거와 함께 한국어로 정리하라. 특히 '무엇이 이것을 고품질로 만드는가'의 구체 요소(구조·구성·디자인·카피·수치 기준)를 뽑아라. 추측 금지, 페이지에 있는 사실만.";
+        const summary = await anthropic(sys, pages.join("\n\n---\n\n").slice(0,24000), want);
+        if(summary && summary.trim()) return { text:summary.trim(), sources:picked.map(u=>({ title:u, uri:u })), via:"free-web" };
+      }
+    }
+  }catch(e){ /* 무료검색 실패 → 모델기억 폴백 */ }
+  // ③ (유료 모드에서) grounding이 준 모델기억 텍스트라도 있으면 사용
+  if(groundedText) return { text:groundedText, sources:[], via:"model-grounding" };
+  // ④ 최종: 순수 모델기억
+  try{ const t = await geminiText("아래 주제를 아는 범위에서 핵심만 정리하라(지금은 웹조사가 불가한 상태): "+query, want); if(t && t.trim()) return { text:t.trim(), sources:[], via:"model" }; }catch(_){}
+  throw new Error("web-research 실패"+(groundErr?(": "+groundErr):""));
 }
 async function learnFromWebUrls(dept, urls){
   const a = AGENTS[dept];
@@ -974,6 +1137,34 @@ function safeJson(t, fallback){
     if(m){ try{ return JSON.parse(m[0]); }catch(_){} }
     return fallback;
   }
+}
+// 채점 텍스트에서 0~100 점수를 안정적으로 추출(JSON이 아니어도 '72/100','점수: 72','72점','Score: 72' 등 커버)
+function extractScore(t){
+  const s = String(t||"");
+  if(!s) return null;
+  const pats = [
+    /(\d{1,3})\s*\/\s*100\b/,                 // 72/100
+    /점수[^\d]{0,8}(\d{1,3})/,                 // 점수: 72 / 점수는 72
+    /score[^\d]{0,8}(\d{1,3})/i,              // Score: 72
+    /(\d{1,3})\s*점(?!\s*(?:이하|이상|만점))/,   // 72점 (‘100점 만점’ 류 제외)
+    /(\d{1,3})\s*(?:out of|\/)\s*100/i
+  ];
+  for(const p of pats){ const m=s.match(p); if(m){ const n=+m[1]; if(n>=0&&n<=100) return n; } }
+  // 라벨이 없을 때 마지막 수단: 리스트 개수(가지/개/편 등)로 오인되지 않는 0~100 숫자
+  const m2 = s.match(/\b(\d{1,3})\b(?!\s*(?:가지|개|편|명|위|번|라운드|round|%|퍼센트))/i);
+  if(m2){ const n=+m2[1]; if(n>=0&&n<=100) return n; }
+  return null;
+}
+// 검수부 채점 파싱: JSON 우선 → 실패 시 텍스트에서 점수 추출. strengths/gaps는 가능한 만큼 보존.
+function parseReviewScore(raw, fallback){
+  const clamp = n => Math.max(0, Math.min(100, Math.round(+n||0)));
+  const j = safeJson(raw, null);
+  const strengths = (j && Array.isArray(j.strengths)) ? j.strengths : [];
+  const gaps = (j && Array.isArray(j.gaps)) ? j.gaps : [];
+  if (j && j.score!=null && !isNaN(+j.score)) return { score:clamp(j.score), strengths, gaps, parsed:"json" };
+  const s = extractScore(raw);
+  if (s!=null) return { score:clamp(s), strengths, gaps:(gaps.length?gaps:[]), parsed:"regex" };
+  return fallback || { score:0, strengths:[], gaps:["채점 결과를 해석하지 못했어요"], parsed:"fail" };
 }
 async function gatherMaterial(urls){
   const isYt = (u)=>/youtube\.com\/watch\?v=|youtu\.be\//.test(u);
@@ -1055,8 +1246,8 @@ async function deepLearnPipeline(job){
     + "반드시 JSON만 출력: {\"score\":0~100, \"strengths\":[\"...\"], \"gaps\":[\"부족한 점을 고칠 수 있게 구체적으로\"]}";
   setStep("검수부(서다은)가 채점 중 (1라운드)");
   const rawR = await anthropic(sysR, "[참고자료(벤치마크)]\n"+material.slice(0,10000)+"\n\n[우리 예제]\n"+example.slice(0,10000), 900);
-  let review = safeJson(rawR, { score:0, strengths:[], gaps:["채점 결과를 해석하지 못했어요"] });
-  let score = Math.max(0, Math.min(100, +review.score||0));
+  let review = parseReviewScore(rawR, { score:0, strengths:[], gaps:["채점 결과를 해석하지 못했어요"] });
+  let score = review.score;
 
   // 5) 점수가 낮으면 2라운드: 지적사항 반영 → 재제작 → 재채점 (진짜 자가개선)
   if (score < 80){
@@ -1068,12 +1259,13 @@ async function deepLearnPipeline(job){
       "[이전 예제]\n"+example.slice(0,9000)+"\n\n위 예제를 지적사항대로 고쳐 더 높은 수준으로 다시 만들어라.", 3000));
     setStep("검수부가 재채점 중 (2라운드)");
     const rawR2 = await anthropic(sysR, "[참고자료(벤치마크)]\n"+material.slice(0,10000)+"\n\n[우리 예제]\n"+example2.slice(0,10000), 900);
-    const review2 = safeJson(rawR2, review);
-    const score2 = Math.max(0, Math.min(100, +review2.score||0));
+    const review2 = parseReviewScore(rawR2, review);
+    const score2 = review2.score;
     if (score2 >= score){ example = example2; review = review2; score = score2; }
   }
 
   // 6) 팀장 종합 → 참여 부서별 '품질 공식'을 지식에 갱신 (부족분은 다음 학습 과제로)
+  const scored = (review.parsed !== "fail");   // 채점을 실제로 읽었는가(파싱 실패=false)
   setStep("팀장이 종합해 각 부서 지식 갱신 중");
   const parts = picked.map(p=>p.dept).concat(["creation","advisory"]);
   const uniq = parts.filter((v,i)=>parts.indexOf(v)===i);
@@ -1083,9 +1275,12 @@ async function deepLearnPipeline(job){
     + "검수에서 지적된 부족분은 반드시 각 부서의 '다음 학습 과제'에 반영하라. "
     + "각 부서 블록을 정확히 아래 형식으로만 출력(다른 말 금지):\n"
     + uniq.map(d=>"===dept:"+d+"===\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)").join("\n\n");
+  const reviewBlock = scored
+    ? ("[검수 채점] 점수 "+score+"/100\n강점: "+((review.strengths||[]).join(" / "))+"\n부족: "+((review.gaps||[]).join(" / ")))
+    : "[검수 채점] 이번엔 채점 형식 오류로 점수를 산출하지 못했다. 점수·부족분에 의존하지 말고, 위 '부서 가이드라인'의 품질을 그대로 통합·발전시켜라. 없는 부족분을 지어내지 마라.";
   const rawF = await anthropic(sysF,
     "[학습 목표] "+goal+"\n\n"+priorBlock+"\n\n[부서 가이드라인]\n"+guideBlock.slice(0,6000)
-    +"\n\n[검수 채점] 점수 "+score+"/100\n강점: "+((review.strengths||[]).join(" / "))+"\n부족: "+((review.gaps||[]).join(" / ")), 2600);
+    +"\n\n"+reviewBlock, 2600);
 
   // 블록 파싱 → 각 부서 지식 저장
   const updated = [];
@@ -1107,7 +1302,7 @@ async function deepLearnPipeline(job){
   setStep("팀장이 전 부서 학습을 흡수해 총괄 기준 갱신 중");
   await absorbToLeader(updated, "협업 심화학습");
   saveDB();
-  return { ok:true, goal, kind:mat.kind, round, score,
+  return { ok:true, goal, kind:mat.kind, round, score, scored,
     depts: picked.map(p=>({ dept:p.dept, kr:AGENTS[p.dept].kr, focus:p.focus||"" })),
     guides, example, review, updated: updated.map(d=>AGENTS[d].kr) };
 }
