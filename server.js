@@ -849,7 +849,7 @@ async function probeYouTube(u){
   const key = geminiKey(); if(!key) return { ok:false, reason:"키 없음" };
   if(!/youtube\.com\/watch\?v=|youtu\.be\//.test(String(u||""))) return { ok:false, reason:"유효한 유튜브 URL 아님" };
   try{
-    const url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
+    const url="https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
     const body={ contents:[{ parts:[ {fileData:{fileUri:u}}, {text:"이 영상의 주제를 한 문장으로 요약해."} ] }], generationConfig:{maxOutputTokens:150} };
     const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","x-goog-api-key":key},body:JSON.stringify(body)});
     const raw=await r.text(); let dj={}; try{dj=JSON.parse(raw);}catch(_){}
@@ -2097,26 +2097,28 @@ async function geminiSearch(prompt, maxTok){
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
   await waitGeminiCooldown();
   if (!searchAllowedNow()) throw new Error("오늘 웹검색 한도("+searchDailyCap()+"회) 도달 — 내일 재개하거나 SEARCH_DAILY_CAP를 올리세요");
-  const models = ["gemini-3.5-flash","gemini-2.5-flash"]; // 구글검색 grounding 지원 모델(최신순: 3.5는 종료일 미정)
+  const models = ["gemini-2.5-flash","gemini-3.5-flash"]; // 무료티어에선 2.5가 응답, 3.5는 429 잦음 → 2.5 우선
   const want = maxTok || 1400;
-  let lastErr=null;
+  let lastErr=null, rateHits=0;
   for (const mdl of models){
     try{
       const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
       const body = { contents:[{ parts:[{ text: prompt }] }], tools:[{ google_search:{} }], generationConfig:{ maxOutputTokens: want } };
       const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
       const dj = await r.json();
-      if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(dj.error.message,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
+      if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); if(isRateErr(dj.error.message, dj.error.code||r.status)) rateHits++; continue; }
       const cand = (dj.candidates||[])[0]||{};
       const parts = (cand.content||{}).parts||[];
       const text = parts.map(p=>p.text||"").join("").trim();
       const gmeta = cand.groundingMetadata || {};
       const chunks = gmeta.groundingChunks || [];
       const sources = chunks.map(c=> (c && c.web) ? { title:String(c.web.title||"").slice(0,80), uri:c.web.uri } : null).filter(Boolean).slice(0,8);
-      if (text){ noteSearch(); try{ recordGeminiUsage(dj.usageMetadata); }catch(_){} return { text, sources }; }
-      lastErr = "빈 응답";
-    }catch(e){ lastErr=String(e.message||e); }
+      if (text){ gemini429Streak=0; noteSearch(); try{ recordGeminiUsage(dj.usageMetadata); }catch(_){} return { text, sources }; }
+      lastErr = "["+mdl+"] 빈 응답";
+    }catch(e){ lastErr=String(e.message||e); if(isRateErr(lastErr)) rateHits++; }
   }
+  // 모든 모델이 한도(429)로 실패했을 때만 계층 쿨다운(성공한 모델이 있으면 절대 걸지 않음)
+  if (rateHits>0 && rateHits>=models.length){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; }
   throw new Error("gemini-search 실패: "+(lastErr||"원인 미상"));
 }
 
@@ -2144,24 +2146,25 @@ async function analyzeYouTube(url, question, maxTok){
   await waitGeminiCooldown();
   const u = String(url||"").trim();
   if (!/youtube\.com\/watch\?v=|youtu\.be\//.test(u)) throw new Error("유효한 유튜브 URL이 아님");
-  const models = ["gemini-3.5-flash","gemini-2.5-flash"];
+  const models = ["gemini-2.5-flash","gemini-3.5-flash"];
   const want = maxTok || 1500;
   const q = question || "이 영상을 화면·구성·편집·자막까지 분석해, 무엇이 이 영상을 잘 만들어진(또는 인기 있는) 콘텐츠로 만드는지 구체적으로 정리하라. 도입 후킹, 장면 전환, 자막·카피, 길이·리듬, 썸네일급 첫 장면을 짚어라.";
-  let lastErr=null;
+  let lastErr=null, rateHits=0;
   for (const mdl of models){
     try{
       const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
       const body = { contents:[{ parts:[ { fileData:{ fileUri:u } }, { text:q } ] }], generationConfig:{ maxOutputTokens: want } };
       const r = await fetch(apiUrl, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
       const dj = await r.json();
-      if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(dj.error.message,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
+      if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); if(isRateErr(dj.error.message, dj.error.code||r.status)) rateHits++; continue; }
       const cand = (dj.candidates||[])[0]||{};
       const parts = (cand.content||{}).parts||[];
       const text = parts.map(p=>p.text||"").join("").trim();
-      if (text){ noteSearch(); try{ recordGeminiUsage(dj.usageMetadata); }catch(_){} return { text, url:u }; }
-      lastErr = "빈 응답(영상이 비공개/미등록이거나 분석 불가)";
-    }catch(e){ lastErr=String(e.message||e); }
+      if (text){ gemini429Streak=0; noteSearch(); try{ recordGeminiUsage(dj.usageMetadata); }catch(_){} return { text, url:u }; }
+      lastErr = "["+mdl+"] 빈 응답(영상이 비공개/미등록이거나 분석 불가)";
+    }catch(e){ lastErr=String(e.message||e); if(isRateErr(lastErr)) rateHits++; }
   }
+  if (rateHits>0 && rateHits>=models.length){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; }
   throw new Error("유튜브 분석 실패: "+(lastErr||"원인 미상"));
 }
 // 유튜브 URL 분석 엔드포인트(수동 테스트/학습용)
