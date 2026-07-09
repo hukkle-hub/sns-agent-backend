@@ -3872,7 +3872,9 @@ app.post("/api/webtoon/create", async (req,res)=>{
   catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // ===== HTML 상품페이지 생성 (커머스·그로스 부서의 학습된 품질 공식을 실제 페이지로) =====
-async function productPagePipeline(body){
+async function productPagePipeline(body, setStep){
+  const _step = (typeof setStep==="function") ? setStep : function(){};
+  _step("상품 정보·품질공식 준비 중");
   const d="monetization"; const a=AGENTS[d];
   const product = String(body.product||"").slice(0,120);
   const info = String(body.info||"").slice(0,2000);
@@ -3914,7 +3916,9 @@ async function productPagePipeline(body){
       + formulaBlock + photoBlock + profileContext();
     user = "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n상품 정보:\n"+info;
   }
+  _step((body.baseHtml?"수정 사항 반영해 상세페이지 재작성 중":"AI가 상세페이지 작성 중")+" (1~3분)");
   let html = await anthropic(sys, user, 8000); // 페이지는 길어야 하므로 큰 토큰
+  _step("마무리·정리 중");
   // 혹시 코드펜스가 붙어 나오면 제거
   html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
   // 학습·경험치
@@ -3937,10 +3941,10 @@ function trimPageJobs(){
 async function runPageJob(id, appUrl){
   const j = (DB.pageJobs||[]).find(x=>String(x.id)===String(id));
   if(!j) return;
-  j.status="running"; j.startedAt=Date.now(); saveDB();
+  j.status="running"; j.startedAt=Date.now(); j.step="대기 중"; saveDB();
   beginJobMode();   // 작업 중 한도로 끊기지 않게
   try{
-    const out = await productPagePipeline(j.input||{});
+    const out = await productPagePipeline(j.input||{}, function(s){ j.step=s; saveDB(); });
     j.html = out.html; j.appliedFormula = !!out.appliedFormula;
     j.status="done"; j.doneAt=Date.now(); delete j.input;
     trimPageJobs(); saveDB();
@@ -3997,7 +4001,7 @@ app.get("/api/product-page/status", (req,res)=>{
   const id=String(req.query.id||"");
   const j=(DB.pageJobs||[]).find(x=>String(x.id)===id);
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"",
+  res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"", step:j.step||"",
     appliedFormula:!!j.appliedFormula, html:(j.status==="done"?(j.html||""):"") });
 });
 app.get("/api/product-page/list", (req,res)=>{
@@ -4742,7 +4746,7 @@ async function assignDailyDirectives(){
   catch(e){ logError("assign-daily-directives", e); return null; }
   DB.leaderDailyDirective = DB.leaderDailyDirective || {};
   const day = kstDay(), now = Date.now();
-  let n=0;
+  let n=0; const assigned=[];
   String(out).replace(/DIRECTIVE:\s*([a-z]+)\s*=\s*(.+)/g,(mm,d,txt)=>{
     d=d.trim();
     if(AGENTS[d] && d!=="ops"){
@@ -4752,6 +4756,7 @@ async function assignDailyDirectives(){
         DB.leadDirectives = DB.leadDirectives||[];
         DB.leadDirectives.push({ dept:d, directive:clean, reason:"일일 자율수행 지시(오세라)", at:now });
         if(DB.leadDirectives.length>60) DB.leadDirectives=DB.leadDirectives.slice(-60);
+        assigned.push({ kr:(AGENTS[d]?AGENTS[d].kr:d), task:clean });
         n++;
       }
     }
@@ -4760,7 +4765,10 @@ async function assignDailyDirectives(){
   DB.lastLeaderDirectDay = day;
   if(DB.dirFeedback){ Object.keys(DB.dirFeedback).forEach(function(dd){ (DB.dirFeedback[dd]||[]).forEach(function(x){ x.used=true; }); }); }
   saveDB();
-  if(n>0) kakaoNotify("🧭 오늘의 팀장 지시 배정 완료 — "+n+"개 부서에 오늘의 자율수행 과제를 내렸어요.").catch(()=>{});
+  if(n>0){
+    const lines = assigned.map(x=>"• "+x.kr+": "+x.task).join("\n");
+    kakaoNotify("🧭 오늘의 팀장 지시 배정 완료 — "+n+"개 부서에 오늘의 자율수행 과제를 내렸어요\n\n"+lines).catch(()=>{});
+  }
   return DB.leaderDailyDirective;
 }
 app.post("/api/ops/daily-directives", async (req,res)=>{
@@ -4795,12 +4803,13 @@ async function runDailyGrowth(){
   depts.forEach(d=>{ const rr=catchUpRounds(d); planRounds[d]=rr; totalRounds+=rr; });
   DB.growBurst={ active:true, total:totalRounds+2, done:0, mode:"daily", startedAt:Date.now(), finishedAt:0 };
   saveDB();
+  const _trainedWhat = {};
   for(const d of depts){
     if(!(DB.deptMemory[d]||[]).length){ DB.deptMemory[d]=[{ at:Date.now(), instruction:"[시작]", note:AGENTS[d].kr+" 부서 가동 시작" }]; }
     const rr=planRounds[d]||1;
     const lagging = rr>1; // 뒤처진 부서
     for(let k=0;k<rr;k++){
-      try{ await runSelfTraining(d); }catch(e){ logError("daily:"+d, e); } // 자기주도 훈련 +1 + distill
+      try{ const _r=await runSelfTraining(d); if(_r){ const _t=String(_r.transcript||""); const _m=_t.match(/훈련\s*주제[:\s]*([^\n]+)/); _trainedWhat[d] = _m ? _m[1].trim().slice(0,80) : ((_r.principles&&_r.principles[0])?String(_r.principles[0]).slice(0,80):(_trainedWhat[d]||"")); } }catch(e){ logError("daily:"+d, e); } // 자기주도 훈련 +1 + distill
       DB.growBurst.done++; saveDB(); await new Promise(r=>setTimeout(r,700));
     }
     // 뒤처진 부서는 훈련 후 '심화 지식 정리'를 강제로 한 번 더 → 레벨뿐 아니라 실제 전문성·지능이 도약
@@ -4820,8 +4829,8 @@ async function runDailyGrowth(){
     const behindList=depts.filter(d=>planRounds[d]>1);
     const behind=behindList.length;
     if(behind>0){
-      const names=behindList.map(d=>(AGENTS[d]?AGENTS[d].kr:d)+"("+planRounds[d]+"라운드)").join(", ");
-      kakaoNotify("📅 매일 자동 성장 완료 — 뒤처진 "+behind+"개 부서를 집중 훈련해 격차를 좁혔어요(무료)\n\n집중 훈련: "+names+"\n\n↑ 약한 부서를 더 돌려 전 부서 수준을 끌어올렸어요.");
+      const lines=behindList.map(d=>"• "+(AGENTS[d]?AGENTS[d].kr:d)+" ("+planRounds[d]+"라운드)"+(_trainedWhat[d]?(": "+_trainedWhat[d]):"")).join("\n");
+      kakaoNotify("📅 매일 자동 성장 완료 — 뒤처진 "+behind+"개 부서를 집중 훈련해 격차를 좁혔어요(무료)\n\n"+lines+"\n\n↑ 약한 부서를 더 돌려 전 부서 수준을 끌어올렸어요.");
     } else {
       kakaoNotify("📅 매일 자동 성장 완료 — 전 부서가 고르게 성장 중이라 뒤처진 부서 없이 균등 훈련했어요(무료).");
     }
