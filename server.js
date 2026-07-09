@@ -810,6 +810,62 @@ app.get("/api/learn/status", (req,res)=>{
     analyzed:j.analyzed||0, autoDepts:j.autoDepts||null, knowledge:(j.status==="done"?(j.knowledge||""):""),
     result:(j.status==="done" && j.kind==="deep") ? (j.result||null) : null });
 });
+// ===== 학습 인프라 진단: 구글검색·유튜브·웹수집이 '왜' 실패하는지 진짜 에러를 그대로 보여준다 =====
+async function probeGeminiSearch(){
+  const key = geminiKey();
+  if(!key) return { ok:false, reason:"GEMINI_API_KEY(또는 GOOGLE_API_KEY) 미설정 — Render 환경변수 확인" };
+  const models = ["gemini-3.5-flash","gemini-2.5-flash"];
+  const tried = [];
+  for(const mdl of models){
+    try{
+      const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
+      const body = { contents:[{ parts:[{ text:"한국 전라남도 고흥의 특산물을 한 문장으로 알려줘." }] }], tools:[{ google_search:{} }], generationConfig:{ maxOutputTokens:200 } };
+      const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
+      const raw = await r.text(); let dj={}; try{ dj=JSON.parse(raw); }catch(_){}
+      if(dj.error){ tried.push({ model:mdl, http:r.status, ok:false, code:String(dj.error.status||dj.error.code||""), reason:String(dj.error.message||"").slice(0,280) }); continue; }
+      const cand=(dj.candidates||[])[0]||{}; const parts=(cand.content||{}).parts||[];
+      const t=parts.map(p=>p.text||"").join("").trim();
+      const grounded = !!(((cand.groundingMetadata||{}).groundingChunks)||[]).length;
+      tried.push({ model:mdl, http:r.status, ok:!!t, grounded, sample:t.slice(0,120) });
+      if(t) return { ok:true, tried };
+    }catch(e){ tried.push({ model:mdl, ok:false, reason:String(e.message||e).slice(0,280) }); }
+  }
+  return { ok:false, tried };
+}
+async function probeYouTube(u){
+  const key = geminiKey(); if(!key) return { ok:false, reason:"키 없음" };
+  if(!/youtube\.com\/watch\?v=|youtu\.be\//.test(String(u||""))) return { ok:false, reason:"유효한 유튜브 URL 아님" };
+  try{
+    const url="https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent";
+    const body={ contents:[{ parts:[ {fileData:{fileUri:u}}, {text:"이 영상의 주제를 한 문장으로 요약해."} ] }], generationConfig:{maxOutputTokens:150} };
+    const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","x-goog-api-key":key},body:JSON.stringify(body)});
+    const raw=await r.text(); let dj={}; try{dj=JSON.parse(raw);}catch(_){}
+    if(dj.error) return { ok:false, http:r.status, code:String(dj.error.status||dj.error.code||""), reason:String(dj.error.message||"").slice(0,280) };
+    const t=(((dj.candidates||[])[0]||{}).content||{}).parts||[]; const s=t.map(p=>p.text||"").join("").trim();
+    return { ok:!!s, http:r.status, sample:s.slice(0,120) };
+  }catch(e){ return { ok:false, reason:String(e.message||e).slice(0,280) }; }
+}
+async function probeWeb(u){
+  try{ const h=await fetchPageText(u); return { ok:!!(h&&h.length>200), len:(h||"").length }; }
+  catch(e){ return { ok:false, reason:String(e.message||e).slice(0,280) }; }
+}
+// GET /api/learn/diagnose?yt=<유튜브URL>&web=<웹URL>  — 셋 다 실제로 때려보고 진짜 원인 반환
+app.get("/api/learn/diagnose", async (req,res)=>{
+  const ytUrl = String((req.query&&req.query.yt)||"").trim();
+  const webUrl = String((req.query&&req.query.web)||"https://www.goheung.go.kr").trim();
+  const out = {
+    at: Date.now(),
+    key: { present: !!geminiKey(),
+           source: process.env.GEMINI_API_KEY ? "GEMINI_API_KEY" : (process.env.GOOGLE_API_KEY ? "GOOGLE_API_KEY" : "없음"),
+           paidAvailable: paidKeyAvailable(), paidModeOn: paidModeOn() },
+    cooldown: { active: Date.now()<geminiCooldownUntil, untilSec: Math.max(0,Math.ceil((geminiCooldownUntil-Date.now())/1000)), streak: gemini429Streak },
+    searchesToday: (typeof searchesToday==="function") ? searchesToday() : 0
+  };
+  try{ out.search = await probeGeminiSearch(); }catch(e){ out.search={ ok:false, reason:String(e.message||e).slice(0,280) }; }
+  if(ytUrl){ try{ out.youtube = await probeYouTube(ytUrl); }catch(e){ out.youtube={ ok:false, reason:String(e.message||e).slice(0,280) }; } }
+  try{ out.web = await probeWeb(webUrl); }catch(e){ out.web={ ok:false, reason:String(e.message||e).slice(0,280) }; }
+  res.json({ ok:true, diagnose: out });
+});
 // 현재 부서 지식(품질 공식) 조회
 app.get("/api/learn/knowledge", (req,res)=>{
   const dept=String(req.query.dept||"");
@@ -2032,7 +2088,7 @@ async function geminiSearch(prompt, maxTok){
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
   await waitGeminiCooldown();
   if (!searchAllowedNow()) throw new Error("오늘 웹검색 한도("+searchDailyCap()+"회) 도달 — 내일 재개하거나 SEARCH_DAILY_CAP를 올리세요");
-  const models = ["gemini-2.5-flash","gemini-3.5-flash"]; // 구글검색 grounding 지원 모델
+  const models = ["gemini-3.5-flash","gemini-2.5-flash"]; // 구글검색 grounding 지원 모델(최신순: 3.5는 종료일 미정)
   const want = maxTok || 1400;
   let lastErr=null;
   for (const mdl of models){
@@ -2041,7 +2097,7 @@ async function geminiSearch(prompt, maxTok){
       const body = { contents:[{ parts:[{ text: prompt }] }], tools:[{ google_search:{} }], generationConfig:{ maxOutputTokens: want } };
       const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
       const dj = await r.json();
-      if (dj.error){ lastErr=String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(lastErr,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
+      if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(dj.error.message,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
       const cand = (dj.candidates||[])[0]||{};
       const parts = (cand.content||{}).parts||[];
       const text = parts.map(p=>p.text||"").join("").trim();
@@ -2079,7 +2135,7 @@ async function analyzeYouTube(url, question, maxTok){
   await waitGeminiCooldown();
   const u = String(url||"").trim();
   if (!/youtube\.com\/watch\?v=|youtu\.be\//.test(u)) throw new Error("유효한 유튜브 URL이 아님");
-  const models = ["gemini-2.5-flash","gemini-3.5-flash"];
+  const models = ["gemini-3.5-flash","gemini-2.5-flash"];
   const want = maxTok || 1500;
   const q = question || "이 영상을 화면·구성·편집·자막까지 분석해, 무엇이 이 영상을 잘 만들어진(또는 인기 있는) 콘텐츠로 만드는지 구체적으로 정리하라. 도입 후킹, 장면 전환, 자막·카피, 길이·리듬, 썸네일급 첫 장면을 짚어라.";
   let lastErr=null;
@@ -2089,7 +2145,7 @@ async function analyzeYouTube(url, question, maxTok){
       const body = { contents:[{ parts:[ { fileData:{ fileUri:u } }, { text:q } ] }], generationConfig:{ maxOutputTokens: want } };
       const r = await fetch(apiUrl, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
       const dj = await r.json();
-      if (dj.error){ lastErr=String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(lastErr,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
+      if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); const code=dj.error.code||r.status; if(isRateErr(dj.error.message,code)){ gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000; } continue; }
       const cand = (dj.candidates||[])[0]||{};
       const parts = (cand.content||{}).parts||[];
       const text = parts.map(p=>p.text||"").join("").trim();
