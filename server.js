@@ -526,6 +526,11 @@ function ensureLeaderLead(){
   if((DB.exp.ops||0) < want) DB.exp.ops = want;
 }
 // ── 클라이언트 학습: 발화를 모아 '클라이언트 프로필'(말투·유머·습관·선호)로 압축, 모든 부서가 공유 ──
+function brandBlock(){
+  const t=(DB.brandProfile&&DB.brandProfile.text)?DB.brandProfile.text:"";
+  if(!t) return "";
+  return "\n\n[브랜드 기준 — 모든 결과물은 이 브랜드 프로필을 반드시 따른다. 사실·수치·산지는 왜곡 금지]\n"+t;
+}
 function clientBlock(){
   const t=(DB.clientProfile&&DB.clientProfile.text)?DB.clientProfile.text:"";
   if(!t) return "";
@@ -2327,6 +2332,14 @@ async function waitGeminiCooldown(){
   console.log("Gemini 무료 한도 대기 "+Math.ceil(waitMs/1000)+"초 → 자동 재시도");
   await _sleep(waitMs);
 }
+// fetch + 타임아웃(무한 대기 방지). Gemini/외부 호출이 응답 없이 멈추는 걸 막는다.
+async function fetchTimeout(url, opts, ms){
+  const c = new AbortController();
+  const to = setTimeout(()=>{ try{ c.abort(); }catch(_){}}, ms||120000);
+  try{ return await fetch(url, Object.assign({}, opts||{}, { signal:c.signal })); }
+  catch(e){ if(e && e.name==="AbortError") throw new Error("응답 시간 초과("+Math.round((ms||120000)/1000)+"초)"); throw e; }
+  finally{ clearTimeout(to); }
+}
 async function geminiSearch(prompt, maxTok){
   const key = geminiKey();
   if (!key) throw new Error("GEMINI_API_KEY 미설정");
@@ -2339,7 +2352,7 @@ async function geminiSearch(prompt, maxTok){
     try{
       const url = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
       const body = { contents:[{ parts:[{ text: prompt }] }], tools:[{ google_search:{} }], generationConfig:{ maxOutputTokens: want } };
-      const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
+      const r = await fetchTimeout(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) }, 150000);
       const dj = await r.json();
       if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); if(isRateErr(dj.error.message, dj.error.code||r.status)) rateHits++; continue; }
       const cand = (dj.candidates||[])[0]||{};
@@ -2389,7 +2402,7 @@ async function analyzeYouTube(url, question, maxTok){
     try{
       const apiUrl = "https://generativelanguage.googleapis.com/v1beta/models/"+mdl+":generateContent";
       const body = { contents:[{ parts:[ { fileData:{ fileUri:u } }, { text:q } ] }], generationConfig:{ maxOutputTokens: want } };
-      const r = await fetch(apiUrl, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) });
+      const r = await fetchTimeout(apiUrl, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key }, body: JSON.stringify(body) }, 180000);
       const dj = await r.json();
       if (dj.error){ lastErr="["+mdl+"] "+(dj.error.status||dj.error.code||r.status)+": "+String(dj.error.message||""); if(isRateErr(dj.error.message, dj.error.code||r.status)) rateHits++; continue; }
       const cand = (dj.candidates||[])[0]||{};
@@ -2433,8 +2446,8 @@ async function geminiText(prompt, maxTok){
         const headroom = thinkCfg ? (/gemini-3/.test(mdl) ? 6000 : 3000) : 0;
         const genCfg = { maxOutputTokens: want + headroom };
         if (thinkCfg && attempt===0) genCfg.thinkingConfig = thinkCfg;
-        const r = await fetch(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
-          body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }], generationConfig: genCfg }) });
+        const r = await fetchTimeout(url, { method:"POST", headers:{ "Content-Type":"application/json", "x-goog-api-key":key },
+          body: JSON.stringify({ contents:[{ parts:[{ text: prompt }] }], generationConfig: genCfg }) }, 150000);
         const dj = await r.json();
         if (dj.error){
           lastErr=String(dj.error.message||"");
@@ -3107,18 +3120,19 @@ function reactionInsights(){
 // 운영 프로필(채널 설정) — 부서가 매번 되묻지 않고 전제로 삼을 공통 맥락
 function profileContext(){
   const p = (DB.state && DB.state.profile) || null;
-  if (!p) return "";
   const rows=[];
-  if(p.brand) rows.push("브랜드/채널: "+p.brand);
+  if(p){
+    if(p.brand) rows.push("브랜드/채널: "+p.brand);
   if(p.topic) rows.push("주제·분야: "+p.topic);
   if(p.audience) rows.push("타깃 시청자: "+p.audience);
   if(p.character) rows.push("대표 캐릭터/화자: "+p.character);
   if(p.tone) rows.push("톤&무드: "+p.tone);
   if(p.platforms) rows.push("주요 플랫폼: "+p.platforms);
-  if(p.avoid) rows.push("피해야 할 것: "+p.avoid);
-  if(p.extra) rows.push("기타 지침: "+p.extra);
-  if(!rows.length) return "";
-  return "\n\n[운영 프로필 — 모든 콘텐츠·제안의 기본 전제. 이 정보로 충분하니 사용자에게 되묻지 말고 바로 진행하라]\n" + rows.map(r=>"· "+r).join("\n");
+    if(p.avoid) rows.push("피해야 할 것: "+p.avoid);
+    if(p.extra) rows.push("기타 지침: "+p.extra);
+  }
+  const profileTxt = rows.length ? ("\n\n[운영 프로필 — 모든 콘텐츠·제안의 기본 전제. 이 정보로 충분하니 사용자에게 되묻지 말고 바로 진행하라]\n" + rows.map(r=>"· "+r).join("\n")) : "";
+  return profileTxt + brandBlock();
 }
 function parseTasks(out){
   var tasks={}; var mt = (out||"").match(/TASKS:\s*([^\n]+)/i);
@@ -5515,6 +5529,244 @@ app.get("/api/usage", (req,res)=>{
 // 에러 로그 조회
 app.get("/api/errors", (req,res)=> res.json((DB.errors||[]).slice(-50)));
 
+// ===== 🩺 시스템 건강 상태: 오류(묶음)·작업·API·저장을 한 화면에 =====
+app.get("/api/health", (req,res)=>{
+  const now = Date.now();
+  const groups = {};
+  (DB.errors||[]).forEach(e=>{
+    const key = (e.where||"")+"|"+String(e.msg||"").slice(0,60);
+    if(!groups[key]) groups[key] = { where:e.where||"", msg:String(e.msg||"").slice(0,160), count:0, last:0 };
+    groups[key].count++; groups[key].last = Math.max(groups[key].last, e.at||0);
+  });
+  const errorGroups = Object.keys(groups).map(k=>groups[k]).sort((a,b)=>b.last-a.last).slice(0,12);
+  const errs24h = (DB.errors||[]).filter(e=>(now-(e.at||0))<86400000).length;
+  function jobStat(arr){ const s={queued:0,running:0,done:0,error:0,stuck:0}; (arr||[]).forEach(j=>{ if(s[j.status]!=null)s[j.status]++; if(j.status==="running" && (now-(j.startedAt||j.at||now))>900000) s.stuck++; }); return s; }
+  const learn = jobStat(DB.learnJobs), page = jobStat(DB.pageJobs);
+  const api = { geminiKey: !!geminiKey(), cooldownActive: now<geminiCooldownUntil,
+    cooldownSec: Math.max(0, Math.ceil((geminiCooldownUntil-now)/1000)),
+    searchesToday: (typeof searchesToday==="function"?searchesToday():0),
+    researchMode: (DB.state&&DB.state.researchMode)||"free", paidGeminiOn: paidModeOn() };
+  const storage = { saveFailStreak: _saveFailStreak||0, lastSaveErr: String(_lastSaveErr||"").slice(0,140),
+    lastSaveOkMinAgo: _lastSaveOkAt ? Math.round((now-_lastSaveOkAt)/60000) : -1 };
+  const problems = [];
+  if(!api.geminiKey) problems.push("GEMINI_API_KEY 미설정");
+  if(storage.saveFailStreak>0) problems.push("데이터 저장 실패 "+storage.saveFailStreak+"회");
+  if(learn.stuck+page.stuck>0) problems.push("멈춘 작업 "+(learn.stuck+page.stuck)+"건");
+  if(errs24h>10) problems.push("최근 24시간 오류 "+errs24h+"건");
+  res.json({ ok:true, at:now, status: problems.length?"warn":"ok", problems,
+    errors:{ total:(DB.errors||[]).length, last24h:errs24h, groups:errorGroups },
+    jobs:{ learn, page }, api, storage });
+});
+
+// ===== 🧪 자가 점검(스모크 테스트): 핵심 경로를 실제로 한 번씩 돌려 pass/fail =====
+app.get("/api/selftest", async (req,res)=>{
+  const deep = String((req.query&&req.query.deep)||"")==="1";  // deep=1이면 유료 가능성 있는 LLM까지 점검
+  const results = [];
+  const t = async (name, fn)=>{ const s=Date.now(); try{ const d=await fn(); results.push({ name, ok:true, ms:Date.now()-s, detail:String(d||"ok").slice(0,120) }); }catch(e){ results.push({ name, ok:false, ms:Date.now()-s, detail:String(e.message||e).slice(0,160) }); } };
+  await t("JSON 파서(safeJson)", async()=>{ const o=safeJson('{"a":1}',null); if(!o||o.a!==1) throw new Error("파싱 실패"); return "ok"; });
+  await t("점수·부족분 파서", async()=>{ const r=parseReviewScore("점수: 72\n부족: 여백이 부족함, CTA 불명확",null); if(r.score!==72||!r.gaps.length) throw new Error("추출 실패"); return "72점 · gaps "+r.gaps.length+"개"; });
+  await t("데이터 저장(saveDB)", async()=>{ saveDB(); if(_saveFailStreak>0) throw new Error("저장 실패 누적 "+_saveFailStreak+"회"); return "ok"; });
+  await t("카카오 토큰", async()=>{ const tk=await getKakaoToken(); return tk?"발급 ok":"토큰 없음"; });
+  await t("무료 웹검색(DuckDuckGo)", async()=>{ const u=await freeSearchUrls("고흥 유자 마케팅",3); if(!u.length) throw new Error("결과 0건(Render 차단 의심)"); return u.length+"건"; });
+  await t("웹페이지 수집(+리더 폴백)", async()=>{ const h=await fetchPageText("https://example.com"); if(!h||h.length<50) throw new Error("본문 없음"); return (h||"").length+"자"; });
+  if(deep){
+    await t("Gemini 텍스트(무료)", async()=>{ const x=await geminiText("한 단어로 인사해",40); if(!x) throw new Error("빈 응답"); return String(x).slice(0,30); });
+    await t("Gemini 검색(grounding)", async()=>{ const s=await geminiSearch("고흥 특산물 한 줄",200); return (s&&s.text)?("응답 ok"+((s.sources||[]).length?" · 검색근거 "+s.sources.length:" · 검색근거 없음")):"빈 응답"; });
+    await t("Claude 호출", async()=>{ const x=await anthropic("한국어로 답하라.","'정상'이라고만 답해",20); return String(x||"").slice(0,20); });
+  }
+  const pass = results.filter(r=>r.ok).length;
+  res.json({ ok:true, pass, fail:results.length-pass, total:results.length, deep, results });
+});
+
+// ===== ① 브랜드 학습: 고흥/민앤팜 브랜드 프로필(모든 생성의 기준) =====
+app.get("/api/brand", (req,res)=>{ const b=DB.brandProfile||{text:"",at:0}; res.json({ ok:true, text:b.text||"", at:b.at||0 }); });
+app.post("/api/brand", async (req,res)=>{
+  try{
+    const b=req.body||{};
+    if(typeof b.text==="string" && !b.material && !b.url && b.distill!==true){
+      DB.brandProfile={ text:String(b.text).slice(0,4000), at:Date.now() }; saveDB();
+      return res.json({ ok:true, text:DB.brandProfile.text, mode:"saved" });
+    }
+    let material=String(b.material||b.text||"");
+    if(b.url){ try{ const h=await fetchPageText(String(b.url)); if(h) material+=("\n\n[페이지] "+b.url+"\n"+h.slice(0,12000)); }catch(e){ material+=("\n\n[페이지 실패] "+String(e.message||e)); } }
+    if(!material.trim()) return res.status(400).json({ error:"브랜드 자료(텍스트 또는 URL)가 필요해요" });
+    const prior=(DB.brandProfile&&DB.brandProfile.text)||"";
+    const sys="너는 민앤팜(전남 고흥 특산물)의 브랜드 가이드 정리 담당이다. 아래 자료에서 '모든 콘텐츠 제작의 기준이 될 브랜드 프로필'을 뽑아 기존 것과 통합·정교화하라. 한국어로, 아래 형식만(설명·서론 금지):\n브랜드 한 줄: (무엇을 파는 누구인가)\n핵심 가치·톤: (말투·분위기 3~5개)\n반드시 지킬 표현: (사실 기반·수치·산지 등)\n피해야 할 표현: (과장·근거 없는 최상급·금지어)\n대표 제품·사실: (제품명·당도·산지·인증 등 구체 수치)\n자주 쓰는 키워드·해시태그:";
+    const out=await anthropic(sys, "[기존 브랜드 프로필]\n"+(prior||"(없음)")+"\n\n[새 자료]\n"+material.slice(0,16000), 1200);
+    DB.brandProfile={ text:String(out).slice(0,4000), at:Date.now() }; saveDB();
+    res.json({ ok:true, text:DB.brandProfile.text, mode:"distilled" });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
+// ===== ② 원소스 멀티플랫폼 변환: 콘텐츠 1개 → 플랫폼별 재가공 (백그라운드 작업) =====
+const REPURPOSE_FORMATS = {
+  instagram: "인스타그램 피드 — 후킹 첫 문장 + 본문(줄바꿈 넉넉히, 이모지 적절) + 해시태그 8~12개. 저장·공유 유도.",
+  reels:     "인스타 릴스/숏폼 대본 — 0~3초 후킹, 컷별 자막(3~5컷), 마지막 CTA. 세로 영상용.",
+  shorts:    "유튜브 쇼츠 대본 — 3초 후킹 + 15~40초 내레이션/자막 흐름 + 끝 CTA. 제목 후보 2개.",
+  blog:      "네이버/티스토리 블로그 — SEO 제목, 소제목 3~5개, 정보성 본문(600~1000자), 자연스러운 키워드, 마무리.",
+  youtube:   "유튜브 영상 설명란 — 제목 후보 3개 + 설명(첫 2줄 후킹) + 타임스탬프 뼈대 + 태그.",
+  thread:    "스레드/X — 3~6개 연속 포스트로 분할, 각 280자 내, 첫 포스트 후킹.",
+  kakao:     "카카오채널 소식 — 짧고 친근한 톤, 핵심 혜택 + 링크 유도."
+};
+const REPURPOSE_KR = { instagram:"인스타 피드", reels:"릴스", shorts:"유튜브 쇼츠", blog:"블로그", youtube:"유튜브 설명란", thread:"스레드/X", kakao:"카카오채널" };
+function trimRepurposeJobs(){ DB.repurposeJobs=DB.repurposeJobs||[]; if(DB.repurposeJobs.length>15) DB.repurposeJobs=DB.repurposeJobs.slice(-15); }
+async function runRepurposeJob(id, appUrl){
+  const j=(DB.repurposeJobs||[]).find(x=>String(x.id)===String(id)); if(!j) return;
+  j.status="running"; j.startedAt=Date.now(); saveDB(); beginJobMode();
+  try{
+    const list=(j.platforms||[]).filter(p=>REPURPOSE_FORMATS[p]).slice(0,7);
+    if(!list.length) throw new Error("변환할 플랫폼이 없어요");
+    if(!String(j.source||"").trim()) throw new Error("원본 콘텐츠가 비었어요");
+    j.variants={};
+    for(const p of list){
+      j.step=(REPURPOSE_KR[p]||p)+" 변환 중"; saveDB();
+      const sys="너는 민앤팜(고흥 특산물)의 콘텐츠 리퍼포징 전문가다."+brandBlock()+profileContext()
+        +(knowledgeText("creation")?("\n\n[제작 품질 공식]\n"+knowledgeText("creation")):"")
+        +(knowledgeText("monetization")?("\n\n[전환 품질 공식]\n"+knowledgeText("monetization")):"")
+        +"\n\n아래 '원본 콘텐츠'를 핵심 손실 없이 아래 형식으로 재가공하라. 형식: "+REPURPOSE_FORMATS[p]+" 브랜드 사실·수치는 왜곡 금지. 결과물만 출력(설명 금지).";
+      j.variants[p]=stripFences(await anthropic(sys, "[원본]\n"+String(j.source).slice(0,8000), 1500));
+      saveDB();
+    }
+    j.status="done"; j.doneAt=Date.now(); j.step="완료"; trimRepurposeJobs(); saveDB();
+    const done=Object.keys(j.variants).map(p=>REPURPOSE_KR[p]||p).join(", ");
+    kakaoNotify("♻️ 멀티플랫폼 변환 완료 — "+done+"\n앱 학습 탭에서 플랫폼별 결과를 확인·복사하세요.", String(appUrl||"")).catch(()=>{});
+  }catch(e){ j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now(); saveDB();
+    kakaoNotify("⚠️ 멀티플랫폼 변환 실패 — "+j.error).catch(()=>{});
+  }finally{ endJobMode(); }
+}
+app.post("/api/repurpose/start", (req,res)=>{
+  try{
+    const b=req.body||{};
+    const source=String(b.source||b.content||"").trim();
+    const platforms=(Array.isArray(b.platforms)?b.platforms:[]).filter(p=>REPURPOSE_FORMATS[p]);
+    if(!source) return res.status(400).json({ error:"원본 콘텐츠를 입력하세요" });
+    if(!platforms.length) return res.status(400).json({ error:"변환할 플랫폼을 1개 이상 선택하세요" });
+    DB.repurposeJobs=DB.repurposeJobs||[];
+    const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), source, platforms, status:"queued", at:Date.now() };
+    DB.repurposeJobs.push(job); trimRepurposeJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id, status:"queued", platforms });
+    setImmediate(()=>{ runRepurposeJob(job.id, String(b.appUrl||"")).catch(e=>logError("runRepurposeJob", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/repurpose/status", (req,res)=>{
+  const j=(DB.repurposeJobs||[]).find(x=>String(x.id)===String(req.query.id||"")); if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", platforms:j.platforms||[], variants:(j.status==="done"?(j.variants||{}):null) });
+});
+
+// ===== 🚀 자율 개선 제안: 팀장이 웹을 조사해 '품질 개선안'을 제시 → 승인 시 품질 공식에 반영 → 승인/거절에서 학습 =====
+function improveLogText(){
+  const lg=(DB.improveLog||[]).slice(-8);
+  if(!lg.length) return "";
+  return lg.map(x=>"· ["+(x.decision==="approved"?"승인":"거절")+"] "+(AGENTS[x.dept]?AGENTS[x.dept].kr:x.dept)+": "+x.title).join("\n");
+}
+function logImproveDecision(pr, approved){
+  DB.improveLog = DB.improveLog || [];
+  DB.improveLog.push({ id:pr.id, at:Date.now(), dept:pr.dept, title:String(pr.title||"").slice(0,80), decision:approved?"approved":"rejected" });
+  if(DB.improveLog.length>30) DB.improveLog=DB.improveLog.slice(-30);
+}
+const IMPROVE_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout"];
+async function researchImprovement(focusDept){
+  DB.improveProposals = DB.improveProposals || [];
+  if (DB.improveProposals.filter(p=>p.status==="pending").length >= 4) return { ok:false, note:"승인 대기 중인 개선안이 많아요(먼저 처리해 주세요)" };
+  // 부서 선정: 지정 없으면 경험치 가장 낮은(가장 뒤처진) 부서
+  let dept = (focusDept && AGENTS[focusDept] && focusDept!=="ops") ? focusDept : null;
+  if(!dept){ const sorted=IMPROVE_DEPTS.slice().sort((a,b)=>((DB.exp&&DB.exp[a])||0)-((DB.exp&&DB.exp[b])||0)); dept=sorted[0]||"creation"; }
+  const a=AGENTS[dept];
+  beginJobMode();
+  try{
+    const query = "민앤팜 고흥 특산물 SNS를 위한 '"+a.kr+"' 관점 2026 최신 베스트 프랙티스·성공 사례·구체 기준(수치 포함). 역할: "+a.role;
+    let research={ text:"", via:"" };
+    try{ research = await researchWeb(query, 1400); }catch(e){ research={ text:"", via:"", err:String(e.message||e).slice(0,120) }; }
+    const prior = knowledgeText(dept);
+    const sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다."+brandBlock()
+      + " 방금 웹에서 최신 사례를 조사했다. 우리 부서의 '기존 품질 공식'을 한 단계 끌어올릴 '가장 임팩트 큰 개선안 1개'를 제안하라. 막연한 조언 금지, 결과물에 바로 적용할 구체 기준으로. "
+      + (improveLogText() ? ("\n\n[내가 과거에 낸 개선안과 운영자 결정 — 승인된 유형은 발전시키고, 거절된 유형·이미 있는 것은 반복하지 마라]\n"+improveLogText()) : "")
+      + "\n\n반드시 JSON만 출력(설명·마크다운 금지): {\"title\":\"개선안 한 줄 제목\",\"why\":\"왜 지금 이게 중요한가 1~2문장(근거)\",\"improvement\":\"품질 공식에 추가/교체할 구체 기준 3~6개(체크리스트 형태, 재사용 가능하게)\",\"expect\":\"이걸 반영하면 결과물이 어떻게 좋아지는가 1문장\"}";
+    const ctx = "[기존 품질 공식]\n"+(prior||"(아직 없음)")+"\n\n[방금 조사한 최신 사례]\n"+(research.text||"(웹조사 실패 — 기존 전문성 기반으로 제안)");
+    const raw = await anthropic(sys, ctx, 1200);
+    const j = safeJson(raw, null);
+    if(!j || !j.improvement) return { ok:false, note:"개선안 생성 실패(형식 오류)" };
+    const pr = { id:String(Date.now())+"_"+Math.floor(Math.random()*1000), code:String(Math.floor(1000+Math.random()*9000)),
+      dept, deptKr:a.kr, title:String(j.title||"품질 개선").slice(0,80), why:String(j.why||"").slice(0,300),
+      improvement:String(j.improvement||"").slice(0,1200), expect:String(j.expect||"").slice(0,200),
+      sourceVia: research.via||"", status:"pending", at:Date.now() };
+    DB.improveProposals.push(pr);
+    if(DB.improveProposals.length>20) DB.improveProposals=DB.improveProposals.slice(-20);
+    saveDB();
+    return { ok:true, proposal:pr };
+  } finally { endJobMode(); }
+}
+async function applyImprovement(pr){
+  const dept=pr.dept; const a=AGENTS[dept]; if(!a) return;
+  const prior=knowledgeText(dept);
+  const sys="너는 민앤팜 '"+a.no+" "+a.kr+"' 부서 수석 전문가다."+brandBlock()+" 아래 '승인된 개선안'을 기존 품질 공식에 통합·발전시켜라. 중복은 합치고 더 정교하게. 형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
+  const out=await anthropic(sys, "[기존 품질 공식]\n"+(prior||"(없음)")+"\n\n[승인된 개선안]\n"+pr.title+"\n"+pr.improvement, 1600);
+  commitKnowledge(dept, out, "자율 개선(승인): "+String(pr.title||"").slice(0,40));
+  DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[dept]=DB.deptMemory[dept]||[];
+  DB.deptMemory[dept].push({ at:Date.now(), instruction:"[자율 개선 승인]", note:String(pr.title||"").slice(0,120) });
+  DB.exp=DB.exp||{}; DB.exp[dept]=(DB.exp[dept]||0)+2;
+  saveDB();
+  try{ await absorbToLeader([dept], "자율 개선"); }catch(e){}
+}
+async function decideImprovement(id, approve, viaCode){
+  const pr=(DB.improveProposals||[]).find(x=>String(x.id)===String(id) && x.status==="pending");
+  if(!pr) return { ok:false, note:"제안을 찾을 수 없거나 이미 처리됨" };
+  if(viaCode!=null && String(viaCode)!==String(pr.code)) return { ok:false, note:"코드 불일치" };
+  if(approve){ try{ await applyImprovement(pr); }catch(e){ logError("applyImprovement", e); } pr.status="approved"; pr.decidedAt=Date.now(); logImproveDecision(pr, true); saveDB();
+    kakaoNotify("✅ 자율 개선 반영됨 — "+pr.deptKr+": "+pr.title+"\n품질 공식에 통합됐어요. 이제 결과물에 반영됩니다.").catch(()=>{});
+    return { ok:true, applied:true, proposal:pr };
+  } else { pr.status="rejected"; pr.decidedAt=Date.now(); logImproveDecision(pr, false); saveDB();
+    return { ok:true, applied:false, proposal:pr };
+  }
+}
+app.post("/api/improve/propose", async (req,res)=>{
+  try{ const b=req.body||{}; const r=await researchImprovement(b.dept||""); res.json(r); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/improve/list", (req,res)=>{
+  const rows=(DB.improveProposals||[]).slice(-12).reverse().map(p=>({ id:p.id, dept:p.dept, deptKr:p.deptKr, title:p.title, why:p.why, improvement:p.improvement, expect:p.expect, sourceVia:p.sourceVia, status:p.status, at:p.at }));
+  res.json({ ok:true, proposals:rows, learnedFrom:(DB.improveLog||[]).length });
+});
+app.post("/api/improve/decide", async (req,res)=>{
+  try{ const b=req.body||{}; const r=await decideImprovement(b.id, b.approve===true, null); res.json(r); }
+  catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/improve/approve", async (req,res)=>{ const r=await decideImprovement(req.query.id, true, req.query.code); res.send(r.ok?"✅ 개선안을 승인·반영했어요. 앱으로 돌아가셔도 됩니다.":("처리 실패: "+(r.note||""))); });
+app.get("/api/improve/reject", async (req,res)=>{ const r=await decideImprovement(req.query.id, false, req.query.code); res.send(r.ok?"🚫 개선안을 거절했어요. 팀장이 이 결정을 학습합니다.":("처리 실패: "+(r.note||""))); });
+
+// ===== 🌲 에버그린 재발행: 성과 좋았던(즐겨찾기) 콘텐츠를 새로 각색해 재활용 =====
+//  성과 수치 API가 아직 없으므로 '직접 즐겨찾기 + 선택적 성과점수' 기준. (나중에 분석 API 붙이면 자동 성과 기준으로 승격)
+function evergreenList(){
+  const arr=(DB.evergreen||[]).slice();
+  arr.sort((a,b)=> ((b.score||0)-(a.score||0)) || ((a.lastUsedAt||0)-(b.lastUsedAt||0)) );  // 성과 높은 것 → 오래 안 쓴 것 순환
+  return arr;
+}
+app.get("/api/evergreen/list", (req,res)=>{
+  const now=Date.now();
+  res.json({ ok:true, items: evergreenList().slice(0,30).map(x=>({ id:x.id, text:x.text, note:x.note||"", score:x.score||0, at:x.at||0, lastUsedAt:x.lastUsedAt||0,
+    daysIdle: x.lastUsedAt ? Math.round((now-x.lastUsedAt)/86400000) : Math.round((now-(x.at||now))/86400000) })) });
+});
+app.post("/api/evergreen/add", (req,res)=>{
+  try{ const b=req.body||{}; const text=String(b.text||"").trim(); if(!text) return res.status(400).json({ error:"내용이 필요해요" });
+    DB.evergreen=DB.evergreen||[];
+    DB.evergreen.push({ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), text:text.slice(0,4000), note:String(b.note||"").slice(0,140), score:Math.max(0,Math.min(100,+b.score||0)), at:Date.now(), lastUsedAt:0 });
+    if(DB.evergreen.length>60) DB.evergreen=DB.evergreen.slice(-60);
+    saveDB(); res.json({ ok:true, count:DB.evergreen.length });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/evergreen/remove", (req,res)=>{ try{ const id=String((req.body||{}).id||""); DB.evergreen=(DB.evergreen||[]).filter(x=>String(x.id)!==id); saveDB(); res.json({ ok:true }); }catch(e){ res.status(500).json({ error:String(e.message||e) }); } });
+app.post("/api/evergreen/refresh", async (req,res)=>{
+  try{
+    const b=req.body||{}; const it=(DB.evergreen||[]).find(x=>String(x.id)===String(b.id));
+    if(!it) return res.status(404).json({ error:"항목을 찾을 수 없어요" });
+    const sys="너는 민앤팜(고흥 특산물) 콘텐츠 리프레셔다."+brandBlock()+profileContext()+(knowledgeText("creation")?("\n\n[제작 품질 공식]\n"+knowledgeText("creation")):"")
+      +"\n\n아래는 예전에 성과가 좋았던 콘텐츠다. 핵심 메시지·강점은 유지하되 표현·훅·예시·시의성을 새롭게 바꿔 '재게시용 새 버전'을 만들어라(예전 것 그대로 복붙 금지). 결과물만 출력.";
+    const out=stripFences(await anthropic(sys, "[원본(성과 좋았던 콘텐츠)]\n"+String(it.text).slice(0,6000)+(it.note?("\n\n[메모] "+it.note):""), 1500));
+    it.lastUsedAt=Date.now(); saveDB();
+    res.json({ ok:true, refreshed:out });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+
 // 성과 지표 수집 (플랫폼별 — 실제 API 연결 자리)
 app.get("/api/metrics", async (req,res)=>{
   const pubs = (DB.jobs||[]).filter(j=>j.type==="publish");
@@ -5954,6 +6206,36 @@ setInterval(async ()=>{
       }
     }
   } catch(e){ /* 훈련 실패 무시 */ }
+  // (0-f) 자율 개선 제안: 하루 1회, 팀장이 웹을 조사해 개선안을 제시(승인 시 품질 공식 반영) — 자동·무료
+  try {
+    const st4 = DB.state || {};
+    if (autoOK && st4.autoImproveOn !== false) {
+      const everyH = Number.isFinite(+st4.improveEveryH) ? Math.max(6, +st4.improveEveryH) : 24;
+      const pend = (DB.improveProposals||[]).filter(p=>p.status==="pending").length;
+      if (pend < 2 && Date.now() - (DB.lastImproveAt||0) >= everyH*3600000) {
+        DB.lastImproveAt = Date.now(); saveDB(); // 선점
+        researchImprovement("").then(r=>{ if(r&&r.ok&&r.proposal){ const pr=r.proposal; const base=(st4.appBase||"").replace(/\/$/,"");
+          const links = base ? ("\n\n승인: "+base+"/api/improve/approve?id="+pr.id+"&code="+pr.code+"\n거절: "+base+"/api/improve/reject?id="+pr.id+"&code="+pr.code) : "";
+          try{ kakaoNotify("🚀 자율 개선 제안 — "+pr.deptKr+"\n"+pr.title+"\n\n왜: "+pr.why+"\n기대: "+pr.expect+"\n\n⚠️ 승인하면 품질 공식에 반영됩니다. 앱 학습 탭에서도 확인 가능."+links); }catch(_){} } console.log("자율 개선 제안 완료"); }).catch(e=>logError("auto-improve", e));
+      }
+    }
+  } catch(e){ /* 개선 제안 실패 무시 */ }
+  // (0-g) 에버그린 재발행 추천: 3일에 1회, 오래(21일+) 안 쓴 즐겨찾기 콘텐츠가 있으면 재발행을 권유 — 자동·무료(알림만)
+  try {
+    const st5 = DB.state || {};
+    if (autoOK && st5.evergreenSuggestOn !== false) {
+      if (Date.now() - (DB.lastEvergreenSuggestAt||0) >= 3*86400000) {
+        const now = Date.now();
+        const cand = (DB.evergreen||[]).filter(x=> (now-(x.lastUsedAt||x.at||now)) >= 21*86400000)
+          .sort((a,b)=> ((b.score||0)-(a.score||0)) || ((a.lastUsedAt||0)-(b.lastUsedAt||0)))[0];
+        if (cand){
+          DB.lastEvergreenSuggestAt = now; saveDB();
+          const idle = Math.round((now-(cand.lastUsedAt||cand.at||now))/86400000);
+          kakaoNotify("🌲 에버그린 재발행 추천\n"+idle+"일째 안 올린 콘텐츠가 있어요"+(cand.note?(" ("+cand.note+")"):"")+".\n\""+String(cand.text||"").slice(0,60)+"…\"\n앱 학습 탭 🌲 에버그린에서 '새로 각색'해 다시 올려보세요.").catch(()=>{});
+        }
+      }
+    }
+  } catch(e){ /* 에버그린 추천 실패 무시 */ }
   // 프로젝트 자동 사이클: 각 프로젝트의 설정 간격마다 한 사이클 진행(회의 대체, 지속형)
   try{
     for (const p of (DB.projects||[])){
@@ -6464,11 +6746,24 @@ const PORT = process.env.PORT || 3000;
     });
     if(_migrated){ try{ saveDB(); }catch(e){} console.log("부서 재편 마이그레이션 적용됨(커뮤니티·CS 삭제 / 그로스→커머스 흡수)"); }
   } catch(e){ logError("dept-migration", e); }
-  // 서버 재시작으로 중단된 작업/회의를 정리(고아 running → error) — 무한 '진행 중' 방지
-  let _orphan = 0;
+  // 서버 재시작으로 중단된 작업 복원: 회의·발행은 정리(error), 학습·상품페이지·변환은 입력이 남아 있으면 자동 재개
+  let _orphan = 0, _resumed = 0;
   (DB.meetings||[]).forEach(function(m){ if(m && m.status==="running"){ m.status="error"; m.error="서버 재시작으로 중단됨"; _orphan++; } });
   (DB.jobs||[]).forEach(function(j){ if(j && j.status==="running"){ j.status="error"; j.error="서버 재시작으로 중단됨"; _orphan++; } });
-  if(_orphan){ try{ saveDB(); }catch(e){} console.log("중단된 작업 "+_orphan+"건 정리(error 처리)"); }
+  function _recoverJobs(arr, runner, label){
+    (arr||[]).forEach(function(j){
+      if(!j || (j.status!=="running" && j.status!=="queued")) return;
+      j.resumeCount = (j.resumeCount||0) + 1;
+      if(j.resumeCount > 2){ j.status="error"; j.error="서버 재시작이 반복돼 중단됐어요(재개 2회 초과)"; j.doneAt=Date.now(); _orphan++; return; }
+      j.status="queued"; j.step="서버 재시작 후 재개 대기 중"; j.startedAt=0; _resumed++;
+      setImmediate(()=>{ runner(j.id, "").catch(e=>logError(label, e)); });
+    });
+  }
+  _recoverJobs(DB.learnJobs, runLearnJob, "resume-learn");
+  _recoverJobs(DB.pageJobs, runPageJob, "resume-page");
+  _recoverJobs(DB.repurposeJobs, runRepurposeJob, "resume-repurpose");
+  if(_orphan||_resumed){ try{ saveDB(); }catch(e){} console.log("재시작 복원 — 자동 재개 "+_resumed+"건, 정리 "+_orphan+"건"); }
+  if(_resumed){ try{ kakaoNotify("🔄 서버 재시작 감지 — 중단됐던 작업 "+_resumed+"건을 자동으로 다시 시작했어요.").catch(()=>{}); }catch(e){} }
   app.listen(PORT, ()=> console.log("SNS 에이전트 백엔드 listening on " + PORT + (useSupabase?" (Supabase)":" (file)")));
   // ── 자기-핑(self keep-alive): 서버가 스스로 자기 URL을 주기적으로 호출해 무료 슬립(15분)을 막음 ──
   // Render는 RENDER_EXTERNAL_URL을 자동 제공. 직접 지정하려면 SELF_URL 환경변수 사용.
