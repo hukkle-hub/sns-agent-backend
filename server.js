@@ -5670,6 +5670,69 @@ app.get("/api/repurpose/status", (req,res)=>{
   res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", platforms:j.platforms||[], variants:(j.status==="done"?(j.variants||{}):null) });
 });
 
+// ===== 🎬 AI 영상 기획 파이프라인: 리서치·콘셉트 → 마스터 시트(장면 프롬프트까지). 영상 생성 자체는 외부 툴(힉스필드 등)에 프롬프트 투입 =====
+const VIDEO_HOOKS = "챌린지형, 언박싱형, 솔직 리뷰형, ASMR형, 비포&애프터형, 스토리텔링형";
+const VIDEO_PLAT_KR = { shorts:"유튜브 쇼츠", reels:"인스타 릴스", tiktok:"틱톡" };
+function trimVideoJobs(){ DB.videoJobs=DB.videoJobs||[]; if(DB.videoJobs.length>15) DB.videoJobs=DB.videoJobs.slice(-15); }
+async function runVideoPlanJob(id, appUrl){
+  const j=(DB.videoJobs||[]).find(x=>String(x.id)===String(id)); if(!j) return;
+  j.status="running"; j.startedAt=Date.now(); saveDB(); beginJobMode();
+  try{
+    const platform = VIDEO_PLAT_KR[j.platform]?j.platform:"shorts";
+    const platKr = VIDEO_PLAT_KR[platform];
+    const days = Math.max(3, Math.min(30, +j.days||14));
+    // 1) 리서치
+    j.step="시장·트렌드 리서치 중"; saveDB();
+    let research={text:"",via:""};
+    try{ research=await researchWeb(String(j.source||"").slice(0,120)+" 숏폼 마케팅 후킹 트렌드 2026", 1200); }catch(e){}
+    // 2) 콘셉트·후킹
+    j.step="콘셉트·후킹 아이디어 도출 중"; saveDB();
+    const cSys="너는 민앤팜(전남 고흥 특산물) 숏폼 영상 기획 디렉터다."+brandBlock()+profileContext()+(knowledgeText("creation")?("\n\n[제작 품질 공식]\n"+knowledgeText("creation")):"")
+      +"\n\n아래 제품/주제와 리서치를 바탕으로 "+platKr+" 영상 캠페인 콘셉트를 잡아라. 후킹 유형("+VIDEO_HOOKS+") 중 이 제품에 맞는 걸 골라 활용. 반드시 JSON만: {\"concept\":\"캠페인 한 줄 콘셉트\",\"target\":\"핵심 타깃 페르소나\",\"angles\":[\"후킹 앵글 4~6개(각 유형 라벨 포함)\"],\"tone\":\"영상 톤&무드\"}";
+    const cRaw=await anthropic(cSys, "[제품/주제]\n"+String(j.source||"").slice(0,2000)+"\n\n[리서치]\n"+String(research.text||"(리서치 없음)").slice(0,4000), 1200);
+    const concept=safeJson(cRaw, null)||{ concept:"", target:"", angles:[], tone:"" };
+    j.concept=concept; saveDB();
+    // 3) 마스터 시트(장면 프롬프트) — 15일씩 청크로 안정 생성
+    j.days_plan=[];
+    let start=1;
+    while(start<=days){
+      const end=Math.min(days, start+14);
+      j.step=start+"~"+end+"일차 콘텐츠 플랜 작성 중 ("+platKr+")"; saveDB();
+      const mSys="너는 숏폼 콘텐츠 캘린더 기획자다."+brandBlock()+(knowledgeText("monetization")?("\n\n[전환 품질 공식]\n"+knowledgeText("monetization")):"")
+        +"\n\n아래 콘셉트로 "+platKr+"용 콘텐츠 캘린더의 "+start+"~"+end+"일차를 작성하라. 날짜마다 서로 다른 후킹·소재로 겹치지 않게. 브랜드 사실·수치는 왜곡 금지. "
+        +"반드시 JSON 배열만(설명 금지): [{\"day\":숫자,\"hookType\":\"후킹유형\",\"title\":\"영상 제목/주제\",\"persona\":\"등장 페르소나\",\"lengthSec\":숫자,\"scenePrompt\":\"영상 생성 AI에 넣을 장면 프롬프트(카메라·구도·분위기·동작 포함, 영어+한국어 병기)\",\"caption\":\"업로드 캡션\",\"hashtags\":\"해시태그\"}]";
+      const mRaw=await anthropic(mSys, "[콘셉트]\n"+JSON.stringify(concept).slice(0,1600), 3800);
+      const arr=safeJson(mRaw, null);
+      if(Array.isArray(arr)) j.days_plan=j.days_plan.concat(arr);
+      saveDB();
+      start=end+1;
+    }
+    j.status="done"; j.doneAt=Date.now(); j.step="완료"; trimVideoJobs(); saveDB();
+    kakaoNotify("🎬 AI 영상 기획 완료 — '"+String(j.source||"").slice(0,30)+"' ("+platKr+")\n콘셉트 + "+(j.days_plan||[]).length+"일치 콘텐츠 플랜(장면 프롬프트 포함)이 나왔어요.\n앱 학습 탭에서 확인·복사해 영상툴에 넣으세요.", String(appUrl||"")).catch(()=>{});
+  }catch(e){ j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now(); saveDB();
+    kakaoNotify("⚠️ AI 영상 기획 실패 — "+j.error).catch(()=>{}); }
+  finally{ endJobMode(); }
+}
+app.post("/api/video/start", (req,res)=>{
+  try{
+    const b=req.body||{}; const source=String(b.source||"").trim();
+    if(!source) return res.status(400).json({ error:"제품/주제(또는 URL)를 입력하세요" });
+    DB.videoJobs=DB.videoJobs||[];
+    const job={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), source:source.slice(0,2000),
+      platform:(["shorts","reels","tiktok"].indexOf(b.platform)>=0?b.platform:"shorts"),
+      days:Math.max(3,Math.min(30,+b.days||14)), status:"queued", at:Date.now() };
+    DB.videoJobs.push(job); trimVideoJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id });
+    setImmediate(()=>{ runVideoPlanJob(job.id, String(b.appUrl||"")).catch(e=>logError("runVideoPlanJob", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/video/status", (req,res)=>{
+  const j=(DB.videoJobs||[]).find(x=>String(x.id)===String(req.query.id||"")); if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"",
+    platform:j.platform, concept:(j.status==="done"?(j.concept||null):null), days_plan:(j.status==="done"?(j.days_plan||[]):null) });
+});
+
+
 // ===== 🚀 자율 개선 제안: 팀장이 웹을 조사해 '품질 개선안'을 제시 → 승인 시 품질 공식에 반영 → 승인/거절에서 학습 =====
 function improveLogText(){
   const lg=(DB.improveLog||[]).slice(-8);
@@ -6787,6 +6850,7 @@ const PORT = process.env.PORT || 3000;
       _recoverJobs(DB.learnJobs, runLearnJob, "resume-learn");
       _recoverJobs(DB.pageJobs, runPageJob, "resume-page");
       _recoverJobs(DB.repurposeJobs, runRepurposeJob, "resume-repurpose");
+      _recoverJobs(DB.videoJobs, runVideoPlanJob, "resume-video");
       if(_orphan||_resumed){ try{ saveDB(); }catch(e){} console.log("재시작 복원 — 자동 재개 "+_resumed+"건, 정리 "+_orphan+"건"); }
       if(_resumed){ try{ kakaoNotify("🔄 서버 재시작 감지 — 중단됐던 작업 "+_resumed+"건을 자동으로 다시 시작했어요.").catch(function(){}); }catch(e){} }
     }catch(e){ try{ logError("boot-recover", e); }catch(_){} }
