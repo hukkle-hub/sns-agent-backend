@@ -255,9 +255,9 @@ async function anthropic(system, user, maxTokens = 1500, images){
   let full = "";
   let needSpace = false;
   let _rl429 = 0;
-  // 출력 길이에 비례한 타임아웃(짧은 작업 90초, 상품페이지 같은 긴 문서는 최대 8분)
-  const _timeoutMs = Math.min(480000, Math.max(90000, Math.round((maxTokens||1500) * 45)));
-  const _timeoutSec = Math.round(_timeoutMs/1000);
+  // 출력 길이에 비례한 타임아웃. 백그라운드 작업(학습 등)은 여유를 더 준다(끊기면 작업 전체가 죽으므로).
+  let _timeoutMs = Math.min(600000, Math.max((_jobMode>0 ? 150000 : 90000), Math.round((maxTokens||1500) * 45)));
+  let _toRetries = 0;
   // 토큰 한도로 답변이 중간에 끊기면, 끊긴 지점부터 이어서 작성하도록 최대 3번까지 연결
   for (let attempt=0; attempt<4; attempt++){
     const _ctrl = new AbortController();
@@ -271,7 +271,11 @@ async function anthropic(system, user, maxTokens = 1500, images){
         signal: _ctrl.signal
       });
     } catch(e){
-      if (e && e.name==="AbortError") throw new Error("AI 응답 시간 초과("+_timeoutSec+"초)");
+      if (e && e.name==="AbortError"){
+        const maxTo = (_jobMode>0) ? 2 : 1;   // 작업 중이면 타임아웃도 최대 2회 더 재시도(늘려서)
+        if (_toRetries < maxTo){ _toRetries++; _timeoutMs = Math.min(600000, Math.round(_timeoutMs*1.5)); clearTimeout(_to); attempt--; continue; }
+        throw new Error("AI 응답 시간 초과("+Math.round(_timeoutMs/1000)+"초)");
+      }
       throw e;
     } finally { clearTimeout(_to); }
     if (r.status === 429 || r.status === 529 || r.status >= 500){
@@ -812,7 +816,9 @@ async function runLearnJob(id, appUrl){
       const msg = "📚 "+nm+" 유튜브 학습 완료 ("+(out.analyzed||0)+"편)\n\n"+blocks.join("\n\n")+"\n\n✅ 품질 공식이 갱신됐어요.";
       kakaoNotify(msg, String(appUrl||"")).catch(()=>{});
     } else {
-      kakaoNotify(title+what+"\n품질 공식이 갱신됐어요. 이제 결과물에 반영됩니다.", String(appUrl||"")).catch(()=>{});
+      const learnedSummary = String(out.knowledge||"").replace(/\r/g,"").split("\n").map(s=>s.trim()).filter(Boolean).slice(0,5).join("\n").slice(0,350);
+      const extra = learnedSummary ? ("\n\n📌 이번에 배운 것:\n"+learnedSummary) : "";
+      kakaoNotify(title+what+extra+"\n\n품질 공식이 갱신됐어요. 이제 결과물에 반영됩니다.", String(appUrl||"")).catch(()=>{});
     }
     // 학습 결과를 실제로 쓰려면 앱 자체를 바꿔야 하는지 팀장이 판단 → 필요하면 '승인 요청'(승인 전 적용 금지)
     if (j.kind==="youtube" || j.kind==="web" || j.kind==="deep"){
@@ -985,9 +991,9 @@ app.get("/api/learn/knowledge", (req,res)=>{
   res.json({ ok:true, all: Object.keys(DB.deptKnowledge||{}).map(d=>({ dept:d, source:(DB.deptKnowledge[d].benchmark||""), at:DB.deptKnowledge[d].at||0 })) });
 });
 // ===== 웹페이지(홈페이지·상세페이지) URL을 직접 학습시켜 부서 전문성에 반영 =====
-async function fetchPageText(url){
+async function fetchDirect(url){
   const ctrl = new AbortController();
-  const to = setTimeout(()=>{ try{ctrl.abort();}catch(_){}}, 25000);
+  const to = setTimeout(()=>{ try{ctrl.abort();}catch(_){}}, 22000);
   try{
     const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
     const r = await fetch(url, { signal:ctrl.signal, redirect:"follow", headers:{
@@ -995,12 +1001,7 @@ async function fetchPageText(url){
       "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8"
     }});
-    if(!r.ok){
-      const why = (r.status===403) ? "403 접속 차단(봇 차단 사이트 — 다른 페이지를 쓰세요)"
-               : (r.status===404) ? "404 주소를 찾을 수 없음"
-               : ("HTTP "+r.status);
-      throw new Error(why);
-    }
+    if(!r.ok) throw new Error("HTTP "+r.status);
     let html = await r.text();
     // 분석에 방해되는 것 제거(스크립트/주석/base64), 구조·카피·스타일 힌트는 보존
     html = html.replace(/<script[\s\S]*?<\/script>/gi, " ")
@@ -1010,6 +1011,28 @@ async function fetchPageText(url){
                .replace(/\s{2,}/g, " ");
     return html.slice(0, 60000);   // 토큰 보호
   } finally { clearTimeout(to); }
+}
+// 리더 프록시(Jina Reader) — 봇 차단·JS 전용 페이지도 대신 렌더해 깨끗한 텍스트로 반환(무료, 키 선택)
+async function fetchViaReader(url){
+  const ctrl = new AbortController();
+  const to = setTimeout(()=>{ try{ctrl.abort();}catch(_){}}, 30000);
+  try{
+    const headers = { "Accept":"text/plain", "X-Return-Format":"text", "X-Timeout":"25" };
+    if(process.env.JINA_API_KEY) headers["Authorization"] = "Bearer "+process.env.JINA_API_KEY;   // 있으면 한도 상향(없어도 무료 동작)
+    const r = await fetch("https://r.jina.ai/"+url, { signal:ctrl.signal, redirect:"follow", headers });
+    if(!r.ok) throw new Error("reader HTTP "+r.status);
+    const t = await r.text();
+    return String(t||"").replace(/\s{3,}/g," ").slice(0, 60000);
+  } finally { clearTimeout(to); }
+}
+// 페이지 본문 가져오기: ① 직접 → 부족/차단 시 ② 리더 프록시로 폴백(봇 차단 커머스 사이트 대응)
+async function fetchPageText(url){
+  let direct = "";
+  try{ direct = await fetchDirect(url); }catch(e){ direct = ""; }
+  if(direct && direct.length > 500) return direct;              // 직접 본문이 충분하면 사용
+  try{ const rd = await fetchViaReader(url); if(rd && rd.length > 200) return rd; }catch(_){}   // 차단·JS전용 → 리더
+  if(direct && direct.length > 200) return direct;              // 리더도 실패 시 직접본문이라도
+  throw new Error("페이지를 가져오지 못했어요 (봇 차단·JS 전용·로그인 필요일 수 있어요)");
 }
 // ===== 무료 웹조사 계층 =====
 // DuckDuckGo 결과 HTML에서 결과 URL 추출(리다이렉트 uddg 디코딩 + 직접링크 폴백)
@@ -1124,7 +1147,7 @@ app.post("/api/learn/web-apply", (req,res)=>{
 // 학습 작업 목록(학습 탭에서 이력 표시)
 app.get("/api/learn/list", (req,res)=>{
   res.json({ ok:true, jobs:(DB.learnJobs||[]).slice(-12).map(j=>({
-    id:j.id, kind:j.kind, dept:j.dept, status:j.status, at:j.at, doneAt:j.doneAt||0,
+    id:j.id, kind:j.kind, dept:j.dept, status:j.status, at:j.at, doneAt:j.doneAt||0, startedAt:j.startedAt||0, step:j.step||"",
     error:j.error||"", analyzed:j.analyzed||0, urls:(j.urls||[]).length })) });
 });
 // ===== 🏢 전 부서 협업 심화 학습 =====
@@ -4362,7 +4385,12 @@ async function runTrainingRound(n){
   // 모든 부서가 골고루 훈련되도록 '오래 훈련 안 한 순'으로 정렬(공평 순환). 동률이면 경험치 낮은 부서 먼저.
   cands.sort((x,y)=> ((DB.lastTrainAt[x]||0)-(DB.lastTrainAt[y]||0)) || (((DB.exp&&DB.exp[x])||0)-((DB.exp&&DB.exp[y])||0)));
   const picked=cands.slice(0,cap); const done=[];
-  for(const d of picked){ try{ const r=await runSelfTraining(d); if(r) done.push(r.name); }catch(e){ logError("train:"+d, e); } }
+  for(const d of picked){ try{ const r=await runSelfTraining(d); if(r){
+    const t=String(r.transcript||"");
+    const m=t.match(/훈련\s*주제[:\s]*([^\n]+)/);
+    const what = m ? m[1].trim() : ((r.principles&&r.principles.length) ? r.principles[0] : t.replace(/\s+/g," ").slice(0,90));
+    done.push({ name:r.name, what:String(what||"").slice(0,100) });
+  } }catch(e){ logError("train:"+d, e); } }
   ensureLeaderLead(); saveDB();
   return done;
 }
@@ -4372,7 +4400,7 @@ app.post("/api/ops/train", async (req,res)=>{
     if(b.dept && AGENTS[b.dept]){ const r=await runSelfTraining(b.dept); return res.json({ ok:true, trained:r?[r.name]:[], detail:r }); }
     const all=Object.keys(AGENTS).filter(d=>d!=="ops" && (DB.deptMemory[d]||[]).length>=2).length;
     const done=await runTrainingRound(b.all?all:(b.n||2));
-    res.json({ ok:true, trained:done });
+    res.json({ ok:true, trained:done.map(x=>x.name), details:done });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 
@@ -5869,7 +5897,7 @@ setInterval(async ()=>{
       const everyH = Number.isFinite(+st2.kShareEveryH) ? Math.max(6, +st2.kShareEveryH) : 48;
       if (Date.now() - (DB.lastKShareAt||0) >= everyH*3600000) {
         DB.lastKShareAt = Date.now(); saveDB(); // 선점
-        runKnowledgeShare("gemini").then(r=>{ try{ kakaoNotify("🤝 부서 지식 공유 세션 완료 — "+((r.learnings||[]).length)+"개 부서가 서로 배움"); }catch(_){} console.log("자동 지식 공유 완료"); }).catch(e=>logError("auto-kshare", e));
+        runKnowledgeShare("gemini").then(r=>{ try{ var lg=(r.learnings||[]); var body=lg.length?("\n\n"+lg.map(x=>"· "+x.name+": "+String(x.learn||"").slice(0,90)).join("\n")):""; kakaoNotify("🤝 부서 지식 공유 세션 완료 — "+lg.length+"개 부서가 서로 배움"+body); }catch(_){} console.log("자동 지식 공유 완료"); }).catch(e=>logError("auto-kshare", e));
       }
     }
   } catch(e){ /* 지식공유 실패 무시 */ }
@@ -5902,7 +5930,7 @@ setInterval(async ()=>{
       const everyH = Number.isFinite(+st3.trainEveryH) ? Math.max(2, +st3.trainEveryH) : 12;
       if (Date.now() - (DB.lastTrainRoundAt||0) >= everyH*3600000) {
         DB.lastTrainRoundAt = Date.now(); saveDB(); // 선점
-        runTrainingRound(2).then(done=>{ if(done&&done.length){ try{ kakaoNotify("🏋️ 지식 훈련 — "+done.join(", ")+" 부서가 스스로 실력을 단련했어요"); }catch(_){} } console.log("자기 훈련 라운드 완료"); }).catch(e=>logError("auto-train", e));
+        runTrainingRound(2).then(done=>{ if(done&&done.length){ try{ kakaoNotify("🏋️ 지식 훈련 — 부서가 스스로 실력을 단련했어요\n\n"+done.map(x=>"· "+x.name+": "+x.what).join("\n")); }catch(_){} } console.log("자기 훈련 라운드 완료"); }).catch(e=>logError("auto-train", e));
       }
     }
   } catch(e){ /* 훈련 실패 무시 */ }
