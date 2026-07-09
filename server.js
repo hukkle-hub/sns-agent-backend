@@ -4697,7 +4697,13 @@ async function runNightResearch(){
   }
   DB.lastNightResearchDay = today;
   saveDB();
-  if(n>0) kakaoNotify("🌌 야간 연구 완료 — 오세라가 "+n+"개 부서 자료를 정리했어요"+(searched>0?(" (웹검색 "+searched+"건 포함)"):"")+". 아침 지시에 반영돼요.").catch(()=>{});
+  if(n>0){
+    const lines = ordered.filter(d=>DB.nightResearch[d] && DB.nightResearch[d].day===today).slice(0,6).map(d=>{
+      const nr=DB.nightResearch[d]; const icon = nr.searched ? "🔎" : "📖";
+      return icon+" "+(AGENTS[d]?AGENTS[d].kr:d)+": "+String(nr.text||"").replace(/\s+/g," ").slice(0,80);
+    }).join("\n");
+    kakaoNotify("🌌 야간 연구 완료 — 오세라가 "+n+"개 부서 자료를 정리했어요"+(searched>0?(" (웹검색 "+searched+"건 포함)"):"")+"\n\n"+lines+"\n\n↑ 아침 지시에 반영돼요. (🔎=웹조사 / 📖=지식기반)").catch(()=>{});
+  }
   return DB.nightResearch;
 }
 app.post("/api/ops/night-research", async (req,res)=>{
@@ -4811,9 +4817,11 @@ async function runDailyGrowth(){
   DB.lastDailyGrowthDay=kstDay();
   DB.growBurst.active=false; DB.growBurst.finishedAt=Date.now(); saveDB();
   try{
-    const behind=depts.filter(d=>planRounds[d]>1).length;
+    const behindList=depts.filter(d=>planRounds[d]>1);
+    const behind=behindList.length;
     if(behind>0){
-      kakaoNotify("📅 매일 자동 성장 완료 — 뒤처진 "+behind+"개 부서를 집중 훈련해 격차를 좁혔어요(무료).");
+      const names=behindList.map(d=>(AGENTS[d]?AGENTS[d].kr:d)+"("+planRounds[d]+"라운드)").join(", ");
+      kakaoNotify("📅 매일 자동 성장 완료 — 뒤처진 "+behind+"개 부서를 집중 훈련해 격차를 좁혔어요(무료)\n\n집중 훈련: "+names+"\n\n↑ 약한 부서를 더 돌려 전 부서 수준을 끌어올렸어요.");
     } else {
       kakaoNotify("📅 매일 자동 성장 완료 — 전 부서가 고르게 성장 중이라 뒤처진 부서 없이 균등 훈련했어요(무료).");
     }
@@ -6140,7 +6148,11 @@ setInterval(async ()=>{
       DB.benchmarkTurn = (DB.benchmarkTurn+1) % order.length;
       saveDB(); // 선점(중복 실행 방지)
       learnFromBenchmark(dept).then(r=>{
-        if(r&&r.ok){ try{ kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 '"+r.benchmark+"'를 학습해 품질 공식을 갱신했어요"); }catch(_){}
+        if(r&&r.ok){ try{
+            const learned=String(r.knowledge||"").replace(/\r/g,"").split("\n").map(s=>s.trim()).filter(Boolean).slice(0,4).join("\n").slice(0,300);
+            const src=(r.sources&&r.sources.length)?("\n\n출처: "+r.sources.map(s=>s.title||s.uri).slice(0,2).join(" · ")):"";
+            kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 '"+r.benchmark+"'를 학습해 품질 공식을 갱신했어요"+(learned?("\n\n📌 배운 것:\n"+learned):"")+src);
+          }catch(_){}
           console.log("벤치마크 학습 완료: "+dept); }
         else { console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note)); DB.lastBenchmarkDay=""; saveDB(); } // 실패 시 오늘 재시도 허용
       }).catch(e=>{ logError("benchmark-learn", e); DB.lastBenchmarkDay=""; try{saveDB();}catch(_){} });
@@ -6485,7 +6497,8 @@ async function autoRunDept(dept, directive){
   DB.collections.push({ id:Date.now()+Math.floor(Math.random()*1000), topic:"["+a.kr+"] "+baseFocus, text:note, at:Date.now(), dept });
   if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
   saveDB();
-  kakaoNotify("📚 "+a.kr+(directive?" 자율 지시 수행 +1 (경험치 ":" 자율 학습 +1 (경험치 ")+DB.exp[dept]+")").catch(()=>{});
+  const didSummary = String(note||"").replace(/\s+/g," ").slice(0,90);
+  kakaoNotify("📚 "+a.kr+(directive?" 자율 지시 수행 +1":" 자율 학습 +1")+" (경험치 "+DB.exp[dept]+")"+(baseFocus?("\n주제: "+String(baseFocus).slice(0,60)):"")+(didSummary?("\n한 일: "+didSummary):"")).catch(()=>{});
 }
 
 // 지금 자율수행 1회 실행(수동 트리거) — 무료 서버 슬립으로 주기가 안 돌 때 직접 실행
@@ -6746,25 +6759,29 @@ const PORT = process.env.PORT || 3000;
     });
     if(_migrated){ try{ saveDB(); }catch(e){} console.log("부서 재편 마이그레이션 적용됨(커뮤니티·CS 삭제 / 그로스→커머스 흡수)"); }
   } catch(e){ logError("dept-migration", e); }
-  // 서버 재시작으로 중단된 작업 복원: 회의·발행은 정리(error), 학습·상품페이지·변환은 입력이 남아 있으면 자동 재개
-  let _orphan = 0, _resumed = 0;
-  (DB.meetings||[]).forEach(function(m){ if(m && m.status==="running"){ m.status="error"; m.error="서버 재시작으로 중단됨"; _orphan++; } });
-  (DB.jobs||[]).forEach(function(j){ if(j && j.status==="running"){ j.status="error"; j.error="서버 재시작으로 중단됨"; _orphan++; } });
-  function _recoverJobs(arr, runner, label){
-    (arr||[]).forEach(function(j){
-      if(!j || (j.status!=="running" && j.status!=="queued")) return;
-      j.resumeCount = (j.resumeCount||0) + 1;
-      if(j.resumeCount > 2){ j.status="error"; j.error="서버 재시작이 반복돼 중단됐어요(재개 2회 초과)"; j.doneAt=Date.now(); _orphan++; return; }
-      j.status="queued"; j.step="서버 재시작 후 재개 대기 중"; j.startedAt=0; _resumed++;
-      setImmediate(()=>{ runner(j.id, "").catch(e=>logError(label, e)); });
-    });
-  }
-  _recoverJobs(DB.learnJobs, runLearnJob, "resume-learn");
-  _recoverJobs(DB.pageJobs, runPageJob, "resume-page");
-  _recoverJobs(DB.repurposeJobs, runRepurposeJob, "resume-repurpose");
-  if(_orphan||_resumed){ try{ saveDB(); }catch(e){} console.log("재시작 복원 — 자동 재개 "+_resumed+"건, 정리 "+_orphan+"건"); }
-  if(_resumed){ try{ kakaoNotify("🔄 서버 재시작 감지 — 중단됐던 작업 "+_resumed+"건을 자동으로 다시 시작했어요.").catch(()=>{}); }catch(e){} }
   app.listen(PORT, ()=> console.log("SNS 에이전트 백엔드 listening on " + PORT + (useSupabase?" (Supabase)":" (file)")));
+  // 서버가 뜬 뒤(listen 성공 후)에만 중단 작업 복원 — 복원 로직의 어떤 오류도 서버 기동을 막지 못하게 try/catch + 지연
+  setTimeout(function(){
+    try{
+      let _orphan = 0, _resumed = 0;
+      (DB.meetings||[]).forEach(function(m){ if(m && m.status==="running"){ m.status="error"; m.error="서버 재시작으로 중단됨"; _orphan++; } });
+      (DB.jobs||[]).forEach(function(j){ if(j && j.status==="running"){ j.status="error"; j.error="서버 재시작으로 중단됨"; _orphan++; } });
+      function _recoverJobs(arr, runner, label){
+        (arr||[]).forEach(function(j){
+          if(!j || (j.status!=="running" && j.status!=="queued")) return;
+          j.resumeCount = (j.resumeCount||0) + 1;
+          if(j.resumeCount > 2){ j.status="error"; j.error="서버 재시작이 반복돼 중단됐어요(재개 2회 초과)"; j.doneAt=Date.now(); _orphan++; return; }
+          j.status="queued"; j.step="서버 재시작 후 재개 대기 중"; j.startedAt=0; _resumed++;
+          setImmediate(function(){ try{ runner(j.id, "").catch(function(e){ logError(label, e); }); }catch(e){ logError(label, e); } });
+        });
+      }
+      _recoverJobs(DB.learnJobs, runLearnJob, "resume-learn");
+      _recoverJobs(DB.pageJobs, runPageJob, "resume-page");
+      _recoverJobs(DB.repurposeJobs, runRepurposeJob, "resume-repurpose");
+      if(_orphan||_resumed){ try{ saveDB(); }catch(e){} console.log("재시작 복원 — 자동 재개 "+_resumed+"건, 정리 "+_orphan+"건"); }
+      if(_resumed){ try{ kakaoNotify("🔄 서버 재시작 감지 — 중단됐던 작업 "+_resumed+"건을 자동으로 다시 시작했어요.").catch(function(){}); }catch(e){} }
+    }catch(e){ try{ logError("boot-recover", e); }catch(_){} }
+  }, 4000);
   // ── 자기-핑(self keep-alive): 서버가 스스로 자기 URL을 주기적으로 호출해 무료 슬립(15분)을 막음 ──
   // Render는 RENDER_EXTERNAL_URL을 자동 제공. 직접 지정하려면 SELF_URL 환경변수 사용.
   try {
