@@ -579,6 +579,22 @@ const DEPT_BENCHMARK = {
     "요즘 뜨는 쇼츠", "바이럴 챌린지 2026", "로컬 콘텐츠 인기 영상" ] }
 };
 // 부서가 웹에서 벤치마크를 조사·분석해 '품질 공식'을 지식에 축적 (자동·무료 Gemini 검색)
+// 지식 저장 가드: 병합 결과가 비었거나 비정상적으로 짧으면(=LLM 절단·실패) 충실한 기존 지식을 덮어쓰지 않고 보존한다.
+// (URL/벤치마크 학습은 이미 prior를 프롬프트에 넣어 병합하지만, 병합 산출물이 손상됐을 때의 소실만 여기서 막는다)
+function commitKnowledge(dept, newText, benchmark){
+  DB.deptKnowledge = DB.deptKnowledge || {};
+  const prev = DB.deptKnowledge[dept] || null;
+  const prior = (prev && prev.text) || "";
+  const nt = String(newText||"").trim();
+  if (prior && prior.length > 200 && nt.length < 80){
+    if (prev) prev.at = Date.now();          // 학습 시도 시각만 갱신, 내용은 기존 보존
+    return { saved:false, kept:true };
+  }
+  DB.deptKnowledge[dept] = { text: nt || prior, at:Date.now(),
+    basis:(DB.deptMemory[dept]||[]).length, exp:(DB.exp&&DB.exp[dept])||0,
+    benchmark: benchmark||"", learned:true };
+  return { saved:true };
+}
 async function learnFromBenchmark(dept){
   try{
     const a=AGENTS[dept]; const bm=DEPT_BENCHMARK[dept];
@@ -631,8 +647,7 @@ async function learnFromBenchmark(dept){
       + "형식(이 형식만, 한국어):\n핵심 품질 공식: (결과물을 고품질로 만드는 구체 기준 5~8개, 재사용 가능한 체크리스트로)\n반드시 지킬 것: (빠뜨리면 티 나는 필수 요소 3~5개)\n피해야 할 것: (아마추어 티 나는 실수 2~4개)\n다음 학습 과제: (아직 부족해 더 배워야 할 것 1~2개)";
     const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[방금 조사한 고품질 사례]\n"+research;
     const formula = await anthropic(sys, ctx, 1800); // 품질 추출은 고품질 엔진(Claude)으로
-    DB.deptKnowledge = DB.deptKnowledge || {};
-    DB.deptKnowledge[dept] = { text: formula, at:Date.now(), basis:(DB.deptMemory[dept]||[]).length, exp:(DB.exp&&DB.exp[dept])||0, benchmark:bm.what, learned:true };
+    commitKnowledge(dept, formula, bm.what);
     // 학습 기록 남기기(성장 체감) + 경험치
     DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
     DB.deptMemory[dept].push({ at:Date.now(), instruction:"[벤치마크 학습] "+bm.what, note:"조사: "+query+" → 품질 공식 갱신" });
@@ -691,9 +706,7 @@ async function learnFromYouTubeUrls(dept, urls){
     + "형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
   const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[방금 직접 분석한 유튜브 영상]\n"+okNotes.join("\n\n");
   const formula = await anthropic(sys, ctx, 1800);
-  DB.deptKnowledge = DB.deptKnowledge || {};
-  DB.deptKnowledge[dept] = { text:formula, at:Date.now(), basis:(DB.deptMemory[dept]||[]).length,
-    exp:(DB.exp&&DB.exp[dept])||0, benchmark:"유튜브 영상 직접 학습("+okNotes.length+"편)", learned:true };
+  commitKnowledge(dept, formula, "유튜브 영상 직접 학습("+okNotes.length+"편)");
   DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:"[유튜브 영상 학습]", note:okNotes.length+"편 분석 → 품질 공식 갱신" });
   if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
@@ -920,9 +933,7 @@ async function learnFromWebUrls(dept, urls){
     + "기존 축적 전문성과 통합·발전시켜라. 형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
   const ctx = "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[분석할 실제 웹페이지]\n"+notes.join("\n\n---\n\n");
   const formula = await anthropic(sys, ctx, 1800);
-  DB.deptKnowledge = DB.deptKnowledge || {};
-  DB.deptKnowledge[dept] = { text:formula, at:Date.now(), basis:(DB.deptMemory[dept]||[]).length,
-    exp:(DB.exp&&DB.exp[dept])||0, benchmark:"웹페이지 직접 학습("+notes.length+"개)", learned:true };
+  commitKnowledge(dept, formula, "웹페이지 직접 학습("+notes.length+"개)");
   DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:"[웹페이지 학습]", note:notes.length+"개 분석 → 품질 공식 갱신" });
   if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
@@ -1643,9 +1654,7 @@ async function autoRouteLearn(urls, srcKind, onStep){
       + "추상적 조언 금지, 바로 실행 가능한 구체 기준으로.\n"
       + "형식(이 형식만, 한국어):\n핵심 품질 공식: (5~8개 체크리스트)\n반드시 지킬 것: (3~5개)\n피해야 할 것: (2~4개)\n다음 학습 과제: (1~2개)";
     const formula = await anthropic(sys, "[기존 축적 전문성]\n"+(prior||"(아직 없음)")+"\n\n[분석한 자료]\n"+material.slice(0,16000), 1800);
-    DB.deptKnowledge = DB.deptKnowledge || {};
-    DB.deptKnowledge[p.dept] = { text:formula, at:Date.now(), basis:(DB.deptMemory[p.dept]||[]).length,
-      exp:(DB.exp&&DB.exp[p.dept])||0, benchmark:"자동배정 학습("+mat.kind+")", learned:true };
+    commitKnowledge(p.dept, formula, "자동배정 학습("+mat.kind+")");
     DB.deptMemory = DB.deptMemory||{}; DB.deptMemory[p.dept] = DB.deptMemory[p.dept]||[];
     DB.deptMemory[p.dept].push({ at:Date.now(), instruction:"[자동배정 학습]", note:(p.focus||"").slice(0,80) });
     if(DB.deptMemory[p.dept].length>40) DB.deptMemory[p.dept]=DB.deptMemory[p.dept].slice(-40);
