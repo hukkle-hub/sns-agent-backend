@@ -1299,9 +1299,13 @@ async function deepLearnPipeline(job){
     const gapsTxt = gapsList.length
       ? gapsList.map((g,i)=>(i+1)+". "+g).join("\n")
       : "· 참고자료(벤치마크) 대비 우리 예제에서 약한 부분을 스스로 찾아 구체적으로 개선하라: 구성·정보 위계, 여백·타이포, 카피의 설득력, CTA 명확성, 디테일·완성도. 현재 "+score+"점 → 85점 이상을 목표로 확실히 끌어올려라.";
+    // 파서가 라벨 없는 산문 지적('0~2초 훅 부재' 등)을 놓칠 수 있어, 검수 원문도 함께 주입(중복은 무해)
+    const rawFeedback = String(rawR||"").replace(/```[a-z]*|```/g,"").replace(/\s{2,}/g," ").trim().slice(0,1200);
+    const fixBlock = "[검수부 지적사항 — 아래를 하나도 빠짐없이 반영해 고쳐라]\n"+gapsTxt
+      + (rawFeedback ? ("\n\n[검수부 원문 피드백(구체 지시 포함) — 여기 적힌 훅 문구·수치 노출 타이밍·UI 가시화 등 모든 지시를 실제로 반영]\n"+rawFeedback) : "");
     const example2 = stripFences(await anthropic(
-      sysC + "\n\n[검수부 지적사항 — 반드시 전부 반영]\n"+gapsTxt,
-      "[이전 예제]\n"+example.slice(0,9000)+"\n\n위 예제를 지적사항대로 고쳐 더 높은 수준으로 다시 만들어라.", 3000));
+      sysC + "\n\n"+fixBlock,
+      "[이전 예제]\n"+example.slice(0,9000)+"\n\n위 예제를 위 지적사항대로 구체적으로 고쳐 더 높은 수준으로 다시 만들어라. 지적된 항목은 반드시 결과물에서 확인 가능해야 한다.", 3000));
     setStep("검수부가 재채점 중 (2라운드)");
     const rawR2 = await anthropic(sysR, "[참고자료(벤치마크)]\n"+material.slice(0,10000)+"\n\n[우리 예제]\n"+example2.slice(0,10000), 900);
     const review2 = parseReviewScore(rawR2, review);
@@ -6832,28 +6836,25 @@ const PORT = process.env.PORT || 3000;
     if(_migrated){ try{ saveDB(); }catch(e){} console.log("부서 재편 마이그레이션 적용됨(커뮤니티·CS 삭제 / 그로스→커머스 흡수)"); }
   } catch(e){ logError("dept-migration", e); }
   app.listen(PORT, ()=> console.log("SNS 에이전트 백엔드 listening on " + PORT + (useSupabase?" (Supabase)":" (file)")));
-  // 서버가 뜬 뒤(listen 성공 후)에만 중단 작업 복원 — 복원 로직의 어떤 오류도 서버 기동을 막지 못하게 try/catch + 지연
+  // 서버가 뜬 뒤(listen 성공 후)에만 실행 — 중단된 작업은 '되살리지 않고' 안전하게 정리만 한다.
+  // (자동 재실행은 실패 작업이 서버를 반복 불안정하게 만들 수 있어 제거했다. 사용자가 다시 누르면 됨)
   setTimeout(function(){
     try{
-      let _orphan = 0, _resumed = 0;
-      (DB.meetings||[]).forEach(function(m){ if(m && m.status==="running"){ m.status="error"; m.error="서버 재시작으로 중단됨"; _orphan++; } });
-      (DB.jobs||[]).forEach(function(j){ if(j && j.status==="running"){ j.status="error"; j.error="서버 재시작으로 중단됨"; _orphan++; } });
-      function _recoverJobs(arr, runner, label){
+      let _orphan = 0;
+      function _cleanup(arr, label){
         (arr||[]).forEach(function(j){
           if(!j || (j.status!=="running" && j.status!=="queued")) return;
-          j.resumeCount = (j.resumeCount||0) + 1;
-          if(j.resumeCount > 2){ j.status="error"; j.error="서버 재시작이 반복돼 중단됐어요(재개 2회 초과)"; j.doneAt=Date.now(); _orphan++; return; }
-          j.status="queued"; j.step="서버 재시작 후 재개 대기 중"; j.startedAt=0; _resumed++;
-          setImmediate(function(){ try{ runner(j.id, "").catch(function(e){ logError(label, e); }); }catch(e){ logError(label, e); } });
+          j.status="error"; j.error="서버 재시작으로 중단됐어요 — 다시 시도해 주세요"; j.doneAt=Date.now(); _orphan++;
         });
       }
-      _recoverJobs(DB.learnJobs, runLearnJob, "resume-learn");
-      _recoverJobs(DB.pageJobs, runPageJob, "resume-page");
-      _recoverJobs(DB.repurposeJobs, runRepurposeJob, "resume-repurpose");
-      _recoverJobs(DB.videoJobs, runVideoPlanJob, "resume-video");
-      if(_orphan||_resumed){ try{ saveDB(); }catch(e){} console.log("재시작 복원 — 자동 재개 "+_resumed+"건, 정리 "+_orphan+"건"); }
-      if(_resumed){ try{ kakaoNotify("🔄 서버 재시작 감지 — 중단됐던 작업 "+_resumed+"건을 자동으로 다시 시작했어요.").catch(function(){}); }catch(e){} }
-    }catch(e){ try{ logError("boot-recover", e); }catch(_){} }
+      (DB.meetings||[]).forEach(function(m){ if(m && m.status==="running"){ m.status="error"; m.error="서버 재시작으로 중단됨"; _orphan++; } });
+      _cleanup(DB.jobs, "publish");
+      _cleanup(DB.learnJobs, "learn");
+      _cleanup(DB.pageJobs, "page");
+      _cleanup(DB.repurposeJobs, "repurpose");
+      _cleanup(DB.videoJobs, "video");
+      if(_orphan){ try{ saveDB(); }catch(e){} console.log("재시작 정리 — 중단 작업 "+_orphan+"건 error 처리(재실행 안 함)"); }
+    }catch(e){ try{ logError("boot-cleanup", e); }catch(_){} }
   }, 4000);
   // ── 자기-핑(self keep-alive): 서버가 스스로 자기 URL을 주기적으로 호출해 무료 슬립(15분)을 막음 ──
   // Render는 RENDER_EXTERNAL_URL을 자동 제공. 직접 지정하려면 SELF_URL 환경변수 사용.
