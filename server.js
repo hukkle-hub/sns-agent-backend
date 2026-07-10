@@ -346,6 +346,14 @@ async function anthropic(system, user, maxTokens = 1500, images){
 }
 function logError(where, e){
   const msg = String((e && e.message) || e);
+  // Gemini 무료 한도는 '오류'가 아니라 '잠시 쉼'(다음 주기 자동 재시도) → 오류 집계에서 제외, 따로 카운트
+  if(/무료한도|무료 한도|rate-limited|exceeded your current quota|RESOURCE_EXHAUSTED|429/i.test(msg)){
+    DB.rateWaits = DB.rateWaits || [];
+    DB.rateWaits.push({ at:Date.now(), where });
+    if (DB.rateWaits.length > 100) DB.rateWaits = DB.rateWaits.slice(-100);
+    saveDB();
+    return;
+  }
   DB.errors = DB.errors || [];
   DB.errors.push({ at:Date.now(), where, msg });
   if (DB.errors.length > 200) DB.errors = DB.errors.slice(-200);
@@ -612,7 +620,8 @@ function recordLearnLog(entry){
     if(DB.learnLog.length > 60) DB.learnLog = DB.learnLog.slice(-60);
   }catch(_){}
 }
-async function learnFromBenchmark(dept){
+async function learnFromBenchmark(dept, setStep){
+  const _step = (typeof setStep==="function")?setStep:function(){};
   try{
     const a=AGENTS[dept]; const bm=DEPT_BENCHMARK[dept];
     if(!a || !bm) return { ok:false, note:"벤치마크 미정의" };
@@ -622,6 +631,7 @@ async function learnFromBenchmark(dept){
     const qi = ((DB.learnIdx||0)) % bm.queries.length;
     DB.learnIdx = (DB.learnIdx||0)+1;
     const query = bm.queries[qi];
+    _step((a?a.kr:dept)+" 부서 웹 조사 중: "+String(query).slice(0,30));
     let research="", sources=[], ytNote="", searchErr="", ytErr="", researchVia="";
     try{
       const s = await researchWeb("아래 주제를 실제 웹에서 조사해 핵심만 정리하라. 특히 '무엇이 이것을 고품질로 만드는가'의 구체적 요소(구조·구성·디자인·카피·수치 기준)를 뽑아라.\n주제: "+query, 1400);
@@ -631,6 +641,7 @@ async function learnFromBenchmark(dept){
     }catch(e){ searchErr = String(e.message||e).slice(0,140); }   // 실제 오류 보존(원인 파악용)
     // 유튜브 영상 학습(정의된 부서만): 인기 영상 1편을 화면까지 실제로 분석해 재료에 추가
     if (bm.ytSearch && bm.ytSearch.length){
+      _step((a?a.kr:dept)+" 부서 유튜브 사례 분석 중");
       try{
         const yq = bm.ytSearch[((DB.learnIdx||1)-1) % bm.ytSearch.length];
         let vids = await ytSearchTop(yq, 3);
@@ -655,6 +666,7 @@ async function learnFromBenchmark(dept){
       return { ok:false, note:"조사 결과 없음 — "+(why||"웹검색·유튜브 모두 실패(원인 미상)") };
     }
     research = (research||"") + ytNote;
+    _step((a?a.kr:dept)+" 부서 품질 공식 추출 중");
     // 2) 조사 내용을 '이 부서가 결과물에 바로 적용할 품질 공식'으로 추출 → 기존 지식에 통합 (고품질 엔진=Claude)
     const prior = knowledgeText(dept);
     const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 방금 '"+bm.what+"'에 대해 최고 수준의 실제 사례를 조사했다. "
@@ -671,6 +683,7 @@ async function learnFromBenchmark(dept){
     DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3; // 벤치마크 학습은 실무보다 큰 성장(+3)
     saveDB();
     await absorbToLeader([dept], "웹 벤치마크");   // 팀장이 이 부서 학습을 흡수
+    recordLearnLog({ dept, deptKr:a.kr, kind:"benchmark", ok:true, benchmark:bm.what, query, sources:sources.slice(0,3), note:"벤치마크 조사("+(researchVia||"?")+") → 품질 공식 갱신" });
     return { ok:true, dept, benchmark:bm.what, query, sources: sources.slice(0,4), knowledge: formula };
   }catch(e){ logError("learnFromBenchmark:"+dept, e); return { ok:false, note:String(e.message||e).slice(0,100) }; }
 }
@@ -724,12 +737,14 @@ async function learnFromYouTubeVideo(url){
   // JSON 파싱 실패 시에도 원문 관찰은 보존(구조화만 실패)
   return { url, ok:true, unstructured:true, keyMoments:[], keyPoint:"", understanding:"", reasoning:"", vision:"", raw: clip(raw,900) };
 }
-async function learnFromYouTubeUrls(dept, urls){
+async function learnFromYouTubeUrls(dept, urls, setStep){
+  const _step = (typeof setStep==="function")?setStep:function(){};
   const a = AGENTS[dept]; const bm = DEPT_BENCHMARK[dept];
   if(!a) throw new Error("유효한 부서가 아닙니다");
   if(!geminiKey()) throw new Error("GEMINI_API_KEY 미설정 — 영상 분석 불가");
   const list = (urls||[]).slice(0,3);
   if(!list.length) throw new Error("분석할 유튜브 URL이 없습니다");
+  _step("유튜브 영상 "+list.length+"편 분석 중");
   const videos = [];   // 영상별 구조화 학습 결과(어디서 → 요점 → 이해 → 추리 → 비전)
   for (const u of list){
     try{ videos.push(await learnFromYouTubeVideo(u)); }
@@ -789,10 +804,10 @@ async function runLearnJob(id, appUrl){
     const setStep = (st)=>{ try{ j.step=st; saveDB(); }catch(_){} };
     const isAuto = (j.dept==="auto") && (j.kind==="youtube" || j.kind==="web");
     const out = isAuto              ? await autoRouteLearn(j.urls||[], j.kind, setStep)
-              : (j.kind==="youtube") ? await learnFromYouTubeUrls(j.dept, j.urls||[])
-              : (j.kind==="web")     ? await learnFromWebUrls(j.dept, j.urls||[])
+              : (j.kind==="youtube") ? await learnFromYouTubeUrls(j.dept, j.urls||[], setStep)
+              : (j.kind==="web")     ? await learnFromWebUrls(j.dept, j.urls||[], setStep)
               : (j.kind==="deep")    ? await deepLearnPipeline(j)
-              : await learnFromBenchmark(j.dept);
+              : await learnFromBenchmark(j.dept, setStep);
     if(!out || out.ok===false) throw new Error((out&&out.note)||"학습 보류");
     j.status="done"; j.doneAt=Date.now(); j.knowledge=out.knowledge||""; j.analyzed=out.analyzed||0; j.step="완료";
     if(j.kind==="deep"){ j.result = { goal:out.goal, kind:out.kind, round:out.round, score:out.score, scored:out.scored,
@@ -1103,19 +1118,23 @@ async function researchWeb(query, maxTok, mode){
   try{ const t = await geminiText("아래 주제를 아는 범위에서 핵심만 정리하라(지금은 웹조사가 불가한 상태): "+query, want); if(t && t.trim()) return { text:t.trim(), sources:[], via:"model" }; }catch(_){}
   throw new Error("web-research 실패"+(groundErr?(": "+groundErr):""));
 }
-async function learnFromWebUrls(dept, urls){
+async function learnFromWebUrls(dept, urls, setStep){
+  const _step = (typeof setStep==="function")?setStep:function(){};
   const a = AGENTS[dept];
   if(!a) throw new Error("유효한 부서가 아닙니다");
   const list = (urls||[]).slice(0,3);
   if(!list.length) throw new Error("분석할 웹페이지 URL이 없습니다");
   const notes = [];
+  let _i=0;
   for (const u of list){
+    _i++; _step("웹페이지 "+_i+"/"+list.length+" 읽는 중");
     try{
       const html = await fetchPageText(u);
       if(html && html.length>200) notes.push("[페이지] "+u+"\n"+html);
     }catch(e){ /* 실패한 URL은 건너뜀 */ }
   }
   if(!notes.length) throw new Error("페이지를 가져오지 못했어요 (접속 차단·로그인 필요·잘못된 주소)");
+  _step("웹페이지 품질 공식 추출 중");
   const prior = knowledgeText(dept);
   const sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 전문가다. 아래는 실제 웹페이지의 HTML이다. "
     + "이 페이지가 '무엇 때문에 고품질인지'를 분석해, 우리가 결과물을 만들 때 그대로 적용할 구체적 품질 공식·체크리스트를 뽑아라. "
@@ -1131,6 +1150,7 @@ async function learnFromWebUrls(dept, urls){
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3;
   saveDB();
   await absorbToLeader([dept], "웹페이지");   // 팀장이 이 부서 학습을 흡수
+  recordLearnLog({ dept, deptKr:(AGENTS[dept]?AGENTS[dept].kr:dept), kind:"web", ok:true, analyzed:notes.length, urls:(urls||[]).slice(0,4), note:notes.length+"개 웹페이지 분석 → 품질 공식 갱신" });
   return { ok:true, dept, analyzed:notes.length, knowledge:formula };
 }
 app.post("/api/learn/web-apply", (req,res)=>{
@@ -1350,6 +1370,8 @@ async function deepLearnPipeline(job){
   saveDB();
   setStep("팀장이 전 부서 학습을 흡수해 총괄 기준 갱신 중");
   await absorbToLeader(updated, "협업 심화학습");
+  recordLearnLog({ dept:"ops", deptKr:"전 부서(팀장)", kind:"deep", ok:true, score:(scored?score:null),
+    analyzed:(picked||[]).length, note:"협업 심화학습("+mat.kind+") — "+(scored?(score+"점 · "):"")+updated.length+"개 부서 갱신", goal:String(goal||"").slice(0,80) });
   saveDB();
   return { ok:true, goal, kind:mat.kind, round, score, scored,
     depts: picked.map(p=>({ dept:p.dept, kr:AGENTS[p.dept].kr, focus:p.focus||"" })),
@@ -3878,6 +3900,7 @@ app.post("/api/webtoon/create", async (req,res)=>{
 // ===== HTML 상품페이지 생성 (커머스·그로스 부서의 학습된 품질 공식을 실제 페이지로) =====
 async function productPagePipeline(body, setStep){
   const _step = (typeof setStep==="function") ? setStep : function(){};
+  let j_visualDirection = null;
   _step("상품 정보·품질공식 준비 중");
   const d="monetization"; const a=AGENTS[d];
   const product = String(body.product||"").slice(0,120);
@@ -3910,6 +3933,26 @@ async function productPagePipeline(body, setStep){
       + formulaBlock + profileContext();
     user = "[기존 상품페이지 HTML]\n"+baseHtml+"\n\n[클라이언트 수정·추가 요청]\n"+feedback;
   } else {
+    // 🎨 '비주얼 먼저' 원칙: HTML을 짜기 전에 색 팔레트·타이포·핵심 이미지 컨셉·무드를 먼저 확정하고, 그에 정확히 맞춰 페이지를 설계하게 한다.
+    _step("비주얼 디렉션 잡는 중 (색·이미지·무드)");
+    let visualBlock = "";
+    try{
+      const vSys = "너는 민앤팜(전남 고흥 특산물)의 아트디렉터다."+brandBlock()
+        + " 상세페이지를 코딩하기 전에 '비주얼을 먼저' 확정한다. 이 상품에 맞는 색 팔레트(hex)·타이포 느낌·핵심 이미지 컨셉·전체 무드를 정하라. "
+        + "반드시 JSON만(설명 금지): {\"mood\":\"전체 무드 한 줄\",\"palette\":[{\"name\":\"\",\"hex\":\"#______\",\"use\":\"용도\"}],\"typography\":{\"heading\":\"제목 폰트 느낌\",\"body\":\"본문 느낌\"},\"imagePlan\":[{\"slot\":\"히어로/상세1 등\",\"desc\":\"구도·색·분위기까지 구체적 이미지 묘사\"}]}. palette 4~6개, imagePlan 3~5개.";
+      const vRaw = await anthropic(vSys, "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n정보: "+info.slice(0,900)+(formula?("\n\n[품질 공식 참고]\n"+formula.slice(0,600)):""), 900);
+      const vj = safeJson(vRaw, null);
+      if(vj){
+        const pal = (vj.palette||[]).map(p=>"· "+(p.name||"")+" "+(p.hex||"")+(p.use?(" ("+p.use+")"):"")).join("\n");
+        const imgs = (vj.imagePlan||[]).map((p,i)=>"· ["+(p.slot||("이미지"+(i+1)))+"] "+(p.desc||"")).join("\n");
+        visualBlock = "\n\n[먼저 확정한 비주얼 디렉션 — 이 색·타이포·이미지 컨셉·무드에 '정확히' 맞춰 페이지를 설계하라. 색상은 아래 hex를 실제 CSS에 사용하고, 이미지 플레이스홀더에는 아래 '핵심 이미지' 묘사를 그대로 넣어라]\n"
+          + "무드: "+(vj.mood||"")+"\n"
+          + (pal?("팔레트:\n"+pal+"\n"):"")
+          + (vj.typography?("타이포: 제목 "+(vj.typography.heading||"")+" / 본문 "+(vj.typography.body||"")+"\n"):"")
+          + (imgs?("핵심 이미지:\n"+imgs):"");
+        j_visualDirection = vj;
+      }
+    }catch(e){ /* 비주얼 디렉션 실패 시 기존 방식으로 진행 */ }
     sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
       + " 아래 상품으로, 샤넬·에르메스 같은 명품 브랜드 수준의 '실제로 바로 열리는 완성형 HTML 상품페이지' 하나를 만들어라. "
       + "반드시 지킬 것: (1) 완전한 단일 HTML 문서(<!DOCTYPE html>부터 </html>까지, CSS는 <style>에 인라인). "
@@ -3917,7 +3960,7 @@ async function productPagePipeline(body, setStep){
       + "(3) 고급스러운 여백·타이포그래피·색감, 스크롤 시 자연스러운 리듬. 모바일 반응형. "
       + "(4) 과장광고·허위표현 금지, 실제 판매에 쓸 수 있는 신뢰감 있는 카피. "
       + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
-      + formulaBlock + photoBlock + profileContext();
+      + formulaBlock + photoBlock + visualBlock + profileContext();
     user = "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n상품 정보:\n"+info;
   }
   _step((body.baseHtml?"수정 사항 반영해 상세페이지 재작성 중":"AI가 상세페이지 작성 중")+" (1~3분)");
@@ -3932,7 +3975,7 @@ async function productPagePipeline(body, setStep){
   DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
   if (formula) logKnowledgeApplied(d, (isRevise?"상품페이지 수정":"상품페이지 제작"), product);
   saveDB();
-  return { ok:true, html, product, appliedFormula: !!formula, by:a.kr };
+  return { ok:true, html, product, appliedFormula: !!formula, visualDirection:j_visualDirection, by:a.kr };
 }
 // ===== 상품페이지 백그라운드 작업 큐 (앱을 나가도 안 끊김) =====
 function trimPageJobs(){
@@ -3949,7 +3992,7 @@ async function runPageJob(id, appUrl){
   beginJobMode();   // 작업 중 한도로 끊기지 않게
   try{
     const out = await productPagePipeline(j.input||{}, function(s){ j.step=s; saveDB(); });
-    j.html = out.html; j.appliedFormula = !!out.appliedFormula;
+    j.html = out.html; j.appliedFormula = !!out.appliedFormula; j.visualDirection = out.visualDirection||null;
     j.status="done"; j.doneAt=Date.now(); delete j.input;
     trimPageJobs(); saveDB();
     const link = String(appUrl||process.env.APP_URL||"");
@@ -4006,7 +4049,7 @@ app.get("/api/product-page/status", (req,res)=>{
   const j=(DB.pageJobs||[]).find(x=>String(x.id)===id);
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
   res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"", step:j.step||"",
-    appliedFormula:!!j.appliedFormula, html:(j.status==="done"?(j.html||""):"") });
+    appliedFormula:!!j.appliedFormula, visualDirection:(j.status==="done"?(j.visualDirection||null):null), html:(j.status==="done"?(j.html||""):"") });
 });
 app.get("/api/product-page/list", (req,res)=>{
   res.json({ ok:true, jobs:(DB.pageJobs||[]).slice(-12).map(j=>({
@@ -4604,7 +4647,7 @@ app.post("/api/ops/run-all", async (req,res)=>{
 // 팀장 보고 요약: 오늘 팀장이 무엇을 했는지 한눈에
 function buildLeaderReport(){
   const today = kstDay();
-  const leaderAutoOn = ((DB.state||{}).leaderAutoOn !== false);
+  const leaderAutoOn = ((DB.state||{}).leaderAutoOn === true);
   const ldd = DB.leaderDailyDirective||{}, rev=DB.dailyReview||{}, nr=DB.nightResearch||{};
   const depts = Object.keys(AGENTS).filter(d=>d!=="ops");
   const directedToday = depts.filter(d=> ldd[d] && ldd[d].day===today).length;
@@ -5561,6 +5604,7 @@ app.get("/api/health", (req,res)=>{
   });
   const errorGroups = Object.keys(groups).map(k=>groups[k]).sort((a,b)=>b.last-a.last).slice(0,12);
   const errs24h = (DB.errors||[]).filter(e=>(now-(e.at||0))<86400000).length;
+  const rateWaits24h = (DB.rateWaits||[]).filter(w=>(now-(w.at||0))<86400000).length;
   function jobStat(arr){ const s={queued:0,running:0,done:0,error:0,stuck:0}; (arr||[]).forEach(j=>{ if(s[j.status]!=null)s[j.status]++; if(j.status==="running" && (now-(j.startedAt||j.at||now))>900000) s.stuck++; }); return s; }
   const learn = jobStat(DB.learnJobs), page = jobStat(DB.pageJobs);
   const api = { geminiKey: !!geminiKey(), cooldownActive: now<geminiCooldownUntil,
@@ -5576,6 +5620,7 @@ app.get("/api/health", (req,res)=>{
   if(errs24h>10) problems.push("최근 24시간 오류 "+errs24h+"건");
   res.json({ ok:true, at:now, status: problems.length?"warn":"ok", problems,
     errors:{ total:(DB.errors||[]).length, last24h:errs24h, groups:errorGroups },
+    rateWaits:{ last24h:rateWaits24h, note:"Gemini 무료 한도로 잠시 쉰 횟수 — 오류 아님(자동 재시도됨)" },
     jobs:{ learn, page }, api, storage });
 });
 
@@ -6157,7 +6202,7 @@ setInterval(async ()=>{
   // (0) 예약 회의: 근무시간과 무관하게 지정 시각(KST)에 실행
   const hm = kstHHMM(), day = kstDay(), dow = kstDow(), nowMs = Date.now();
   const autoOK = geminiAutoAllowed(); // Gemini 월 예산(₩) 안에서만 자동 지능작업 수행(초과 시 잠시 멈춤·다음날/다음달 재개)
-  const leaderAuto = autoOK && ((DB.state||{}).leaderAutoOn !== false); // 팀장에게 맡기기 ON(기본)이면 매일 자동으로 회고·연구·지시 실행
+  const leaderAuto = autoOK && ((DB.state||{}).leaderAutoOn === true); // 기본 OFF: 자동 백그라운드 지능작업(토큰 소모)은 사용자가 명시적으로 켤 때만 실행. 수동 URL 학습은 이 스위치와 무관하게 항상 동작.
   // (0-b) 팀장 브리핑: 아침(오늘 할 일)·저녁(오늘 한 일)·주간(한 주 종합) — 자동이므로 무료(Gemini)
   try {
     const st = DB.state || {};
@@ -6297,7 +6342,7 @@ setInterval(async ()=>{
   // (0-f) 자율 개선 제안: 하루 1회, 팀장이 웹을 조사해 개선안을 제시(승인 시 품질 공식 반영) — 자동·무료
   try {
     const st4 = DB.state || {};
-    if (autoOK && st4.autoImproveOn !== false) {
+    if (leaderAuto && st4.autoImproveOn !== false) {
       const everyH = Number.isFinite(+st4.improveEveryH) ? Math.max(6, +st4.improveEveryH) : 24;
       const pend = (DB.improveProposals||[]).filter(p=>p.status==="pending").length;
       if (pend < 2 && Date.now() - (DB.lastImproveAt||0) >= everyH*3600000) {
@@ -6311,7 +6356,7 @@ setInterval(async ()=>{
   // (0-g) 에버그린 재발행 추천: 3일에 1회, 오래(21일+) 안 쓴 즐겨찾기 콘텐츠가 있으면 재발행을 권유 — 자동·무료(알림만)
   try {
     const st5 = DB.state || {};
-    if (autoOK && st5.evergreenSuggestOn !== false) {
+    if (leaderAuto && st5.evergreenSuggestOn !== false) {
       if (Date.now() - (DB.lastEvergreenSuggestAt||0) >= 3*86400000) {
         const now = Date.now();
         const cand = (DB.evergreen||[]).filter(x=> (now-(x.lastUsedAt||x.at||now)) >= 21*86400000)
