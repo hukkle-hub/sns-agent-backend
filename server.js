@@ -362,6 +362,58 @@ function classifyError(msg){
   if(/재시작/.test(m))                                    return { kind:"restart", ko:"서버 재시작으로 중단",  fix:"Render 무료 플랜은 유휴 시 잠들어요. 🔄 다시 시도하세요." };
   return { kind:"other", ko:"알 수 없는 오류", fix:"🔄 다시 시도해 보세요. 계속되면 오류 원문을 개발자에게 전달하세요." };
 }
+// ═══ v243: 모든 단계를 타임라인으로 기록 ═══
+// 지금까지는 '현재 단계 한 줄'만 남았다. 무슨 일이 있었는지 되짚을 수가 없었다.
+// → 단계가 바뀔 때마다 시각·소요시간과 함께 이력을 쌓는다. 실패했을 때 어디서 죽었는지가 그대로 보인다.
+// v244: 단계별 실측 소요시간을 누적 학습해 '예상 소요시간'을 낸다 (추측이 아니라 우리 서버의 실제 기록)
+function stepKey(text){
+  return String(text||"")
+    .replace(/\d+/g, "N")                       // 숫자 제거 (1/3, 87건 → N)
+    .replace(/\(.*?\)/g, "")                    // 괄호 안 제거
+    .replace(/\s+/g, " ").trim().slice(0, 60);
+}
+function recordStepTime(text, ms){
+  if(!text || !(ms > 500) || ms > 30*60*1000) return;
+  DB.stepStats = DB.stepStats || {};
+  const k = stepKey(text);
+  const st = DB.stepStats[k] || { n:0, sum:0 };
+  st.n += 1; st.sum += ms;
+  if(st.n > 200){ st.sum = Math.round(st.sum * 200/st.n); st.n = 200; }   // 최근 쪽에 가중
+  DB.stepStats[k] = st;
+}
+function stepEta(text){
+  const st = (DB.stepStats||{})[stepKey(text)];
+  if(!st || st.n < 2) return null;
+  return Math.round(st.sum / st.n);
+}
+function logStep(job, text){
+  if(!job) return;
+  const t = String(text||"").slice(0,160);
+  const now = Date.now();
+  job.steps = job.steps || [];
+  const last = job.steps[job.steps.length-1];
+  if(last && !last.done){
+    last.done = now;                                        // 직전 단계 종료 시각 = 이번 단계 시작
+    try{ recordStepTime(last.text, now - last.at); }catch(_){}   // ★ 실측치를 학습
+  }
+  if(!last || last.text !== t){
+    const eta = stepEta(t);                                  // 과거 실측 평균
+    job.steps.push({ at: now, text: t, eta: eta || undefined });
+    if(job.steps.length > 120) job.steps = job.steps.slice(-120);
+  }
+  job.step = t;
+  job.progAt = now;
+  if(!job.startedAt) job.startedAt = now;
+  try{ saveDB(); }catch(_){}
+}
+function doneJob(job, note){
+  if(!job) return;
+  try{ if(job.steps && job.steps.length){ const L=job.steps[job.steps.length-1]; if(!L.done){ L.done=Date.now(); recordStepTime(L.text, L.done-L.at); } } }catch(_){}
+  if(note) logStep(job, note);
+  try{ if(job.steps && job.steps.length){ const L=job.steps[job.steps.length-1]; if(!L.done) L.done=Date.now(); } }catch(_){}
+  job.doneAt = Date.now();
+  try{ saveDB(); }catch(_){}
+}
 function failJob(job, e, tag){
   if(!job) return;
   const raw = String((e && (e.stack || e.message)) || e || "알 수 없는 오류");
@@ -369,6 +421,7 @@ function failJob(job, e, tag){
   const c = classifyError(msg);
   job.status   = "error";
   job.failStep = job.step || "(단계 기록 없음)";   // ★ step을 덮어쓰지 않는다 — 어디서 죽었는지가 핵심 단서
+  try{ if(job.steps && job.steps.length){ const L=job.steps[job.steps.length-1]; if(!L.done){ L.done=Date.now(); L.failed=true; } } }catch(_){}
   job.error    = msg.slice(0, 600);
   job.errorKind= c.kind;
   job.errorKo  = c.ko;
@@ -993,6 +1046,7 @@ const SPEC_DEFAULT = {
     { id:"no_ad_tone",    auto:0, must:1, label:"홍보 티가 나지 않는 경험담·정보공유 톤" }
   ],
   "_기본": [
+    { id:"visual",        auto:0, must:0, label:"확정된 비주얼 디렉션(미학·팔레트·레이아웃·시그니처)을 그대로 구현함" },
     { id:"instruction",   auto:0, must:1, label:"클라이언트가 지시한 내용이 전부 반영됨" },
     { id:"complete",      auto:0, must:1, label:"손대지 않고 바로 쓸 수 있음 (빈칸·placeholder 없음)" },
     { id:"no_fake",       auto:0, must:1, label:"근거 없는 사실·수치를 지어내지 않음" },
@@ -1008,7 +1062,7 @@ function specFor(kind){
 }
 
 // ───────── ① 기계 검증 (결정론적 — 코드로 확인, 점수가 흔들릴 수 없다) ─────────
-function machineVerify(kind, content){
+function machineVerify(kind, content, vdir){
   const h = String(content||"");
   const isHtml = /<html|<!doctype/i.test(h);
   const bodyM = h.match(/<body[^>]*>([\s\S]*)<\/body>/i);
@@ -1052,6 +1106,16 @@ function machineVerify(kind, content){
       if(/이모지/.test(ds.text) && /[\u{1F300}-\u{1FAFF}]/u.test(text)) bans.push("이모지");
       set("brand", hexes.length>0 && used.length >= Math.min(2, hexes.length) && bans.length===0,
           (hexes.length? ("도면 색 "+used.length+"/"+hexes.length+" 사용") : "도면에 색 hex 없음") + (bans.length? (" · ❌ 금지 항목 사용: "+bans.join(", ")) : ""));
+    }
+    // 확정된 비주얼 디렉션의 팔레트가 실제 CSS에 쓰였는가 (아트디렉터가 정한 색을 무시하면 미충족)
+    if(vdir && Array.isArray(vdir.palette) && vdir.palette.length){
+      const hx = vdir.palette.map(p=>String((p&&p.hex)||"").toLowerCase()).filter(x=>/^#[0-9a-f]{6}$/.test(x));
+      if(hx.length){
+        const lo = h.toLowerCase();
+        const used = hx.filter(x=> lo.indexOf(x)>=0);
+        set("visual", used.length >= Math.ceil(hx.length*0.6),
+            "확정 팔레트 "+used.length+"/"+hx.length+" 사용" + (used.length < Math.ceil(hx.length*0.6) ? " → ❌ 정한 색을 안 씀" : ""));
+      }
     }
     // 인라인 스크립트 문법 오류
     const scripts = [...h.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m=>m[1]);
@@ -1138,7 +1202,7 @@ async function syncInsights(pid, setStep){
   const batches = [];
   for(let k=0;k<fresh.length;k+=DISTILL_BATCH) batches.push(fresh.slice(k, k+DISTILL_BATCH));
   for(let b=0;b<batches.length;b++){
-    _step("경험 훑는 중 — 새 경험 "+(b+1)+"/"+batches.length+" 묶음");
+    _step("📚 아직 안 읽은 경험 읽는 중 "+(b+1)+"/"+batches.length+" 묶음 (한 번 읽은 건 다시 안 읽어요)");
     const text = await distillBatch(proj, batches[b], b, batches.length);
     if(text){
       proj.insights.push({ id:String(Date.now())+"_i"+b, at:Date.now(),
@@ -1191,7 +1255,7 @@ async function experienceBriefing(pid, ctx, research, setStep){
   const covered  = insights.reduce((a,x)=>a+(x.expCount||0),0);
   const rel      = relevantExperience(pid, ctx, 20);
 
-  _step("경험 "+total+"건 훑고 이번 작업 브리핑 만드는 중");
+  _step("📚 경험 "+total+"건을 전부 훑어 이번 작업 브리핑 작성 중 — 과거에 통했던 것·틀렸던 것을 정리합니다");
   const sys = "너는 '"+proj.name+"' 프로젝트("+(proj.brief||"")+")의 작업 브리퍼다.\n"
     + "지금 새 작업을 시작한다. 아래는 이 프로젝트가 지금까지 쌓은 경험 전부("+covered+"건을 압축한 통찰)와, "
     + "이번 주제와 특히 관련된 과거 경험 원본이다.\n"
@@ -1652,7 +1716,7 @@ async function runLearnJob(id, appUrl){
   beginJobMode();   // 작업 중 한도로 끊기지 않게
   if (j.forceFree) beginForceFree();   // 무료 우회로 승인된 작업
   try{
-    const setStep = (st)=>{ try{ j.step=st; saveDB(); }catch(_){} };
+    const setStep = (st)=>{ try{ logStep(j, st); }catch(_){} };
     const isAuto = (j.dept==="auto") && (j.kind==="youtube" || j.kind==="web");
     const out = isAuto              ? await autoRouteLearn(j.urls||[], j.kind, setStep)
               : (j.kind==="youtube") ? await learnFromYouTubeUrls(j.dept, j.urls||[], setStep)
@@ -1703,6 +1767,33 @@ async function runLearnJob(id, appUrl){
     }
   }catch(e){
     failJob(j, e, "learn-job");
+
+    // ═══ v246: 쿼터 소진으로 실패한 학습은 '자동 재큐' ═══
+    //   기존 재큐는 '서버 재시작'만 커버했다. 쿼터(RESOURCE_EXHAUSTED) 실패는 그대로 죽었다.
+    //   쿼터는 시간이 지나면 풀리므로, 쿨다운 뒤 자동으로 다시 돌린다 (최대 2회).
+    if(j.errorKind === "rate" || j.errorKind === "quota"){
+      j.requeues = (j.requeues||0) + 1;
+      if(j.requeues <= 2){
+        const waitMs = Math.max(10*60*1000, (geminiCooldownUntil||0) - Date.now() + 60*1000);   // 최소 10분, 쿨다운 끝나고 1분 뒤
+        const mins = Math.round(waitMs/60000);
+        j.status = "queued"; j._requeued = true; delete j.error;
+        logStep(j, "⏳ Gemini 쿼터 소진 — "+mins+"분 뒤 자동 재시도 ("+j.requeues+"/2). 앱을 꺼도 서버가 알아서 다시 돌려요.");
+        saveDB();
+        setTimeout(()=>{
+          const jj = (DB.learnJobs||[]).find(x=>String(x.id)===String(j.id));
+          if(!jj || jj.status!=="queued" || !jj._requeued) return;
+          jj._requeued = false; saveDB();
+          logStep(jj, "🔄 쿼터 회복 — 학습 자동 재시도 시작 ("+jj.requeues+"/2)");
+          runLearnJob(jj.id).catch(err=>logError("learn-requeue", err));
+        }, waitMs);
+        try{ kakaoNotify("⏳ 학습 대기 — Gemini 무료 한도 소진\n"+mins+"분 뒤 자동으로 다시 시도합니다 ("+j.requeues+"/2)"); }catch(_){}
+        endJobMode();
+        return;                                        // 실패 알림을 보내지 않고 조용히 재큐
+      }
+      j.error = "Gemini 무료 한도 소진 — 자동 재시도 2회를 모두 썼어요. 잠시 뒤 직접 다시 시도하거나, 설정에서 유료 Gemini를 켜주세요.";
+      saveDB();
+    }
+
     const who = (j.kind==="deep") ? "협업 심화학습"
               : (j.dept==="auto") ? "자동배정 학습"
               : (AGENTS[j.dept] ? AGENTS[j.dept].kr+" 학습" : String(j.dept));
@@ -1762,7 +1853,7 @@ app.post("/api/learn/benchmark-start", (req,res)=>{
 app.get("/api/learn/status", (req,res)=>{
   const j=(DB.learnJobs||[]).find(x=>String(x.id)===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
+  res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, step:j.step||"", steps:(j.steps||[]).slice(-60), startedAt:j.startedAt||j.at||0, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
     analyzed:j.analyzed||0, autoDepts:j.autoDepts||null, knowledge:(j.status==="done"?(j.knowledge||""):""),
     result:(j.status==="done" && j.kind==="deep") ? (j.result||null) : null });
 });
@@ -2100,7 +2191,7 @@ async function gatherMaterial(urls){
 }
 const DEEP_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout","editing","graphic"];
 async function deepLearnPipeline(job){
-  const setStep = (s)=>{ try{ job.step=s; saveDB(); }catch(_){} };
+  const setStep = (s)=>{ try{ logStep(job, s); }catch(_){} };
   setStep("자료 수집·분석 중");
   const mat = await gatherMaterial(job.urls||[]);
   const material = mat.text.slice(0, 24000);   // 이후 여러 부서가 참조하므로 입력 절약
@@ -3251,7 +3342,12 @@ async function geminiSearch(prompt, maxTok){
     }catch(e){ lastErr=String(e.message||e); if(isRateErr(lastErr)) rateHits++; }
   }
   // 모든 모델이 무료 쿼터(429/RESOURCE_EXHAUSTED)로 실패 → 폴백 체인(둘 다 시도)
-  if (rateHits>0 && rateHits>=models.length){
+  // ═══ v246 [버그 수정] 폴백 조건이 너무 빡빡했다 ═══
+  //   기존: rateHits >= models.length → '모든 모델이 429여야' 폴백
+  //   문제: 첫 모델이 429(RESOURCE_EXHAUSTED)여도 둘째가 404(없는 모델)·타임아웃·빈응답이면
+  //         rateHits=1 < 2 → 폴백이 안 돌고 그대로 실패했다. (실제 실패 로그가 이 경로)
+  //   수정: 쿼터를 한 번이라도 맞았으면 폴백한다 — 쿼터 소진은 모델을 바꿔도 안 풀린다.
+  if (rateHits > 0){
     gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000;
     // ① 무료 웹검색(DuckDuckGo+Jina)로 실제 근거 확보 → Claude가 사실 위주로 종합
     try{
@@ -3298,7 +3394,7 @@ async function analyzeYouTube(url, question, maxTok){
   await waitGeminiCooldown();
   const u = String(url||"").trim();
   if (!/youtube\.com\/watch\?v=|youtu\.be\//.test(u)) throw new Error("유효한 유튜브 URL이 아님");
-  const models = ["gemini-2.5-flash","gemini-3.5-flash"];
+  const models = ["gemini-2.5-flash","gemini-3.5-flash"];   // v246: 모델 목록은 건드리지 않는다(멀티모달 영상 분석 지원 모델만 써야 함)
   const want = maxTok || 1500;
   const q = question || "이 영상을 화면·구성·편집·자막까지 분석해, 무엇이 이 영상을 잘 만들어진(또는 인기 있는) 콘텐츠로 만드는지 구체적으로 정리하라. 도입 후킹, 장면 전환, 자막·카피, 길이·리듬, 썸네일급 첫 장면을 짚어라.";
   let lastErr=null, rateHits=0;
@@ -3316,7 +3412,12 @@ async function analyzeYouTube(url, question, maxTok){
       lastErr = "["+mdl+"] 빈 응답(영상이 비공개/미등록이거나 분석 불가)";
     }catch(e){ lastErr=String(e.message||e); if(isRateErr(lastErr)) rateHits++; }
   }
-  if (rateHits>0 && rateHits>=models.length){
+  // ═══ v246 [버그 수정] 폴백 조건이 너무 빡빡했다 ═══
+  //   기존: rateHits >= models.length → '모든 모델이 429여야' 폴백
+  //   문제: 첫 모델이 429(RESOURCE_EXHAUSTED)여도 둘째가 404(없는 모델)·타임아웃·빈응답이면
+  //         rateHits=1 < 2 → 폴백이 안 돌고 그대로 실패했다. (실제 실패 로그가 이 경로)
+  //   수정: 쿼터를 한 번이라도 맞았으면 폴백한다 — 쿼터 소진은 모델을 바꿔도 안 풀린다.
+  if (rateHits > 0){
     gemini429Streak++; geminiCooldownUntil=Date.now()+Math.min(10,gemini429Streak)*60000;
     // ① 무료로 영상 페이지 본문(제목·설명 등) 읽기: 직접 → Jina 리더 폴백
     let pageInfo = "";
@@ -4709,7 +4810,8 @@ function oseraMin(){ const v=+((DB.state&&DB.state.oseraMin)||80); return (v>=50
 async function oseraReview(kindLabel, content, topic, ctx){
   const a = AGENTS.ops;
   const spec = specFor(kindLabel);
-  const M = machineVerify(kindLabel, content);          // ① 기계 검증 (결정론적)
+  const vdir = (ctx && ctx.visual) || null;                    // 아트디렉터가 확정한 비주얼 디렉션 = 명세의 일부
+  const M = machineVerify(kindLabel, content, vdir);           // ① 기계 검증 (결정론적)
 
   // 클라이언트가 실제로 지시한 것 (부서가 '원한 것')
   const demand = String((ctx && ctx.memo) || "").slice(0, 1500);
@@ -4730,6 +4832,13 @@ async function oseraReview(kindLabel, content, topic, ctx){
     + "[네가 판정할 요구 항목]\n"
     + askItems.map((x,i)=>(i+1)+". "+x.label+(x.must?" (필수)":" (권장)")).join("\n")
     + (demand ? ("\n\n[클라이언트가 실제로 지시한 것 — 이게 최우선 요구사항이다. 하나라도 빠지면 미충족]\n"+demand) : "")
+    + (vdir ? ("\n\n[우리 아트디렉터가 확정한 비주얼 디렉션 — 이대로 만들기로 했다. 다르게 만들었으면 미충족]\n"
+        + (vdir.aesthetic?("미학: "+vdir.aesthetic+"\n"):"")
+        + (vdir.reference?("레퍼런스: "+vdir.reference+"\n"):"")
+        + ((vdir.palette||[]).length?("팔레트: "+(vdir.palette||[]).map(p=>(p&&p.name||"")+" "+(p&&p.hex||"")).join(", ")+"\n"):"")
+        + (vdir.typography?("타이포: 제목 "+(vdir.typography.heading||"")+" / 본문 "+(vdir.typography.body||"")+"\n"):"")
+        + (vdir.layout?("레이아웃: "+vdir.layout+"\n"):"")
+        + (vdir.signature?("시그니처: "+vdir.signature):"")) : "")
     + (brief  ? ("\n\n[작업 브리프]\n"+brief) : "")
     + "\n\n반드시 JSON만 출력(설명·마크다운 금지):\n"
     + '{"checks":[{"n":1,"pass":true,"why":"근거 한 줄 — 결과물의 어느 부분을 보고 판단했는지"}],'
@@ -4776,6 +4885,27 @@ async function oseraReview(kindLabel, content, topic, ctx){
 
 // 오세라 게이트: 기준 미달이면 보완 재작성(최대 2회) → 재심사. 통과해야 passed=true.
 // regen(fix, issues) 는 '보완 지시를 받아 결과물을 다시 만드는' 함수. 없으면 심사만 한다.
+// ═══ v245: 최종 관문 — 완성본이 나가는 '모든' 경로가 여기를 통과해야 한다.
+//   지금까지 선순환·디자인만 검증했고, 🔁 고쳐줘 / 콘텐츠 재활용 / 영상 기획 / 상품페이지 단독 탭은
+//   검증 없이 그대로 나갔다. '검증 안 받은 결과물이 나가는 길'이 하나라도 있으면 안 된다.
+async function verifyFinal(kindLabel, content, topic, regenSys, regenUser, setStep, specCtx, engine){
+  if(!content || String(content).trim().length < 20) return { content, review:null, passed:true };
+  try{
+    return await oseraGate(kindLabel, content, topic, async function(fix, issues){
+      const sys2 = String(regenSys||"")
+        + "\n\n[👑 총괄 오세라의 최종 지적 — 이대로는 못 내보낸다. 전부 반영해 다시 만들어라]\n"
+        + (issues && issues.length ? ("· "+issues.join("\n· ")+"\n") : "")
+        + "가장 중요한 수정: " + fix;
+      const isHtml = /<html|<!doctype/i.test(String(content));
+      const out = await (engine==="anthropic" || isHtml
+        ? anthropic(sys2, String(regenUser||"")+"\n\n(위 지적을 전부 반영한 완성본만 출력)", isHtml?8000:2200)
+        : genText(sys2, String(regenUser||"")+"\n\n(위 지적을 전부 반영한 완성본만 출력)", 2200, workEngine()));
+      let t = String(out||"").trim();
+      if(isHtml) t = t.replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+      return t;
+    }, setStep, specCtx || {});
+  }catch(e){ return { content, review:null, passed:true, error:String(e.message||e) }; }
+}
 async function oseraGate(kindLabel, content, topic, regen, setStep, specCtx){
   const _step = (typeof setStep==="function") ? setStep : function(){};
   if(!oseraGateOn()) return { content, review:null, passed:true, skipped:true };
@@ -4790,7 +4920,7 @@ async function oseraGate(kindLabel, content, topic, regen, setStep, specCtx){
   const _injectedIds = (LAST_INJECTED_LESSONS||[]).slice();   // 이 결과물을 만들 때 주입됐던 규칙들
 
   for(let i=0;i<3;i++){                                  // 초심사 1 + 보완 최대 2
-    _step("👑 오세라 최종 검수 중"+(i?(" (보완 "+i+"차)"):""));
+    _step("👑 총괄 오세라 검증 중 — 요구한 대로 만들었는지 · 기능이 작동하는지 항목별 대조"+(i?(" (보완 "+i+"차)"):""));
     try{ rv = await oseraReview(kindLabel, cur, topic, specCtx); }
     catch(e){ break; }                                    // 심사 실패가 발행을 막지 않는다
     if(!rv) break;
@@ -4800,7 +4930,15 @@ async function oseraGate(kindLabel, content, topic, regen, setStep, specCtx){
     if(rv.score >= rv.min) break;                         // 통과
     if(!regen || i===2) break;                            // 보완 횟수 소진
 
-    _step("👑 미충족 요구 "+((rv.totalCount||0)-(rv.passedCount||0))+"건 보완 중 (이행률 "+rv.score+"% → 기준 "+rv.min+"%)");
+    // ★ v245: '미충족 2건'만으론 아무것도 알 수 없다 → 무엇이 왜 미충족인지 그대로 쓴다
+    const _miss = (rv.checks||[]).filter(x=>!x.pass);
+    const _names = _miss.slice(0,3).map(x=>(x.must?"[필수] ":"")+x.label.split("(")[0].trim()).join(" / ");
+    _step("🔧 오세라 지적 반영 — 이행률 "+rv.score+"% (기준 "+rv.min+"%) · 미충족 "+_miss.length+"건 보완 중"
+        + (_names ? (" → " + _names + (_miss.length>3 ? (" 외 "+(_miss.length-3)+"건") : "")) : ""));
+    // 미충족 항목 하나하나를 이유까지 타임라인에 남긴다
+    _miss.slice(0,6).forEach(function(x){
+      _step("   ✗ "+(x.must?"[필수] ":"")+x.label+" — "+(x.why||"미충족")+(x.by==="기계"?" (기계 검증)":""));
+    });
     let next;
     try{ next = await regen(rv.fix, rv.issues, rv.score); }catch(e){ break; }
     if(!next || String(next).trim().length <= 20) break;
@@ -5044,7 +5182,8 @@ async function productionPipeline(baseSys, userMsg, topic, engine){
   const credit = "\n\n───\n🎬 제작: "+(research.brief?("리서치"+(research.searched?"(실검색)":"")+" · "):"")+"작가 "+W.name+" · PD "+P.name+(isVideo?(" · 연출 "+D.name):"");
   return draft + credit;
 }
-async function createReviewedContent(baseSys, userMsg, topic, engine){
+async function createReviewedContent(baseSys, userMsg, topic, engine, opts){
+  const _o = opts || {};
   const freeGen = (engine==="free" || engine==="nvidia" || engine==="gemini");  // 무료/비-Claude 모델로 생성했는지
   let content=await productionPipeline(baseSys, userMsg, topic, engine);
   // 무료 모델 생성물은 Claude가 '표현·형식'만 다듬어 보완(사실·구조·핵심 메시지는 그대로) — 무거운 초안은 무료, 마무리는 Claude
@@ -5086,8 +5225,9 @@ async function createReviewedContent(baseSys, userMsg, topic, engine){
       }
     }catch(e){ /* 채점 실패는 발행을 막지 않는다 */ }
   }
-  // 👑 오세라 최종 검수 — 여기를 통과해야 내보낼 수 있다 (100점 만점)
+  // 👑 오세라 최종 검증 — 최종본에만 건다 (초안은 어차피 재생성되므로 검증이 낭비)
   let osera = null, oseraPassed = true;
+  if(_o.gate === false) return { content, passed, reviews:history, viral:null, osera:null, oseraPassed:true };
   try{
     const g = await oseraGate("콘텐츠", content, topic, async function(fix, issues){
       const boostSys = baseSys
@@ -5352,8 +5492,9 @@ async function productPagePipeline(body, setStep){
   const formula = knowledgeText(d);
   const formulaBlock = formula ? ("\n\n[이 부서가 축적한 "+KIND_NM+" 품질 공식 — 반드시 이 기준을 적용해 만들어라]\n"+formula) : "";
   // 📚 v237: 만들기 전 — 경험 전부 훑기
-  let _expBrief = "";
-  if(!isRevise && expSweepOn()){
+  // v244: 상위(선순환)에서 이미 훑었으면 그걸 재사용한다 — 같은 경험을 두 번 읽지 않는다.
+  let _expBrief = String(body.expBrief||"");
+  if(!isRevise && !_expBrief && expSweepOn()){
     try{ _expBrief = await experienceBriefing(curProjectId(), KIND_NM+" "+product, info, _step); }catch(e){}
   }
   // 실제 사진 자리 안내
@@ -5422,39 +5563,19 @@ async function productPagePipeline(body, setStep){
       + formulaBlock + photoBlock + visualBlock + designSystemBlock() + _expBrief + profileContext(KIND_NM+" "+product+" "+info.slice(0,200));
     user = "브랜드: "+brand+"\n"+(isHome?"홈페이지 주제":"상품")+": "+product+(price?("\n가격: "+price):"")+"\n"+(isHome?"참고 정보":"상품 정보")+":\n"+info;
   }
-  _step((body.baseHtml?("수정 사항 반영해 "+KIND_NM+" 재작성 중"):("AI가 "+KIND_NM+" 작성 중"))+" (1~3분)");
+  _step((body.baseHtml?("✍️ 수정 요청 반영해 "+KIND_NM+" 재작성 중"):("✍️ 확정된 비주얼·브랜드 도면대로 "+KIND_NM+" 작성 중"))+" (1~3분)");
   let html = await anthropic(sys, user, 8000); // 페이지는 길어야 하므로 큰 토큰
-  _step("마무리·정리 중");
+  _step("📦 코드 정리 후 오세라에게 넘기는 중");
   // 혹시 코드펜스가 붙어 나오면 제거
   html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
-  // 🔁 목표 기반 루프: 검수관(Claude)이 비주얼 디렉션·기준 충족까지 최대 N회 수정. 무한 토큰 방지 위해 상한.
+  // v242: 익명 '검수관' 루프 제거 — 검증 주체는 총괄 오세라 하나다.
+  //   비주얼 디렉션(아트디렉터가 확정한 것)도 '요구 명세'의 일부로 오세라가 검증한다.
+  //   → 검수 주체가 단일해야 오세라가 학습하고, 중복 AI 호출도 사라진다.
   let designReviews = [];
-  const maxLoops = Math.max(0, Math.min(3, (DB.state && DB.state.designReviewLoops!=null) ? (+DB.state.designReviewLoops||0) : 1));
-  if(!isRevise && maxLoops>0){
-    for(let i=0;i<maxLoops;i++){
-      _step("검수관이 디자인 점검 중 ("+(i+1)+"/"+maxLoops+")");
-      const rv = await reviewDesignHtml(html, j_visualDirection);
-      designReviews.push({ round:i+1, pass:rv.pass, feedback:rv.feedback });
-      if(rv.pass) break;
-      _step("검수 피드백 반영해 디자인 수정 중 ("+(i+1)+"/"+maxLoops+")");
-      const fixSys = sys + "\n\n[검수관 피드백 — 아래를 반드시 반영해 고쳐서 '완전한 단일 HTML'을 다시 출력하라. 잘된 부분은 유지]\n"+rv.feedback;
-      try{
-        let fixed = await anthropic(fixSys, "[현재 HTML]\n"+html.slice(0,14000)+"\n\n(피드백 반영한 완성 HTML만 출력)", 8000);
-        fixed = String(fixed).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
-        if(fixed && /<\/html>/i.test(fixed)) html = fixed;
-      }catch(e){ break; }
-    }
-  }
-  // 학습·경험치
-  DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
-  DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?("["+KIND_NM+" 수정]"):("["+KIND_NM+" 제작]")), note:product+" — "+(isRevise?feedback.slice(0,60):(price||"")) });
-  if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
-  DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
-  if (formula) logKnowledgeApplied(d, (isRevise?(KIND_NM+" 수정"):(KIND_NM+" 제작")), product);
-  saveDB();
+
   const _chk = checkHtmlOutput(html);
   if(!_chk.ok){
-    _step("⚠️ 결과물 이상 감지 — 다시 만드는 중 ("+_chk.problems.join(", ")+")");
+    _step("⚠️ 결과물 이상 감지 → 자동 재생성 — "+_chk.problems.join(", "));
     try{
       const retry = await anthropic(sys + "\n\n★이전 시도가 실패했다: "+_chk.problems.join(", ")+". 반드시 <!DOCTYPE html>로 시작해 </html>로 끝나는 완전한 문서를, 본문 텍스트를 충분히 담아 출력하라.", user, 8000);
       const h2 = String(retry).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
@@ -5462,9 +5583,13 @@ async function productPagePipeline(body, setStep){
     }catch(_){}
   }
   html = hardenHtml(html);
-  // 👑 오세라 최종 검수
+  // 👑 오세라 최종 검증
+  // v244 [버그 수정] 기존엔 !isRevise 조건이라 '초안'만 검증하고,
+  //   정작 출시되는 '조사 반영 최종본'(isRevise=true)은 검증 없이 나갔다. 돈은 쓰고 검증은 엉뚱한 데 했다.
+  //   → 호출자가 '이게 최종본이다'(gate:true)라고 알려주면 그때만 검증한다.
+  const _doGate = (body.gate === true) ? true : (body.gate === false ? false : !isRevise);
   let _osera=null, _oseraPassed=true;
-  if(!isRevise){
+  if(_doGate){
     try{
       const g = await oseraGate(KIND_NM, html, product, async function(fix, issues){
         const fixSys = sys + "\n\n[👑 총괄 오세라의 최종 지적 — 이대로는 못 내보낸다. 전부 반영해 완전한 단일 HTML을 다시 출력하라]\n"
@@ -5472,14 +5597,14 @@ async function productPagePipeline(body, setStep){
           + "\n구조·디자인 기조는 유지. 설명 없이 HTML만 출력(```html 금지).";
         const out = await anthropic(fixSys, "[현재 HTML]\n"+html.slice(0,14000), 8000);
         return String(out).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
-      }, _step, { memo: String(body.memo||body.info||"").slice(0,1200), brief: product });
+      }, _step, { memo: String(body.memo||body.info||"").slice(0,1200), brief: product, visual: (j_visualDirection || body.visual || null) });
       if(g.content && g.content.length>300) html = hardenHtml(g.content);
       _osera=g.review; _oseraPassed=g.passed;
     }catch(e){}
   }
   return { ok:true, html, product, kind, dept:d, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, osera:_osera, oseraPassed:_oseraPassed, check:checkHtmlOutput(html), by:a.kr };
 }
-// v227: 보고서 검수관 — 팔 수 있는 보고서인지 '근거'로 심사한다.
+// v227: 보고서 근거 검수 (정유진·글3 = 부서 내부 QA). 최종 검증은 오세라가 따로 한다.
 // 디자인 검수(색·레이아웃)와 완전히 다른 축이다. 지어낸 숫자 하나면 보고서 가치가 0이 된다.
 async function reviewReportHtml(html, topic, research){
   const h = String(html||"");
@@ -5548,7 +5673,7 @@ async function reportPipeline(body, setStep){
         if(Array.isArray(r.sources)) sources = sources.concat(r.sources);
       }catch(e){ /* 한 축이 실패해도 나머지로 진행 */ }
     }
-    if(url){ _step("참고 URL 학습 중"); try{ await learnFromWebUrls(d, [url]); }catch(_){} }
+    if(url){ _step("📖 참고 URL 읽는 중"); try{ await learnFromWebUrls(d, [url]); }catch(_){} }
   }
 
   // 📚 조사자료를 경험으로 영구 보존 (규칙 증류의 원재료)
@@ -5557,9 +5682,9 @@ async function reportPipeline(body, setStep){
       note: "키워드·경쟁사·트렌드 조사 완료 (자료 "+research.length+"자)",
       body: research.slice(0,4000) }); }catch(_){}
   }
-  // 📚 v237: 조사 직후 — 경험 전부 훑기
-  let expBrief = "";
-  if(!isRevise && expSweepOn()){
+  // 📚 v237: 조사 직후 — 경험 전부 훑기 (v244: 상위에서 훑었으면 재사용)
+  let expBrief = String(body.expBrief||"");
+  if(!isRevise && !expBrief && expSweepOn()){
     try{ expBrief = await experienceBriefing(curProjectId(), "리서치 보고서 "+topic, research, _step); }catch(e){}
   }
   const kbS = knowledgeText("strategy");   // 벤치마크로 축적한 후킹·마케팅 지식
@@ -5575,7 +5700,7 @@ async function reportPipeline(body, setStep){
       + designSystemBlock();
     user = "[기존 보고서 HTML]\n"+baseHtml+"\n\n[수정 요청]\n"+feedback;
   } else {
-    _step("보고서 작성 중 (1~3분)");
+    _step("✍️ 오세라가 조사자료를 근거로 보고서 작성 중 (1~3분)");
     sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 오세라다."+ADDRESS
       + " 쇼핑몰 사장님에게 납품할 '리서치 보고서' 한 장을 만든다. 사장님은 바빠서 3분 안에 읽고 바로 움직여야 한다. "
       + "\n\n★ 절대 규칙: (1) 아래 [조사자료]에 실제로 나온 내용만 근거로 써라. "
@@ -5616,13 +5741,13 @@ async function reportPipeline(body, setStep){
   const _maxLoops = Math.max(0, Math.min(3, (DB.state && DB.state.designReviewLoops!=null) ? (+DB.state.designReviewLoops||0) : 1));
   if(!isRevise && _maxLoops>0 && html.length>300){
     for(let i=0;i<_maxLoops;i++){
-      _step("검수관이 근거 점검 중 ("+(i+1)+"/"+_maxLoops+")");
+      _step("🔍 정유진(글3) 부서 QA — 지어낸 숫자·일반론이 없는지 점검 ("+(i+1)+"/"+_maxLoops+")");
       let rv;
       try{ rv = await reviewReportHtml(html, topic, research); }
       catch(e){ break; }
       _reviews.push({ round:i+1, pass:rv.pass, feedback:rv.feedback, lint:rv.lint||[] });
       if(rv.pass) break;
-      _step("검수 반영해 보고서 수정 중 ("+(i+1)+"/"+_maxLoops+")");
+      _step("🔧 정유진 지적 반영해 보고서 수정 중 ("+(i+1)+"/"+_maxLoops+")");
       try{
         const fixSys = "너는 민앤팜의 '"+a.no+" "+a.kr+"' 오세라다. 아래 보고서 HTML을 검수 지적대로 고쳐 완전한 단일 HTML 문서로 다시 출력하라. "
           + "★지어낸 숫자는 반드시 삭제하거나 '자료상 확인 불가 — 직접 확인 필요'로 바꿔라. 일반론은 이 주제에서만 통하는 구체적인 내용으로 교체하라. "
@@ -5642,7 +5767,7 @@ async function reportPipeline(body, setStep){
   saveDB();
   const _chk = checkHtmlOutput(html);
   if(!_chk.ok){
-    _step("⚠️ 보고서 이상 감지 — 다시 만드는 중 ("+_chk.problems.join(", ")+")");
+    _step("⚠️ 보고서 이상 감지 → 자동 재생성 — "+_chk.problems.join(", "));
     try{
       const retry = await anthropic(sys + "\n\n★이전 시도가 실패했다: "+_chk.problems.join(", ")+". 반드시 완전한 HTML 문서를, 본문을 충분히 담아 출력하라.", user, 8000);
       const h2 = String(retry).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
@@ -5683,8 +5808,11 @@ async function runPageJob(id, appUrl){
   j.status="running"; j.startedAt=Date.now(); j.step="대기 중"; saveDB();
   beginJobMode();   // 작업 중 한도로 끊기지 않게
   try{
-    const out = await productPagePipeline(j.input||{}, function(s){ j.step=s; saveDB(); });
+    // v245: 단독 탭에서 만든 상품페이지도 반드시 검증한다 (기존엔 수정(revise) 시 무검증으로 나갔다)
+    const _in = Object.assign({}, (j.input||{}), { gate:true });
+    const out = await productPagePipeline(_in, function(s){ logStep(j, s); });
     j.html = out.html; j.appliedFormula = !!out.appliedFormula; j.visualDirection = out.visualDirection||null;
+    j.osera = out.osera || null; j.oseraPassed = out.oseraPassed !== false;
     j.status="done"; j.doneAt=Date.now(); delete j.input;
     trimPageJobs(); saveDB();
     const link = String(appUrl||process.env.APP_URL||"");
@@ -5740,7 +5868,7 @@ app.get("/api/product-page/status", (req,res)=>{
   const id=String(req.query.id||"");
   const j=(DB.pageJobs||[]).find(x=>String(x.id)===id);
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, step:j.step||"",
+  res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, step:j.step||"", steps:(j.steps||[]).slice(-60), startedAt:j.startedAt||j.at||0,
     appliedFormula:!!j.appliedFormula, visualDirection:(j.status==="done"?(j.visualDirection||null):null), html:(j.status==="done"?(j.html||""):"") });
 });
 app.get("/api/product-page/list", (req,res)=>{
@@ -7473,15 +7601,25 @@ async function runRepurposeJob(id, appUrl){
     if(!String(j.source||"").trim()) throw new Error("원본 콘텐츠가 비었어요");
     j.variants={};
     for(const p of list){
-      j.step=(REPURPOSE_KR[p]||p)+" 변환 중"; saveDB();
+      logStep(j, "✍️ "+(REPURPOSE_KR[p]||p)+" 형식으로 변환 중");
       const sys="너는 민앤팜(고흥 특산물)의 콘텐츠 리퍼포징 전문가다."+brandBlock()+profileContext()
         +(knowledgeText("creation")?("\n\n[제작 품질 공식]\n"+knowledgeText("creation")):"")
         +(knowledgeText("monetization")?("\n\n[전환 품질 공식]\n"+knowledgeText("monetization")):"")
         +"\n\n아래 '원본 콘텐츠'를 핵심 손실 없이 아래 형식으로 재가공하라. 형식: "+REPURPOSE_FORMATS[p]+" 브랜드 사실·수치는 왜곡 금지. 결과물만 출력(설명 금지).";
-      j.variants[p]=stripFences(await anthropic(sys, "[원본]\n"+String(j.source).slice(0,8000), 1500));
+      let _v = stripFences(await anthropic(sys, "[원본]\n"+String(j.source).slice(0,8000), 1500));
+      // v245: 재활용 결과물도 '완성본' — 오세라 검증 없이 나가면 안 된다
+      try{
+        logStep(j, "👑 총괄 오세라 검증 중 — "+(REPURPOSE_KR[p]||p));
+        const g = await verifyFinal((REPURPOSE_KR[p]||p), _v, String(j.source||"").slice(0,60),
+          sys, "[원본]\n"+String(j.source).slice(0,8000), (st)=>logStep(j, (REPURPOSE_KR[p]||p)+" · "+st),
+          { memo: String(j.source||"").slice(0,600) });
+        if(g.content) _v = g.content;
+        j.osera = j.osera || {}; j.osera[p] = g.review || null;
+      }catch(_){}
+      j.variants[p]=_v;
       saveDB();
     }
-    j.status="done"; j.doneAt=Date.now(); j.step="완료"; trimRepurposeJobs(); saveDB();
+    j.status="done"; j.doneAt=Date.now(); doneJob(j, "✅ 완료 — "+Object.keys(j.variants||{}).length+"개 플랫폼 변환"); trimRepurposeJobs(); saveDB();
     const done=Object.keys(j.variants).map(p=>REPURPOSE_KR[p]||p).join(", ");
     kakaoNotify("♻️ 멀티플랫폼 변환 완료 — "+done+"\n앱 학습 탭에서 플랫폼별 결과를 확인·복사하세요.", String(appUrl||"")).catch(()=>{});
   }catch(e){ failJob(j, e, "repurpose-job");
@@ -7504,7 +7642,7 @@ app.post("/api/repurpose/start", (req,res)=>{
 });
 app.get("/api/repurpose/status", (req,res)=>{
   const j=(DB.repurposeJobs||[]).find(x=>String(x.id)===String(req.query.id||"")); if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, platforms:j.platforms||[], variants:(j.status==="done"?(j.variants||{}):null) });
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", steps:(j.steps||[]).slice(-60), startedAt:j.startedAt||j.at||0, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, platforms:j.platforms||[], variants:(j.status==="done"?(j.variants||{}):null) });
 });
 
 // ===== 🎬 AI 영상 기획 파이프라인: 리서치·콘셉트 → 마스터 시트(장면 프롬프트까지). 영상 생성 자체는 외부 툴(힉스필드 등)에 프롬프트 투입 =====
@@ -7519,11 +7657,11 @@ async function runVideoPlanJob(id, appUrl){
     const platKr = VIDEO_PLAT_KR[platform];
     const days = Math.max(3, Math.min(30, +j.days||14));
     // 1) 리서치
-    j.step="시장·트렌드 리서치 중"; saveDB();
+    logStep(j, "🔎 실제 웹 조사 — 이 주제의 숏폼 후킹·트렌드 검색 중");
     let research={text:"",via:""};
     try{ research=await researchWeb(String(j.source||"").slice(0,120)+" 숏폼 마케팅 후킹 트렌드 2026", 1200); }catch(e){}
     // 2) 콘셉트·후킹
-    j.step="콘셉트·후킹 아이디어 도출 중"; saveDB();
+    logStep(j, "💡 숏폼 기획 디렉터 — 캠페인 콘셉트·후킹 유형·타깃 확정 중");
     const cSys="너는 민앤팜(전남 고흥 특산물) 숏폼 영상 기획 디렉터다."+brandBlock()+profileContext()+(knowledgeText("creation")?("\n\n[제작 품질 공식]\n"+knowledgeText("creation")):"")
       +"\n\n아래 제품/주제와 리서치를 바탕으로 "+platKr+" 영상 캠페인 콘셉트를 잡아라. 후킹 유형("+VIDEO_HOOKS+") 중 이 제품에 맞는 걸 골라 활용. 반드시 JSON만: {\"concept\":\"캠페인 한 줄 콘셉트\",\"target\":\"핵심 타깃 페르소나\",\"angles\":[\"후킹 앵글 4~6개(각 유형 라벨 포함)\"],\"tone\":\"영상 톤&무드\"}";
     const cRaw=await anthropic(cSys, "[제품/주제]\n"+String(j.source||"").slice(0,2000)+"\n\n[리서치]\n"+String(research.text||"(리서치 없음)").slice(0,4000), 1200);
@@ -7534,7 +7672,7 @@ async function runVideoPlanJob(id, appUrl){
     let start=1;
     while(start<=days){
       const end=Math.min(days, start+14);
-      j.step=start+"~"+end+"일차 콘텐츠 플랜 작성 중 ("+platKr+")"; saveDB();
+      logStep(j, "📅 "+start+"~"+end+"일차 콘텐츠 캘린더 작성 중 ("+platKr+") — 날마다 제목·후킹·장면 프롬프트");
       const mSys="너는 숏폼 콘텐츠 캘린더 기획자다."+brandBlock()+(knowledgeText("monetization")?("\n\n[전환 품질 공식]\n"+knowledgeText("monetization")):"")
         +"\n\n아래 콘셉트로 "+platKr+"용 콘텐츠 캘린더의 "+start+"~"+end+"일차를 작성하라. 날짜마다 서로 다른 후킹·소재로 겹치지 않게. 브랜드 사실·수치는 왜곡 금지. "
         +"반드시 JSON 배열만(설명 금지): [{\"day\":숫자,\"hookType\":\"후킹유형\",\"title\":\"영상 제목/주제\",\"persona\":\"등장 페르소나\",\"lengthSec\":숫자,\"scenePrompt\":\"영상 생성 AI에 넣을 장면 프롬프트(카메라·구도·분위기·동작 포함, 영어+한국어 병기)\",\"caption\":\"업로드 캡션\",\"hashtags\":\"해시태그\"}]";
@@ -7544,7 +7682,15 @@ async function runVideoPlanJob(id, appUrl){
       saveDB();
       start=end+1;
     }
-    j.status="done"; j.doneAt=Date.now(); j.step="완료"; trimVideoJobs(); saveDB();
+    // v245: 영상 기획도 완성본 — 오세라가 요구 이행을 검증한다
+    try{
+      const planTxt = "[콘셉트]\n"+JSON.stringify(j.concept||{})+"\n\n[콘텐츠 캘린더 "+(j.days_plan||[]).length+"일]\n"+JSON.stringify((j.days_plan||[]).slice(0,20));
+      logStep(j, "👑 총괄 오세라 검증 중 — 요청한 플랫폼·기간·구성이 다 들어갔는지 대조");
+      const g = await verifyFinal("영상 기획", planTxt, String(j.source||"").slice(0,60), "", "", (st)=>logStep(j, st),
+        { memo: String(j.source||"").slice(0,600)+" · "+platKr+" · "+days+"일" });
+      j.osera = g.review || null; j.oseraPassed = g.passed !== false;
+    }catch(_){}
+    j.status="done"; j.doneAt=Date.now(); doneJob(j, "✅ 완료 — "+platKr+" "+(j.days_plan||[]).length+"일 기획"+((j.osera&&j.osera.score!=null)?(" · 오세라 "+j.osera.score+"%"):"")); trimVideoJobs(); saveDB();
     kakaoNotify("🎬 AI 영상 기획 완료 — '"+String(j.source||"").slice(0,30)+"' ("+platKr+")\n콘셉트 + "+(j.days_plan||[]).length+"일치 콘텐츠 플랜(장면 프롬프트 포함)이 나왔어요.\n앱 학습 탭에서 확인·복사해 영상툴에 넣으세요.", String(appUrl||"")).catch(()=>{});
   }catch(e){ failJob(j, e, "repurpose-job");
     kakaoNotify("⚠️ AI 영상 기획 실패 — "+j.error).catch(()=>{}); }
@@ -7565,7 +7711,7 @@ app.post("/api/video/start", (req,res)=>{
 });
 app.get("/api/video/status", (req,res)=>{
   const j=(DB.videoJobs||[]).find(x=>String(x.id)===String(req.query.id||"")); if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", steps:(j.steps||[]).slice(-60), startedAt:j.startedAt||j.at||0, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
     platform:j.platform, concept:(j.status==="done"?(j.concept||null):null), days_plan:(j.status==="done"?(j.days_plan||[]):null) });
 });
 
@@ -8017,9 +8163,9 @@ async function cycleGenText(job, fmt, setStep){
   sys += " 아래 주제로 "+spec.instruct+" 되묻지 말고 완성본만, 한국어로.";
   const userMsg = "주제: "+topic+(url?("\n참고 URL(학습 반영됨): "+url):"")+(info?("\n추가 정보: "+info):"")+(memo?("\n지시: "+memo):"");
   let out = "";
-  try{ const g = await createReviewedContent(sys, userMsg, topic, workEngine()); out = g.content||"";
-       if(g.viral){ job._viral = job._viral||{}; job._viral[fmt] = g.viral; }
-       if(g.osera){ job._osera = job._osera||{}; job._osera[fmt] = g.osera; } }
+  // v244: 초안은 조사 반영해 다시 쓴다 → 검증·바이럴 게이트 낭비. 최종본에만 건다.
+  let _gated = false;
+  try{ const g = await createReviewedContent(sys, userMsg, topic, workEngine(), { gate:false }); out = g.content||""; }
   catch(e){ out = await genText(sys, userMsg, 1800, workEngine()); }
   setStep(spec.label+" · 개선 자료 수집 중");
   let research = "";
@@ -8030,12 +8176,26 @@ async function cycleGenText(job, fmt, setStep){
       const rev = await createReviewedContent(
         sys+"\n\n[추가 조사자료 — 이 좋은 요소를 반영해 더 좋게]\n"+research,
         userMsg+"\n\n(아래 초안을 위 조사자료로 더 완성도 높게 개선한 최종본만 출력)\n\n[초안]\n"+out,
-        topic, workEngine());
-      if(rev.content && rev.content.length>50){ out = rev.content;
+        topic, workEngine(), { gate:true });      // ★ 최종본 — 여기서 검증
+      if(rev.content && rev.content.length>50){ out = rev.content; _gated = true;
         if(rev.viral){ job._viral = job._viral||{}; job._viral[fmt] = rev.viral; }
         if(rev.osera){ job._osera = job._osera||{}; job._osera[fmt] = rev.osera; } }
     }catch(_){}
   }
+  // ★ v244 안전망: 조사 실패 등으로 재생성이 돌지 않으면 초안이 곧 최종본이 된다.
+  //   그럴 땐 여기서 반드시 오세라 검증을 건다 — '검증 안 받은 결과물'이 나가면 안 된다.
+  if(!_gated && out){
+    try{
+      setStep(spec.label+" · 👑 총괄 오세라 검증 중");
+      const g2 = await oseraGate(spec.label, out, topic, async function(fix, issues){
+        return await genText(sys + "\n\n[👑 오세라 지적 — 반드시 반영]\n" + (issues&&issues.length?("· "+issues.join("\n· ")+"\n"):"") + fix,
+          userMsg + "\n\n(위 지적을 전부 반영한 완성본만 출력)", 1800, workEngine());
+      }, setStep, { memo: String(job.memo||"").slice(0,1200) });
+      if(g2.content) out = g2.content;
+      if(g2.review){ job._osera = job._osera||{}; job._osera[fmt] = g2.review; }
+    }catch(_){}
+  }
+
   setStep(spec.label+" · 배운 것 누적 중");
   await accumulateFromResult(d, topic, out, research);
   return out;
@@ -8043,7 +8203,7 @@ async function cycleGenText(job, fmt, setStep){
 async function runCycleJob(id, appUrl){
   const job = (DB.cycleJobs||[]).find(j=>j.id===id);
   if(!job) return;
-  const setStep = (s)=>{ job.step = s; job.progAt = Date.now(); saveDB(); };
+  const setStep = (s)=>{ logStep(job, s); };
   job.status = "running"; job.startedAt = Date.now(); setStep("시작");
   beginJobMode();
   try{
@@ -8071,7 +8231,7 @@ async function runCycleJob(id, appUrl){
     if(o.report){
       setStep("리서치 보고서 · 시작");
       try{
-        const genR = await reportPipeline({ topic: topic, info: info, memo: memo, url: String(job.url||"") },
+        const genR = await reportPipeline({ topic: topic, info: info, memo: memo, url: String(job.url||""), expBrief: job.expBrief||"" },
                                           (s2)=>setStep("리서치 보고서 · "+s2));
         if(genR.osera){ job._osera = job._osera||{}; job._osera.report = genR.osera; }
         results.report = genR.html || "";
@@ -8083,13 +8243,14 @@ async function runCycleJob(id, appUrl){
     // ---------- 홈페이지 (HTML) ----------
     if(o.home){
       const dh = "analytics"; const urlH = String(job.url||"").trim();
-      if(urlH){ setStep("홈페이지 · 참고 URL 학습 중"); try{ await learnFromWebUrls(dh, [urlH]); }catch(e){ job._warn=(job._warn||"")+"홈페이지 학습 일부 실패; "; } }
+      if(urlH && !job._urlLearned){ setStep("📖 참고 URL 읽는 중 (이번 작업에서 1회만)"); try{ await learnFromWebUrls(dh, [urlH]); job._urlLearned=true; }catch(e){ job._warn=(job._warn||"")+"홈페이지 학습 일부 실패; "; } }
       setStep("홈페이지 · 초안 생성 중");
       let homeHtml = "";
       try{
-        const genH = await productPagePipeline({ kind:"home", dept:dh, product: topic, info: info+(memo?("\n[지시] "+memo):""), brand:"민앤팜" }, (s2)=>setStep("홈페이지 · "+s2));
-        if(genH.osera){ job._osera = job._osera||{}; job._osera.home = genH.osera; }
+        const genH = await productPagePipeline({ kind:"home", dept:dh, product: topic, info: info+(memo?("\n[지시] "+memo):""), brand:"민앤팜",
+          expBrief: job.expBrief||"", gate:false }, (s2)=>setStep("홈페이지 · "+s2));
         homeHtml = genH.html || "";
+        job._homeVisual = genH.visualDirection || null;
       }catch(e){ job._warn=(job._warn||"")+"홈페이지 생성 실패: "+String(e.message||e).slice(0,60)+"; "; }
       let homeResearch = "";
       if(homeHtml){
@@ -8098,11 +8259,25 @@ async function runCycleJob(id, appUrl){
         if(homeResearch){
           setStep("홈페이지 · 자료 반영해 재생성 중");
           try{
+            // ★ 최종본 — 여기서 오세라 검증
             const revH = await productPagePipeline({ kind:"home", dept:dh, product: topic, info: info, baseHtml: homeHtml,
+              expBrief: job.expBrief||"", visual: job._homeVisual, gate:true,
               feedback: "아래 최신 조사자료의 좋은 요소(구성·카피·신뢰 장치)를 반영해 더 완성도 높게 개선해줘. 전체 톤·구조는 유지하고 개선점만 자연스럽게:\n"+homeResearch }, (s2)=>setStep("홈페이지 · "+s2));
             if(revH.html && revH.html.length>200) homeHtml = revH.html;
+            if(revH.osera){ job._osera = job._osera||{}; job._osera.home = revH.osera; }
           }catch(_){}
         }
+      }
+      // ★ v244 안전망
+      if(homeHtml && !(job._osera && job._osera.home)){
+        setStep("홈페이지 · 👑 총괄 오세라 검증 중");
+        try{
+          const gh = await productPagePipeline({ kind:"home", dept:dh, product: topic, info: info, baseHtml: homeHtml,
+            expBrief: job.expBrief||"", visual: job._homeVisual, gate:true,
+            feedback: "구조·내용은 그대로 두고, 요구 미충족 항목만 채워라." }, (s2)=>setStep("홈페이지 · "+s2));
+          if(gh.html && gh.html.length>200) homeHtml = gh.html;
+          if(gh.osera){ job._osera = job._osera||{}; job._osera.home = gh.osera; }
+        }catch(_){}
       }
       results.home = homeHtml; results.homeTopic = topic;
       setStep("홈페이지 · 배운 것 누적 중");
@@ -8127,11 +8302,25 @@ async function runCycleJob(id, appUrl){
         if(pageResearch){
           setStep("상품페이지 · 자료 반영해 재생성 중");
           try{
+            // ★ 최종본 — 여기서 오세라 검증 (기존엔 최종본이 검증 없이 나갔다)
             const rev = await productPagePipeline({ product: topic, info: info, baseHtml: pageHtml,
+              expBrief: job.expBrief||"", visual: job._pageVisual, gate:true,
               feedback: "아래 최신 조사자료의 좋은 요소(구성·카피·전환 장치)를 반영해 더 완성도 높게 개선해줘. 전체 톤·구조는 유지하고 개선점만 자연스럽게:\n"+pageResearch }, (s)=>setStep("상품페이지 · "+s));
             if(rev.html && rev.html.length>200) pageHtml = rev.html;
+            if(rev.osera){ job._osera = job._osera||{}; job._osera.page = rev.osera; }
           }catch(_){}
         }
+      }
+      // ★ v244 안전망: 조사 실패로 재생성이 안 돌았다면 초안이 최종본 → 지금 검증한다
+      if(pageHtml && !(job._osera && job._osera.page)){
+        setStep("상품페이지 · 👑 총괄 오세라 검증 중");
+        try{
+          const gp = await productPagePipeline({ product: topic, info: info, baseHtml: pageHtml,
+            expBrief: job.expBrief||"", visual: job._pageVisual, gate:true,
+            feedback: "구조·내용은 그대로 두고, 요구 미충족 항목만 채워라." }, (s)=>setStep("상품페이지 · "+s));
+          if(gp.html && gp.html.length>200) pageHtml = gp.html;
+          if(gp.osera){ job._osera = job._osera||{}; job._osera.page = gp.osera; }
+        }catch(_){}
       }
       results.page = pageHtml; results.pageProduct = topic;
       setStep("상품페이지 · 배운 것 누적 중");
@@ -8153,7 +8342,8 @@ async function runCycleJob(id, appUrl){
       });
     }catch(_){}
     job.results = results;
-    job.status = "done"; job.doneAt = Date.now(); job.step = "완료"; trimCycleJobs(); saveDB();
+    job.status = "done";
+    doneJob(job, "✅ 완료 — "+(parts.join(" + ")||"결과 없음")); job.doneAt = Date.now(); job.step = "완료"; trimCycleJobs(); saveDB();
     const parts = []; if(results.sns) parts.push("SNS"); if(results.blog) parts.push("블로그"); if(results.cafe) parts.push("카페글"); if(results.youtube) parts.push("유튜브"); if(results.page) parts.push("상품페이지"); if(results.home) parts.push("홈페이지"); if(results.report) parts.push("리서치 보고서");
     const base = String(appUrl||(DB.state&&DB.state.appBase)||"").replace(/\/$/,"");
     let vsum = "";
@@ -8195,7 +8385,7 @@ app.post("/api/cycle/start", (req,res)=>{
 app.get("/api/cycle/status", (req,res)=>{
   const j = (DB.cycleJobs||[]).find(x=>x.id===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, warn:j._warn||"",
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", steps:(j.steps||[]).slice(-60), startedAt:j.startedAt||j.at||0, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, warn:j._warn||"",
     topic:j.topic, outputs:j.outputs, doneAt:j.doneAt||0,
     results: j.results ? { osera:j.results.osera||null, sns:j.results.sns||"", blog:j.results.blog||"", cafe:j.results.cafe||"", youtube:j.results.youtube||"", page:j.results.page||"", home:j.results.home||"", report:j.results.report||"", pageProduct:j.results.pageProduct||"", homeTopic:j.results.homeTopic||"", pageDropped:!!j.results.pageDropped, homeDropped:!!j.results.homeDropped } : null });
 });
@@ -8245,6 +8435,15 @@ app.post("/api/cycle/reserve/delete", (req,res)=>{
   res.json({ ok:true });
 });
 // 🔁 피드백 학습 루프: 결과가 마음에 안 들면 고쳐줘 → 재생성 + (원하면) 고정 취향으로 부서에 누적
+// v240: 선순환 작업 삭제 (디자인엔 있는데 선순환엔 없었다 — 같은 구멍)
+app.post("/api/cycle/delete", (req,res)=>{
+  const id = String((req.body&&req.body.id)||"");
+  const before = (DB.cycleJobs||[]).length;
+  DB.cycleJobs = (DB.cycleJobs||[]).filter(x=>String(x.id)!==id);
+  if(DB.cycleJobs.length===before) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  saveDB();
+  res.json({ ok:true, count:DB.cycleJobs.length });
+});
 app.post("/api/cycle/feedback", (req,res)=>{
   const b = req.body || {};
   const job = (DB.cycleJobs||[]).find(x=>x.id===String(b.id||""));
@@ -8260,12 +8459,20 @@ app.post("/api/cycle/feedback", (req,res)=>{
     beginJobMode();
     const prevStatus = job.status;
     try{
-      job.status = "running"; job.step = "🔁 수정 반영 중"; job.progAt = Date.now(); saveDB();
+      job.status = "running"; logStep(job, "🔁 수정 요청 반영 시작 — \""+feedback.slice(0,50)+"\"");
       if(kind === "report"){
         const cur = job.results.report || "";
         const rev = await reportPipeline({ topic: job.results.reportTopic||job.topic, info: job.info, memo: job.memo,
-          baseHtml: cur, feedback: feedback }, (s2)=>{ job.step="🔁 보고서 "+s2; job.progAt=Date.now(); saveDB(); });
-        if(rev.html && rev.html.length>200) job.results.report = rev.html;
+          baseHtml: cur, feedback: feedback }, (s2)=>{ logStep(job, "🔁 보고서 · "+s2); });
+        let _r = (rev.html && rev.html.length>200) ? rev.html : cur;
+        // v245: 수정본도 '최종본'이다 — 검증 없이 나가면 안 된다
+        const gR = await verifyFinal("리서치 보고서", _r, job.results.reportTopic||job.topic,
+          "너는 민앤팜 오세라다. 아래 보고서를 지적대로 고쳐 완전한 단일 HTML로 다시 출력하라. 설명 없이 HTML만."+designSystemBlock(),
+          "[현재 보고서]\n"+_r.slice(0,14000), (st)=>logStep(job, "🔁 보고서 · "+st),
+          { memo: feedback + "\n" + String(job.memo||"").slice(0,600) }, "anthropic");
+        if(gR.content && gR.content.length>200) _r = gR.content;
+        job.results.report = _r;
+        if(gR.review){ job.results.osera = job.results.osera||{}; job.results.osera.report = gR.review; }
         if(remember){ commitKnowledge("ops", "클라이언트 고정 취향(리서치 보고서): "+feedback, "피드백 학습");
           recordLearnLog({ dept:"ops", deptKr:(AGENTS.ops?AGENTS.ops.kr:"총괄"), kind:"feedback", ok:true, note:"고정 취향 학습: "+feedback.slice(0,60) });
         }
@@ -8274,10 +8481,12 @@ app.post("/api/cycle/feedback", (req,res)=>{
         const kd = isH ? "analytics" : "monetization";
         const knm = isH ? "홈페이지" : "상품페이지";
         const cur = job.results[kind] || "";
+        // v245: 수정본도 최종본 → gate:true
         const rev = await productPagePipeline({ kind:(isH?"home":"product"), dept:kd,
           product: (isH?(job.results.homeTopic||job.topic):(job.results.pageProduct||job.topic)), info: job.info,
-          baseHtml: cur, feedback: feedback }, (s)=>{ job.step="🔁 "+knm+" "+s; job.progAt=Date.now(); saveDB(); });
+          baseHtml: cur, feedback: feedback, gate:true }, (s)=>{ logStep(job, "🔁 "+knm+" · "+s); });
         if(rev.html && rev.html.length>200) job.results[kind] = rev.html;
+        if(rev.osera){ job.results.osera = job.results.osera||{}; job.results.osera[kind] = rev.osera; }
         if(remember){ commitKnowledge(kd, "클라이언트 고정 취향("+knm+"): "+feedback, "피드백 학습");
           recordLearnLog({ dept:kd, deptKr:(AGENTS[kd]?AGENTS[kd].kr:kd), kind:"feedback", ok:true, note:"고정 취향 학습: "+feedback.slice(0,60) });
           try{ await absorbToLeader([kd], "피드백"); }catch(_){}
@@ -8290,8 +8499,17 @@ app.post("/api/cycle/feedback", (req,res)=>{
         const cur = job.results[kind] || "";
         const um = "[기존 "+spec.label+"]\n"+cur+"\n\n[클라이언트 수정 요청]\n"+feedback+"\n\n(요청대로 고친 완성본만)";
         let out = "";
-        try{ const g = await createReviewedContent(sys, um, job.topic, workEngine()); out = g.content||""; }
-        catch(e){ out = await genText(sys, um, 1800, workEngine()); }
+        // v245: 수정본도 최종본 → 오세라 검증을 거친다
+        try{ const g = await createReviewedContent(sys, um, job.topic, workEngine(), { gate:true }); out = g.content||"";
+             if(g.osera){ job.results.osera = job.results.osera||{}; job.results.osera[kind] = g.osera; } }
+        catch(e){
+          out = await genText(sys, um, 1800, workEngine());
+          try{
+            const g2 = await verifyFinal(spec.label, out, job.topic, sys, um, (st)=>logStep(job, "🔁 "+spec.label+" · "+st), { memo: feedback });
+            if(g2.content) out = g2.content;
+            if(g2.review){ job.results.osera = job.results.osera||{}; job.results.osera[kind] = g2.review; }
+          }catch(_){}
+        }
         if(out && out.length>20) job.results[kind] = out;
         if(remember){ commitKnowledge(d, "클라이언트 고정 취향("+spec.label+"): "+feedback, "피드백 학습");
           recordLearnLog({ dept:d, deptKr:a.kr, kind:"feedback", ok:true, note:"고정 취향 학습: "+feedback.slice(0,60) });
@@ -8385,7 +8603,7 @@ function trimDesignJobs(){
 async function runDesignJob(id, appUrl){
   const job = (DB.designJobs||[]).find(j=>j.id===id);
   if(!job) return;
-  const setStep = (s)=>{ job.step=s; job.progAt=Date.now(); saveDB(); };
+  const setStep = (s)=>{ logStep(job, s); };
   job.status="running"; job.startedAt=Date.now(); setStep("시작");
   beginJobMode();
   try{
@@ -8394,7 +8612,7 @@ async function runDesignJob(id, appUrl){
     const brief = String(job.brief||"").slice(0,1500);
     const memo = String(job.memo||"").slice(0,800);
     const url = String(job.url||"").trim();
-    if(url){ setStep("참고 URL 학습 중"); try{ await learnFromWebUrls(d, [url]); }catch(_){ job._warn="참고 URL 학습 일부 실패; "; } }
+    if(url){ setStep("📖 참고 URL 읽는 중 — 이 사이트의 구조·톤을 학습해 반영합니다"); try{ await learnFromWebUrls(d, [url]); }catch(_){ job._warn="참고 URL 학습 일부 실패; "; } }
     const kb = knowledgeText(d);
     const isRevise = !!(job.baseOutput && job.feedback);
     // 📚 v237: 만들기 전 — 경험 전부 훑기
@@ -8409,7 +8627,7 @@ async function runDesignJob(id, appUrl){
           + " 아래 기존 "+spec.label+" HTML을 클라이언트 요청대로 수정해 완전한 단일 HTML 문서로 다시 출력하라. 요청 부분만 반영하고 나머지는 유지. 설명·머리말·마크다운 표시 금지, HTML만.";
         user = "[기존 HTML]\n"+job.baseOutput+"\n\n[수정 요청]\n"+job.feedback;
       } else {
-        setStep("비주얼 디렉션 잡는 중");
+        setStep("🎨 아트디렉터 윤소희 — 색·타이포·레이아웃·시그니처를 먼저 확정합니다 (이게 품질을 좌우해요)");
         let visualBlock = "";
         try{
           const vSys = "너는 민앤팜(전남 고흥 특산물)의 아트디렉터다."+brandBlock()
@@ -8430,47 +8648,33 @@ async function runDesignJob(id, appUrl){
               body: JSON.stringify(vj).slice(0,2000) }); }catch(_){}
           }
         }catch(_){}
-        setStep("디자인 코딩 중");
+        setStep("💻 확정된 비주얼대로 HTML 코딩 중 (1~3분)");
         sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 수석 웹디자이너다. "+ADDRESS
           + " 아래 요청으로 '실제로 바로 열리는 완성형 단일 HTML 문서'를 만들어라. "+spec.hint
           + " ★필수: 콘텐츠는 자바스크립트 없이도 즉시 보여야 한다. opacity:0 / visibility:hidden 상태로 시작해서 JS(IntersectionObserver 등)로 나타나게 하는 스크롤 리빌은 금지 — JS가 한 줄이라도 실패하면 페이지 전체가 백지가 된다. 애니메이션은 CSS @keyframes로만, 끝난 상태가 아니라 처음부터 보이는 상태에서 시작하라(animation-fill-mode 의존 금지). localStorage·sessionStorage·쿠키는 절대 쓰지 마라(샌드박스에서 예외를 던져 스크립트가 죽는다). 반드시: (1) <!DOCTYPE html>~</html> 완전한 문서, CSS는 <style>에 인라인. (2) 고급스러운 여백·타이포·색감, 모바일 반응형. (3) 사진 자리는 <div class=\"img-ph\">[이미지: 묘사]</div> 플레이스홀더. (4) 과장광고 금지. (5) 'AI가 만든 흔한 웹' 티 금지 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목+아이콘 카드 3개' 같은 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색·폰트·레이아웃을 실제로 구현하며 시그니처 요소를 눈에 띄게 살려라. 설명·마크다운 없이 HTML만."
           + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + designSystemBlock() + dExpBrief + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext(spec.label+" "+brief.slice(0,200));
         user = "요청: "+spec.label+"\n브리프: "+brief+(url?("\n참고(학습됨): "+url):"");
       }
-      setStep("마무리 중");
+      setStep("📦 코드 정리 후 오세라에게 넘기는 중");
       let html = await anthropic(sys, user, 8000);
       html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
-      // 🔁 목표 기반 루프: 검수관이 비주얼 디렉션·기준 충족까지 최대 N회 수정(신규 생성만, 상한으로 토큰 보호)
-      const _maxLoops = Math.max(0, Math.min(3, (DB.state && DB.state.designReviewLoops!=null) ? (+DB.state.designReviewLoops||0) : 1));
-      if(!isRevise && _maxLoops>0){
-        job.designReviews=[];
-        for(let i=0;i<_maxLoops;i++){
-          setStep("검수관이 디자인 점검 중 ("+(i+1)+"/"+_maxLoops+")");
-          const rv = await reviewDesignHtml(html, job.visualDirection);
-          job.designReviews.push({ round:i+1, pass:rv.pass, feedback:rv.feedback });
-          if(rv.pass) break;
-          setStep("검수 반영해 수정 중 ("+(i+1)+"/"+_maxLoops+")");
-          const fixSys = sys + "\n\n[검수관 피드백 — 반드시 반영해 '완전한 단일 HTML'을 다시 출력, 잘된 부분은 유지]\n"+rv.feedback;
-          try{ let fx=await anthropic(fixSys, "[현재 HTML]\n"+html.slice(0,14000)+"\n\n(피드백 반영한 완성 HTML만)", 8000);
-            fx=String(fx).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
-            if(fx && /<\/html>/i.test(fx)) html=fx;
-          }catch(e){ break; }
-        }
-      }
-      // 👑 오세라 최종 검수
-      if(!isRevise){
+      // v242: 익명 검수관 루프 제거 — 검증은 총괄 오세라가 한다(비주얼 디렉션도 명세로 검증)
+
+      // 👑 오세라 최종 검증 — v245: 수정(고쳐줘) 결과도 최종본이므로 반드시 검증
+      {
         try{
           const g = await oseraGate(spec.label, html, brief, async function(fx, iss){
             const fs2 = sys + "\n\n[👑 총괄 오세라의 최종 지적 — 전부 반영해 완전한 단일 HTML을 다시 출력하라]\n"
               + (iss&&iss.length?("· "+iss.join("\n· ")+"\n"):"") + "가장 중요한 수정: " + fx;
             const o = await anthropic(fs2, "[현재 HTML]\n"+html.slice(0,14000), 8000);
             return String(o).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
-          }, setStep, { memo: String(memo||"").slice(0,1200), brief: brief });
+          }, setStep, { memo: String(memo||"").slice(0,1200), brief: brief, visual: job.visualDirection || null });
           if(g.content && g.content.length>300) html = g.content;
           job.osera = g.review; job.oseraPassed = g.passed;
         }catch(e){}
       }
       job.output = html; job.isHtml = true;
+      doneJob(job, "✅ 완료 — 오세라 검증 "+((job.osera&&job.osera.score)!=null?(job.osera.score+"%"):"통과"));
     } else {
       setStep("구성안 작성 중");
       sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석이다."+ADDRESS+STYLE
@@ -8479,7 +8683,7 @@ async function runDesignJob(id, appUrl){
       user = "요청: "+spec.label+"\n브리프: "+brief+(url?("\n참고(학습됨): "+url):"")+(isRevise?("\n\n[기존안]\n"+job.baseOutput+"\n\n[수정 요청]\n"+job.feedback):"");
       const txt = await anthropic(sys, user, 2500);
       let _t = String(txt).trim();
-      if(!isRevise){
+      {
         try{
           const g = await oseraGate(spec.label, _t, brief, async function(fx, iss){
             const fs2 = sys + "\n\n[👑 총괄 오세라의 최종 지적 — 전부 반영해 다시 써라]\n"
@@ -8491,6 +8695,7 @@ async function runDesignJob(id, appUrl){
         }catch(e){}
       }
       job.output = _t; job.isHtml = false;
+      doneJob(job, "✅ 완료 — 오세라 검증 "+((job.osera&&job.osera.score)!=null?(job.osera.score+"%"):"통과"));
     }
     // 결과에서 배운 것 누적(웹디자인 부서 성장)
     try{ await accumulateFromResult(d, spec.label+" · "+String(job.brief||"").slice(0,30), String(job.output||"").slice(0,1500), ""); }catch(_){}
@@ -8536,7 +8741,7 @@ app.post("/api/design/start", (req,res)=>{
 app.get("/api/design/status", (req,res)=>{
   const j = (DB.designJobs||[]).find(x=>x.id===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, kind:j.kind, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, warn:j._warn||"", isHtml:!!j.isHtml, doneAt:j.doneAt||0 });
+  res.json({ ok:true, id:j.id, kind:j.kind, status:j.status, step:j.step||"", steps:(j.steps||[]).slice(-60), startedAt:j.startedAt||j.at||0, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, warn:j._warn||"", isHtml:!!j.isHtml, doneAt:j.doneAt||0 });
 });
 app.get("/api/design/list", (req,res)=>{
   const jobs = (DB.designJobs||[]).slice(-14).reverse().map(j=>({
@@ -8588,6 +8793,37 @@ setInterval(async ()=>{
       if (mt && mt.status==="running"){
         const started = mt.at || 0;
         if (started && (t0 - started) > STUCK){ mt.status = "error"; mt.error = "처리가 지연돼 자동 중단됨(서버 지연/끊김)"; fixed++; }
+      }
+    }
+    // v240: 워치독이 회의·발행만 보고 있었다 → 6개 큐 전부를 감시한다.
+    //   서버가 살아 있는 채로 작업이 멈추면(fetch 매달림 등) 영원히 '진행 중'에 갇혔다.
+    //   긴 작업(경험 훑기 + 8000토큰 생성 + 검수 루프)이 있으므로 여유를 크게 준다.
+    const LONG_STUCK = 45*60*1000;   // 45분 넘게 진행 중 → 끊긴 것
+    const LONG_STALL = 12*60*1000;   // 또는 12분간 단계 변화 없음 → 멈춘 것
+    const QUEUES = [
+      [DB.designJobs,    "디자인"],
+      [DB.cycleJobs,     "선순환"],
+      [DB.pageJobs,      "상품페이지"],
+      [DB.learnJobs,     "학습"],
+      [DB.videoJobs,     "영상"],
+      [DB.repurposeJobs, "재활용"]
+    ];
+    for (const [arr, label] of QUEUES){
+      for (const jb of (arr||[])){
+        if (!jb || (jb.status!=="running" && jb.status!=="queued")) continue;
+        if (jb.status==="queued" && jb._requeued) continue;
+        const started = jb.startedAt || jb.at || 0;
+        const beat = jb.progAt || jb.startedAt || jb.at || 0;
+        const dead = (started && (t0 - started) > LONG_STUCK) || (beat && (t0 - beat) > LONG_STALL);
+        if (dead){
+          const mins = Math.round((t0 - beat)/60000);
+          try{
+            failJob(jb, new Error(mins+"분 동안 진행이 없어 자동 중단됐어요 (마지막 단계: "+(jb.step||"?")+"). 서버 지연이거나 AI 응답이 끊긴 경우예요 — 🔄 다시 시도해 주세요."), label+"-watchdog");
+          }catch(_){
+            jb.status="error"; jb.error="진행이 멈춰 자동 중단됨"; jb.doneAt=t0;
+          }
+          fixed++;
+        }
       }
     }
     for (const jb of (DB.jobs||[])){
