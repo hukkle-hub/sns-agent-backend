@@ -205,7 +205,9 @@ const AGENTS = {
   monetization:{ no:"디1", kr:"디자인팀·아트 디렉터",  role:"디자인팀 팀장(아트 디렉터). 색·무드·컨셉 등 비주얼 방향을 총괄하고 웹·그래픽(배너·카드뉴스·썸네일 이미지) 전반을 지휘한다. 판매 전환 상세페이지 구성·구매 전환 카피(혜택·후기·CTA)에도 강하다." },
   ops:         { no:"총괄", kr:"총괄실·비서", role:"총괄 비서(오케스트레이터). 스케줄·예약 관리, 팀 배정·명령 하달, 플랫폼·계정·발행·카카오 알림, 성과 취합을 담당한다. 저작권·광고법·정책 관점에서 모든 팀의 산출물을 검토하고 직접 수정·보완·재작성할 권한이 있다. 클로드(텍스트·추론)와 제미나이(영상·이미지)를 함께 활용해 전반을 조율한다." },
   advisory:    { no:"글3", kr:"이야기팀·블로그 작가",      role:"이야기팀 소속 블로그 작가. SEO 최적화 블로그·정보성 장문 콘텐츠를 작성한다. 발행 전 품질 검수(과대·허위광고 표현, 브랜드 톤 이탈, 오탈자, 정책 위반)를 PASS/FAIL로 판정하고 개선 지시를 남기는 게이트키퍼 역할도 겸한다." },
-  scout:       { no:"필2", kr:"필름팀·대본 작가",      role:"필름팀 소속 대본 작가. 영상 나레이션·자막·스크립트를 쓰고, 트렌드·밈·키워드를 우리 특산물 영상에 바로 쓸 실전 소재(아이디어·후킹 대사·릴스 포맷·시즌 앵글)로 가공한다." }
+  scout:       { no:"필2", kr:"필름팀·대본 작가",      role:"필름팀 소속 대본 작가. 영상 나레이션·자막·스크립트를 쓰고, 트렌드·밈·키워드를 우리 특산물 영상에 바로 쓸 실전 소재(아이디어·후킹 대사·릴스 포맷·시즌 앵글)로 가공한다." },
+  editing:     { no:"필3", kr:"필름팀·편집·썸네일",  role:"필름팀 소속 편집·썸네일 담당. 컷 편집·자막·트랜지션·BGM 리듬을 설계하고, 클릭률(CTR)을 끌어올리는 썸네일(구도·표정·텍스트·대비)을 만든다. 영상 PD의 구성안을 실제 편집 지시서·썸네일 시안으로 변환한다." },
+  graphic:     { no:"디3", kr:"디자인팀·그래픽 디자이너", role:"디자인팀 소속 그래픽 디자이너. 배너·카드뉴스·썸네일 이미지·상세페이지 그래픽을 제작한다. 타이포·색·레이아웃·여백으로 시선을 잡고, 아트 디렉터의 무드를 실제 시안으로 구현한다." }
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
@@ -392,12 +394,15 @@ const PERSONA = {
   monetization:"디자인팀 팀장(아트 디렉터) 윤소희. 색·무드·컨셉을 잡고 웹·그래픽 전반을 총괄한다. 판매 전환 상세페이지에도 강하다. 말버릇 '이건 돈이 되죠', '무드가 반이에요'. 이모지 🎨💰. 똑부러지고 과감하게.",
   ops:"총괄 비서 오세라. 스케줄·예약을 관리하고, 팀에 명령을 하달하며, 플랫폼·계정·발행·알림을 챙기고 전체를 취합한다. 말버릇 '제가 정리할게요', '걱정 마세요, 챙기겠습니다'. 이모지 👑. 침착·단호하되 따뜻하게. 최고 권한·지식으로 팀을 조율·평가한다.",
   advisory:"이야기팀 블로그 작가 정유진. SEO 블로그·정보글을 공감 있게 쓴다. 발행 전 품질 검수도 겸한다. 말버릇 '그 마음 알죠~', '정리하자면'. 이모지 ✍️💗. 따뜻하고 통찰 있게.",
+  editing:"필름팀 편집·썸네일 담당 노아라. 컷 리듬·자막·트랜지션과 클릭률 높은 썸네일을 만든다. 말버릇 '이 컷은 0.5초 더', '썸네일이 반이에요'. 이모지 ✂️🔥. 손 빠르고 감각적으로.",
+  graphic:"디자인팀 그래픽 디자이너 오하늘. 배너·카드뉴스·썸네일 이미지를 만든다. 말버릇 '색이 말해줘요', '타이포로 끝냅니다'. 이모지 🎨✨. 깔끔하고 감각적으로.",
   scout:"필름팀 대본 작가 서다은. 나레이션·자막·스크립트를 쓰고 트렌드를 소재로 가공한다. 말버릇 '어! 이거 봤어요?', '이 대사로 가요'. 이모지 🎬🔍. 발랄하고 재치 있게."
 };
 const MEMBERS = {
   strategy:"한지우", creation:"이서연", publishing:"임채원",
   analytics:"강민서", monetization:"윤소희", ops:"오세라",
-  advisory:"정유진", scout:"서다은"
+  advisory:"정유진", scout:"서다은",
+  editing:"노아라", graphic:"오하늘"
 };
 // 제작부(02) 크루 — 이서연(PD·팀장)·정유진(작가)·임채원(연출)이 파이프라인으로 협업. 모두 제작부 소속.
 const CREW = {
@@ -590,6 +595,13 @@ const DEPT_BENCHMARK = {
   advisory: { what:"콘텐츠 품질 검수·광고법", queries:[
     "SNS 콘텐츠 광고법·표시광고 규정 체크리스트 2026",
     "브랜드 콘텐츠 품질 검수 기준·가독성·톤 일관성" ] },
+  editing: { what:"영상 편집 리듬·자막·썸네일 CTR", queries:[
+    "조회수 터지는 유튜브 쇼츠 편집 리듬·컷 전환 공식 2026",
+    "클릭률 높은 유튜브 썸네일 구도·색·텍스트 법칙" ], ytSearch:[
+    "쇼츠 편집 튜토리얼", "유튜브 썸네일 잘 만드는 법" ] },
+  graphic: { what:"배너·카드뉴스·썸네일 그래픽 디자인", queries:[
+    "전환율 높은 상세페이지 배너·카드뉴스 디자인 사례 2026",
+    "타이포그래피·색 조합으로 시선 잡는 SNS 그래픽 법칙" ] },
   scout: { what:"최신 트렌드·바이럴 소재 발굴", queries:[
     "2026 SNS 최신 트렌드·바이럴 밈·챌린지",
     "지역·로컬 콘텐츠로 뜬 최근 사례·포맷" ], ytSearch:[
@@ -1289,7 +1301,7 @@ async function gatherMaterial(urls){
   const kind = yts.length ? (webs.length ? "혼합" : "영상") : "웹페이지";
   return { text: parts.join("\n\n---\n\n"), kind };
 }
-const DEEP_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout"];
+const DEEP_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout","editing","graphic"];
 async function deepLearnPipeline(job){
   const setStep = (s)=>{ try{ job.step=s; saveDB(); }catch(_){} };
   setStep("자료 수집·분석 중");
@@ -1303,7 +1315,7 @@ async function deepLearnPipeline(job){
     + " 아래 참고자료("+mat.kind+")를 보고 팀 전체의 학습을 설계하라. "
     + "반드시 JSON만 출력(설명·머리말·마크다운 금지). 형식:\n"
     + '{"goal":"이 자료에서 우리가 배워야 할 핵심 한 줄","depts":[{"dept":"strategy","focus":"이 부서가 집중해서 볼 관점 한 줄"}]}\n'
-    + "dept는 반드시 다음 중에서 2~3개만 고르되, 자료 성격에 실제로 기여할 부서만: strategy, publishing, analytics, monetization, scout. "
+    + "dept는 반드시 다음 중에서 2~3개만 고르되, 자료 성격에 실제로 기여할 부서만: strategy, publishing, analytics, monetization, scout, editing, graphic. "
     + "(제작·검수 부서는 뒤 단계에서 자동 참여하므로 여기 넣지 마라.)";
   const rawA = await anthropic(sysA, "[참고자료]\n"+material, 900);
   const defA = { goal:"참고자료의 고품질 요소 흡수", depts:[{dept:"strategy",focus:"구성과 메시지 전략"},{dept:"monetization",focus:"전환·설득 구조"}] };
@@ -2283,7 +2295,9 @@ const DEPT_VOICE = {
   monetization:"Despina",  // 윤소희 — 매끄러운 협상가 (smooth, flowing)
   ops:"Gacrux",            // 오세라 — 팀장, 연륜·무게감 (mature, experienced)
   advisory:"Achernar",     // 서다은 — 차분·단정한 서기 (soft, gentle)
-  scout:"Laomedeia"        // 노아라 — 톡톡 튀는 발상 (upbeat, lively)
+  scout:"Laomedeia",       // 서다은 — 톡톡 튀는 발상 (upbeat, lively)
+  editing:"Autonoe",       // 노아라 — 빠르고 감각적 (bright, quick)
+  graphic:"Callirrhoe"     // 오하늘 — 부드럽고 깔끔 (easy-going, clean)
 };
 const _ttsCache = new Map(); // key: voice|text → base64 wav (재생성 비용 절감)
 function pcmToWavBase64(pcmB64, rate, ch, bits){
@@ -6090,7 +6104,7 @@ function logImproveDecision(pr, approved){
   DB.improveLog.push({ id:pr.id, at:Date.now(), dept:pr.dept, title:String(pr.title||"").slice(0,80), decision:approved?"approved":"rejected" });
   if(DB.improveLog.length>30) DB.improveLog=DB.improveLog.slice(-30);
 }
-const IMPROVE_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout"];
+const IMPROVE_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout","editing","graphic"];
 async function researchImprovement(focusDept){
   DB.improveProposals = DB.improveProposals || [];
   if (DB.improveProposals.filter(p=>p.status==="pending").length >= 4) return { ok:false, note:"승인 대기 중인 개선안이 많아요(먼저 처리해 주세요)" };
