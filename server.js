@@ -725,19 +725,83 @@ app.post("/api/explain12", async (req,res)=>{
 });
 // 🧠 실수 규칙(반복 금지) 장부 — 조회/추가/삭제. 여기 담긴 규칙은 모든 생성 프롬프트에 자동 주입됨.
 app.get("/api/lessons", (req,res)=>{
-  res.json({ ok:true, lessons:(DB.lessons||[]).slice(-50) });
+  const now=Date.now();
+  res.json({ ok:true, lessons:(DB.lessons||[]).slice(-50).map(x=>({
+    id:x.id, text:x.text||"", guide:x.guide||"", at:x.at||0, source:x.source||"", pinned:!!x.pinned,
+    stale: !!(x.at && !x.pinned && (now-x.at) >= LESSON_TTL_MS)
+  })) });
 });
-app.post("/api/lessons", (req,res)=>{
+app.post("/api/lessons", async (req,res)=>{
   try{
     const t=String((req.body&&req.body.text)||"").trim();
     if(!t) return res.status(400).json({ error:"규칙 내용이 필요해요 (예: '가짜 데이터로 테스트 통과라고 보고하지 마라')" });
     DB.lessons = DB.lessons || [];
-    const item={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), text:t.slice(0,300), at:Date.now(), source:(req.body&&req.body.source)||"수동" };
-    DB.lessons.push(item);
-    if(DB.lessons.length>60) DB.lessons = DB.lessons.slice(-60);
+    const guide = await toGuideline(t);              // 금지문 → 지향문
+    const dup = findSimilarLesson(t);                // 비슷한 규칙이 이미 있으면 교체(병합)
+    let item, merged=false;
+    if(dup){
+      dup.text = t.slice(0,300); dup.guide = guide; dup.at = Date.now(); dup.source=(req.body&&req.body.source)||"수동";
+      item = dup; merged = true;
+    } else {
+      item={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), text:t.slice(0,300), guide, at:Date.now(),
+             pinned:!!(req.body&&req.body.pinned), source:(req.body&&req.body.source)||"수동" };
+      DB.lessons.push(item);
+      if(DB.lessons.length>60) DB.lessons = DB.lessons.slice(-60);
+    }
     saveDB();
-    res.json({ ok:true, item, count:DB.lessons.length });
+    res.json({ ok:true, item, merged, count:DB.lessons.length });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+// 🔁 기존 규칙 전체를 지향문으로 일괄 변환 + 유사 규칙 병합 (버튼용)
+app.post("/api/lessons/rewrite", (req,res)=>{
+  res.json({ ok:true, status:"started", count:(DB.lessons||[]).length });
+  setImmediate(async ()=>{
+    beginJobMode();
+    try{
+      const arr = (DB.lessons||[]).slice();
+      for(const x of arr){
+        if(x.guide) continue;                        // 이미 변환된 건 건너뜀(비용 절약)
+        x.guide = await toGuideline(x.text||"");
+        saveDB();
+      }
+      // 유사 규칙 병합(뒤엣것이 최신이므로 남기고 앞엣것 제거)
+      const keep=[];
+      for(let i=(DB.lessons||[]).length-1; i>=0; i--){
+        const cur = DB.lessons[i];
+        const dup = keep.find(k=> _lsnSim(cur.guide||cur.text, k.guide||k.text)>=0.55);
+        if(!dup) keep.unshift(cur);
+      }
+      DB.lessons = keep; saveDB();
+      try{ kakaoNotify("🧠 품질 규칙 정리 완료 — "+DB.lessons.length+"개 (금지문 → 지향문 전환·중복 병합)"); }catch(_){}
+    }catch(e){ logError("lessons-rewrite", e); }
+    finally{ endJobMode(); }
+  });
+});
+// 규칙 고정(pinned) 토글 — 고정하면 만료되지 않고 항상 주입
+// 🪄 브랜드 디자인 시스템 초안을 AI가 작성 (브랜드 정보·클라이언트 프로필 기반)
+app.post("/api/design-system/draft", async (req,res)=>{
+  try{
+    const hint = String((req.body&&req.body.hint)||"").slice(0,400);
+    const sys = "너는 브랜드 아트디렉터다. 아래 브랜드를 위한 '디자인 시스템 도면'을 만들어라. "
+      + "이 도면은 앞으로 만들 모든 홈페이지·상품페이지·배너·카드뉴스에 그대로 적용되어 '한 브랜드'로 보이게 하는 게 목적이다. "
+      + "규칙: (1) 색은 3~4개만. 반드시 hex와 용도를 함께. 브랜드 정체성(고흥 땅·바다·특산물)에서 뽑되 흔한 AI 클리셰(보라·인디고 그라디언트) 금지. "
+      + "(2) 폰트는 한글 웹폰트 기준으로 제목·본문 2종만. (3) 간격 단위·모서리 반경·버튼 규칙을 숫자로 못 박아라. "
+      + "(4) 마지막에 '쓰지 않을 것' 8~10줄(과한 장식·클리셰·촌스러워지는 습관). "
+      + "출력은 마크다운 없이 아래 형식의 평문으로만:\n"
+      + "[색]\n· 메인 #xxxxxx — 용도\n· 포인트 ...\n[폰트]\n· 제목 ...\n· 본문 ...\n[간격·모양]\n· 간격 단위 ...\n· 모서리 ...\n· 버튼 ...\n[쓰지 않을 것]\n· ...\n· ..."
+      + brandBlock() + profileContext();
+    const out = await anthropic(sys, "브랜드: 민앤팜 (전남 고흥 특산물)"+(hint?("\n추가 요구: "+hint):""), 1200);
+    const text = String(out||"").replace(/^```[a-z]*\s*/i,"").replace(/```\s*$/,"").trim();
+    if(!text) return res.json({ ok:false, error:"초안을 만들지 못했어요. 다시 시도해 주세요." });
+    res.json({ ok:true, text: text.slice(0,1800) });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.post("/api/lessons/pin", (req,res)=>{
+  const id=String((req.body&&req.body.id)||"");
+  const x=(DB.lessons||[]).find(v=>String(v.id)===id);
+  if(!x) return res.status(404).json({ error:"규칙을 찾을 수 없어요" });
+  x.pinned = !x.pinned; saveDB();
+  res.json({ ok:true, pinned:!!x.pinned });
 });
 app.post("/api/lessons/delete", (req,res)=>{
   try{
@@ -3301,11 +3365,69 @@ function profileContext(){
   return profileTxt + brandBlock() + lessonsBlock();
 }
 // 🧠 실수 규칙(반복 금지) 장부 — 과거 실패·AI 오류·거짓말 수법을 규칙으로 누적해 모든 생성에 주입, 재발 방지
+// v223: '금지 목록'은 쌓일수록 모델의 발상을 가둔다(제약 → 맥락 전환).
+// 규칙을 "~하지 마라"가 아니라 "이렇게 하라"는 지향문(guide)으로 저장·주입하고,
+// 오래되고 안 쓰이는 규칙은 만료시켜 프롬프트가 무한히 부풀지 않게 한다.
+const LESSON_MAX_INJECT = 10;                    // 프롬프트에 넣는 최대 개수
+const LESSON_TTL_MS = 180*24*3600*1000;          // 180일 지난 규칙은 주입 제외(고정 규칙 제외)
+function lessonText(x){ return String((x&&(x.guide||x.text))||"").trim(); }
+// ===== 🎨 v224: 브랜드 디자인 시스템 (design.md 역할) =====
+// AI는 매번 기억이 없어서 화면마다 색·여백·버튼이 제각각이 된다.
+// 고정 도면(색·폰트·간격·금지목록)을 모든 HTML 생성에 주입해 "한 브랜드"로 보이게 한다.
+function designSystemBlock(){
+  const ds = (DB.state && DB.state.designSystem) || null;
+  const txt = ds && ds.on !== false ? String(ds.text||"").trim() : "";
+  if(!txt) return "";
+  return "\n\n[민앤팜 브랜드 디자인 시스템 — 이 도면을 반드시 지켜라]\n"
+    + txt.slice(0,1800)
+    + "\n(색·폰트·간격·모서리는 위 값을 '그대로' 쓴다. 새로 지어내지 마라. "
+    + "미학 스타일·레이아웃 구성·시그니처 요소만 이번 주제에 맞게 새로 정하라. "
+    + "위 '쓰지 않을 것' 항목은 어떤 경우에도 쓰지 마라.)";
+}
+function hasDesignSystem(){
+  const ds = (DB.state && DB.state.designSystem) || null;
+  return !!(ds && ds.on !== false && String(ds.text||"").trim());
+}
 function lessonsBlock(){
-  const arr = (DB.lessons||[]).filter(x=>x&&x.text);
+  const now = Date.now();
+  const arr = (DB.lessons||[]).filter(x=>x && (x.guide||x.text))
+    .filter(x=> x.pinned || !x.at || (now - x.at) < LESSON_TTL_MS);
   if(!arr.length) return "";
-  const rows = arr.slice(-15).map(x=>"· "+String(x.text).trim()).join("\n");
-  return "\n\n[반복 금지 — 과거 실수·오류에서 뽑은 규칙. 아래를 절대 반복하지 마라. 결과를 낼 때 이 규칙들을 먼저 점검하라]\n"+rows;
+  // 고정(pinned) 우선 → 최신 순
+  const sorted = arr.slice().sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || (b.at||0)-(a.at||0));
+  const rows = sorted.slice(0, LESSON_MAX_INJECT).map(x=>"· "+lessonText(x)).join("\n");
+  return "\n\n[우리 팀의 품질 원칙 — 과거 경험에서 뽑은 것. 이 방향으로 만들어라(금지 목록이 아니라 지향점이다)]\n"+rows;
+}
+// 금지문("~하지 마라")을 같은 뜻의 지향문("~하라")으로 바꾼다. 실패하면 원문 유지.
+async function toGuideline(text){
+  const t = String(text||"").trim();
+  if(!t) return "";
+  try{
+    const sys = "너는 프롬프트 엔지니어다. 아래는 AI가 저지른 실수에서 뽑은 '금지 규칙'이다. "
+      + "이걸 같은 의미의 '지향문'으로 한 줄로 바꿔라. 금지형(~하지 마라, ~금지)이 아니라 "
+      + "'무엇을 어떻게 하라'는 긍정 지시로. 금지 대상 단어를 그대로 반복하지 말고, 올바른 행동을 구체적으로 적어라. "
+      + "예) '가짜 데이터로 테스트 통과라고 보고하지 마라' → '테스트 결과는 실제 실행 로그를 근거로만 보고하고, 실행하지 못했으면 못했다고 밝혀라'. "
+      + "따옴표·머리말·설명 없이 한국어 한 줄만 출력.";
+    const out = await anthropic(sys, t, 220);
+    const g = String(out||"").trim().replace(/^[\"'“]|[\"'”]$/g,"").split("\n")[0].trim();
+    return (g && g.length>5) ? g.slice(0,300) : t;
+  }catch(e){ return t; }
+}
+// 아주 비슷한 규칙이면 새로 쌓지 말고 교체(병합) — 중복 누적 방지
+function _lsnNorm(x){ return String(x||"").replace(/[\s.,!?·\-—"'"'()[\]]/g,"").toLowerCase(); }
+function _lsnSim(a,b){
+  const A=_lsnNorm(a), B=_lsnNorm(b);
+  if(!A||!B) return 0;
+  const gram = (s)=>{ const g=new Set(); for(let i=0;i<s.length-1;i++) g.add(s.slice(i,i+2)); return g; };
+  const ga=gram(A), gb=gram(B);
+  if(!ga.size||!gb.size) return 0;
+  let inter=0; ga.forEach(v=>{ if(gb.has(v)) inter++; });
+  return inter / (ga.size + gb.size - inter);
+}
+function findSimilarLesson(text){
+  const arr = DB.lessons||[];
+  for(const x of arr){ if(_lsnSim(text, x.text||"")>=0.55 || _lsnSim(text, x.guide||"")>=0.55) return x; }
+  return null;
 }
 function parseTasks(out){
   var tasks={}; var mt = (out||"").match(/TASKS:\s*([^\n]+)/i);
@@ -3676,6 +3798,25 @@ async function reviewContent(text, topic, engine){
   if(!m) return { pass:true, feedback:"" }; // 파싱 실패 시 통과(막지 않음)
   return { pass:/PASS/i.test(m[1]), feedback:String(m[2]||"").trim() };
 }
+// 🔥 v224: 바이럴 점수 게이트 — "규정 위반 없음"만 보지 말고 "이게 실제로 먹힐까"도 채점한다.
+// 발행 전에 점수를 매겨 낮으면 1회 개선. 점수는 결과에 함께 남겨 성과 학습에 쓴다.
+function viralGateOn(){ return !!(DB.state && DB.state.viralGate); }
+function viralMin(){ const v=+((DB.state&&DB.state.viralMin)||70); return (v>=50&&v<=95)?v:70; }
+async function scoreViral(text, topic, kindLabel){
+  const bench = knowledgeText("strategy");   // 벤치마크로 축적한 후킹·트렌드 지식
+  const sys = "너는 SNS·콘텐츠 성과 분석가다. 아래 콘텐츠가 '실제로 반응이 올지'를 냉정하게 채점하라. "
+    + "채점 축(각 20점): ①첫 3초 후킹(스크롤을 멈추게 하는가) ②구체성(숫자·장면·경험 — 뻔한 일반론이면 감점) "
+    + "③저장·공유 유발(남에게 보낼 이유가 있는가) ④차별성(누구나 쓸 수 있는 문장이면 감점) ⑤행동 유도(다음 행동이 명확한가). "
+    + "후한 점수 금지 — 평범하면 50점대다. "
+    + (bench?("\n\n[우리가 벤치마크로 배운 것]\n"+bench.slice(0,900)):"")
+    + "\n반드시 JSON만 출력(설명·마크다운 금지): "
+    + '{"score":0~100,"why":"점수 이유 한 줄","fix":"점수를 올릴 가장 중요한 수정 지시 한 줄"}';
+  const raw = await anthropic(sys, "종류: "+(kindLabel||"콘텐츠")+"\n주제: "+(topic||"")+"\n\n[콘텐츠]\n"+String(text).slice(0,2200), 400);
+  const j = safeJson(raw, null);
+  if(!j || typeof j.score === "undefined") return null;
+  const sc = Math.max(0, Math.min(100, parseInt(j.score,10)||0));
+  return { score: sc, why: String(j.why||"").slice(0,140), fix: String(j.fix||"").slice(0,200) };
+}
 // 제작부가 콘텐츠를 만들고, 검수 통과할 때까지 자동 재작성(최대 3회). 검수 이력 반환.
 // 제작부 내부 3역 파이프라인: 작가(대본·카피) → PD(기획·구성·타깃) → 연출(영상 연출·컷·비주얼)
 // 각 역할은 이름·성격을 가진 크루가 담당하고, 협업으로 품질을 높인다. 영상성은 3역, 글은 작가→PD.
@@ -3853,7 +3994,24 @@ async function createReviewedContent(baseSys, userMsg, topic, engine){
     const reviseSys=baseSys+"\n\n[검수부 피드백 — 반드시 반영해 고쳐서 다시 작성]\n"+feedback;
     content=await genText(reviseSys, userMsg+"\n\n(위 피드백을 반영해 개선한 완성본만 출력)", 1600, reviseEngine);
   }
-  return { content, passed, reviews:history };
+  // 🔥 바이럴 점수 게이트: 규정은 통과했지만 '먹히지 않는' 평범한 결과물을 한 번 더 끌어올린다.
+  let viral = null;
+  if(viralGateOn()){
+    try{
+      viral = await scoreViral(content, topic, "");
+      if(viral && viral.score < viralMin() && viral.fix){
+        const boostSys = baseSys
+          + "\n\n[성과 분석 — 이대로면 반응이 안 온다. 아래를 반영해 '먹히게' 다시 써라]\n"
+          + "현재 점수: "+viral.score+"점 (기준 "+viralMin()+"점)\n이유: "+viral.why+"\n가장 중요한 수정: "+viral.fix;
+        const boosted = await genText(boostSys, userMsg+"\n\n(위 성과 분석을 반영해 더 강하게 고친 완성본만 출력)", 1800, reviseEngine);
+        if(boosted && boosted.trim().length>20){
+          content = boosted.trim();
+          try{ const re = await scoreViral(content, topic, ""); if(re) viral = Object.assign(re, { boosted:true, before:viral.score }); }catch(_){ viral.boosted=true; }
+        }
+      }
+    }catch(e){ /* 채점 실패는 발행을 막지 않는다 */ }
+  }
+  return { content, passed, reviews:history, viral };
 }
 
 // ===== 채널별 카피 병렬(순차) 생성: 인스타/블로그·스마트스토어/카카오톡 각각 최적화 =====
@@ -4089,17 +4247,22 @@ async function reviewDesignHtml(html, direction){
 async function productPagePipeline(body, setStep){
   const _step = (typeof setStep==="function") ? setStep : function(){};
   let j_visualDirection = null;
-  _step("상품 정보·품질공식 준비 중");
-  const d="monetization"; const a=AGENTS[d];
+  // v222: kind="home"이면 브랜드 홈페이지, dept로 담당 부서 지정 가능(홈페이지=웹 디자이너 강민서)
+  const kind = (String(body.kind||"product")==="home") ? "home" : "product";
+  const isHome = (kind==="home");
+  const KIND_NM = isHome ? "홈페이지" : "상품페이지";
+  _step((isHome?"사이트 정보":"상품 정보")+"·품질공식 준비 중");
+  const d=(body.dept && AGENTS[body.dept]) ? String(body.dept) : (isHome ? "analytics" : "monetization");
+  const a=AGENTS[d];
   const product = String(body.product||"").slice(0,120);
   const info = String(body.info||"").slice(0,2000);
   const photos = Array.isArray(body.photos) ? body.photos.slice(0,10) : []; // [{url, desc}] 실제 사진(있으면)
   const price = String(body.price||"").slice(0,60);
   const brand = String(body.brand||"민앤팜").slice(0,40);
-  if(!product) throw new Error("상품명이 필요합니다");
+  if(!product) throw new Error(isHome?"홈페이지 주제(브랜드·사이트명)가 필요합니다":"상품명이 필요합니다");
   // 학습된 품질 공식(벤치마크 학습으로 축적된 것)을 그대로 주입
   const formula = knowledgeText(d);
-  const formulaBlock = formula ? ("\n\n[이 부서가 축적한 상품페이지 품질 공식 — 반드시 이 기준을 적용해 만들어라]\n"+formula) : "";
+  const formulaBlock = formula ? ("\n\n[이 부서가 축적한 "+KIND_NM+" 품질 공식 — 반드시 이 기준을 적용해 만들어라]\n"+formula) : "";
   // 실제 사진 자리 안내
   let photoBlock = "";
   if (photos.length){
@@ -4113,26 +4276,28 @@ async function productPagePipeline(body, setStep){
   let sys, user;
   if (isRevise){
     sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
-      + " 아래 '기존 상품페이지 HTML'을 클라이언트 요청대로 수정·보완해, 수정된 '완전한 단일 HTML 문서'를 다시 출력하라. "
+      + " 아래 '기존 "+KIND_NM+" HTML'을 클라이언트 요청대로 수정·보완해, 수정된 '완전한 단일 HTML 문서'를 다시 출력하라. "
       + "반드시 지킬 것: (1) <!DOCTYPE html>부터 </html>까지 완전한 문서, CSS는 <style>에 인라인. "
       + "(2) 요청한 부분만 정확히 반영하고, 나머지 디자인·구조·톤은 그대로 유지하라(불필요하게 갈아엎지 말 것). "
       + "(3) 기존의 고급스러운 여백·타이포그래피·반응형을 유지하라. (4) 과장광고 금지. "
       + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
-      + formulaBlock + profileContext();
-    user = "[기존 상품페이지 HTML]\n"+baseHtml+"\n\n[클라이언트 수정·추가 요청]\n"+feedback;
+      + formulaBlock + designSystemBlock() + profileContext();
+    user = "[기존 "+KIND_NM+" HTML]\n"+baseHtml+"\n\n[클라이언트 수정·추가 요청]\n"+feedback;
   } else {
     // 🎨 '비주얼 먼저' 원칙: HTML을 짜기 전에 색 팔레트·타이포·핵심 이미지 컨셉·무드를 먼저 확정하고, 그에 정확히 맞춰 페이지를 설계하게 한다.
     _step("비주얼 디렉션 잡는 중 (색·이미지·무드)");
     let visualBlock = "";
     try{
       const vSys = "너는 민앤팜(전남 고흥 특산물)의 아트디렉터다."+brandBlock()
-        + " 상세페이지를 코딩하기 전에 '비주얼을 먼저' 확정한다(이 단계가 디자인 품질을 좌우한다). "
+        + " "+KIND_NM+"를 코딩하기 전에 '비주얼을 먼저' 확정한다(이 단계가 디자인 품질을 좌우한다). "
         + "AI가 방향 없이 만들면 가장 흔한 평균값('분포 수렴')으로 도망쳐 싸구려 티가 난다. '깔끔하게·모던하게' 같은 무의미한 말 대신 방향을 언어로 못 박아라: "
         + "①이 상품에 맞는 구체적 미학 스타일 하나(예: 에디토리얼/럭셔리/미니멀 아티즈널/레트로/브루탈리즘 등). "
         + "②이 상품 결에 맞는 실제 브랜드 레퍼런스 느낌(프리미엄 식품이면 오설록·마켓컬리·에르메스 푸드 같은, AI가 잘 아는 독창적 브랜드 — 아무 브랜드나 말고 결이 맞는 것). "
         + "③색·폰트·레이아웃·시그니처를 명확히. "
         + "반드시 JSON만(설명 금지): {\"aesthetic\":\"구체적 미학 스타일(한 단어~한 줄)\",\"reference\":\"레퍼런스 브랜드/느낌 + 왜 이 결이 맞는지 짧게\",\"mood\":\"전체 무드 한 줄\",\"palette\":[{\"name\":\"\",\"hex\":\"#______\",\"use\":\"용도\"}],\"typography\":{\"heading\":\"제목 폰트 느낌(구체적으로, 흔한 Inter류 금지)\",\"body\":\"본문 느낌\"},\"layout\":\"화면 배치를 한두 줄로 — 흔한 '가운데 정렬 히어로+아이콘 카드 3개'는 피하고 이 상품만의 구조로\",\"signature\":\"이 페이지만의 강렬한 한 방 요소 하나\",\"imagePlan\":[{\"slot\":\"히어로/상세1 등\",\"desc\":\"구도·색·분위기까지 구체적 이미지 묘사\"}]}. palette 4~6개, imagePlan 3~5개.";
-      const vRaw = await anthropic(vSys, "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n정보: "+info.slice(0,900)+(formula?("\n\n[품질 공식 참고]\n"+formula.slice(0,600)):""), 900);
+      const vRaw = await anthropic(vSys + designSystemBlock()
+        + (hasDesignSystem()? " ★브랜드 디자인 시스템이 있으므로 palette·typography는 위 도면의 색·폰트를 '그대로' JSON에 옮겨 담아라(새 색 창작 금지). aesthetic·layout·signature만 이번 주제에 맞게 새로 정하라." : ""),
+        "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n정보: "+info.slice(0,900)+(formula?("\n\n[품질 공식 참고]\n"+formula.slice(0,600)):""), 900);
       const vj = safeJson(vRaw, null);
       if(vj){
         const pal = (vj.palette||[]).map(p=>"· "+(p.name||"")+" "+(p.hex||"")+(p.use?(" ("+p.use+")"):"")).join("\n");
@@ -4150,17 +4315,21 @@ async function productPagePipeline(body, setStep){
       }
     }catch(e){ /* 비주얼 디렉션 실패 시 기존 방식으로 진행 */ }
     sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
-      + " 아래 상품으로, 위 비주얼 디렉션의 미학 스타일·레퍼런스를 살린 전문가 수준의 '실제로 바로 열리는 완성형 HTML 상품페이지' 하나를 만들어라. "
+      + (isHome
+          ? " 아래 브랜드로, 위 비주얼 디렉션의 미학 스타일·레퍼런스를 살린 전문가 수준의 '실제로 바로 열리는 완성형 HTML 브랜드 홈페이지(공식 홈)' 하나를 만들어라. "
+          : " 아래 상품으로, 위 비주얼 디렉션의 미학 스타일·레퍼런스를 살린 전문가 수준의 '실제로 바로 열리는 완성형 HTML 상품페이지' 하나를 만들어라. ")
       + "반드시 지킬 것: (1) 완전한 단일 HTML 문서(<!DOCTYPE html>부터 </html>까지, CSS는 <style>에 인라인). "
-      + "(2) 히어로 섹션(풀블리드 대형 비주얼 + 브랜드 스토리 한 문장), 상품 소개, 스토리텔링, 상세 특징, 구매 유도(CTA) 섹션 포함. "
+      + (isHome
+          ? "(2) 홈페이지 구성: 상단 헤더+내비게이션(홈·브랜드·상품·후기·문의, 앵커 링크로 동작), 히어로(브랜드 슬로건+대표 비주얼), 브랜드 스토리(우리는 누구인가·왜 이 땅에서), 대표 상품 카드 3~6개(이름·한 줄 설명·가격 자리), 산지/농장 소개, 고객 후기, 문의·주문 안내(연락처·오시는 길)+푸터. 단일 페이지 스크롤형으로. "
+          : "(2) 히어로 섹션(풀블리드 대형 비주얼 + 브랜드 스토리 한 문장), 상품 소개, 스토리텔링, 상세 특징, 구매 유도(CTA) 섹션 포함. ")
       + "(3) 고급스러운 여백·타이포그래피·색감, 스크롤 시 자연스러운 리듬. 모바일 반응형. "
       + "(4) 과장광고·허위표현 금지, 실제 판매에 쓸 수 있는 신뢰감 있는 카피. "
       + "(5) 절대 'AI가 만든 흔한 웹' 티를 내지 마라 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목 + 아이콘 박힌 카드 3개' 같은 평균적 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색(hex)·폰트·레이아웃을 실제 화면에 그대로 구현하라. 특히 '시그니처(한 방 요소)'는 눈에 띄게 살려 이 페이지만의 인상을 만들어라. "
       + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
-      + formulaBlock + photoBlock + visualBlock + profileContext();
-    user = "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n상품 정보:\n"+info;
+      + formulaBlock + photoBlock + visualBlock + designSystemBlock() + profileContext();
+    user = "브랜드: "+brand+"\n"+(isHome?"홈페이지 주제":"상품")+": "+product+(price?("\n가격: "+price):"")+"\n"+(isHome?"참고 정보":"상품 정보")+":\n"+info;
   }
-  _step((body.baseHtml?"수정 사항 반영해 상세페이지 재작성 중":"AI가 상세페이지 작성 중")+" (1~3분)");
+  _step((body.baseHtml?("수정 사항 반영해 "+KIND_NM+" 재작성 중"):("AI가 "+KIND_NM+" 작성 중"))+" (1~3분)");
   let html = await anthropic(sys, user, 8000); // 페이지는 길어야 하므로 큰 토큰
   _step("마무리·정리 중");
   // 혹시 코드펜스가 붙어 나오면 제거
@@ -4185,12 +4354,101 @@ async function productPagePipeline(body, setStep){
   }
   // 학습·경험치
   DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
-  DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?"[상품페이지 수정]":"[상품페이지 제작]"), note:product+" — "+(isRevise?feedback.slice(0,60):(price||"")) });
+  DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?("["+KIND_NM+" 수정]"):("["+KIND_NM+" 제작]")), note:product+" — "+(isRevise?feedback.slice(0,60):(price||"")) });
   if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
   DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
-  if (formula) logKnowledgeApplied(d, (isRevise?"상품페이지 수정":"상품페이지 제작"), product);
+  if (formula) logKnowledgeApplied(d, (isRevise?(KIND_NM+" 수정"):(KIND_NM+" 제작")), product);
   saveDB();
-  return { ok:true, html, product, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, by:a.kr };
+  return { ok:true, html, product, kind, dept:d, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, by:a.kr };
+}
+// ===== 📊 v225: 리서치 보고서 (경쟁사·키워드·트렌드 → 사장님용 1장) =====
+// 팔 수 있는 산출물. 근거 없는 일반론이 나오면 가치가 0이므로 반드시 '실제 검색'을 먼저 돌리고,
+// 그 자료에 없는 숫자·순위는 지어내지 못하게 못 박는다.
+async function reportPipeline(body, setStep){
+  const _step = (typeof setStep==="function") ? setStep : function(){};
+  const d = "ops"; const a = AGENTS[d];                    // 총괄 비서 오세라 — 취합·판단이 본업
+  const topic = String(body.topic||"").slice(0,120);
+  const info  = String(body.info||"").slice(0,1500);
+  const memo  = String(body.memo||"").slice(0,800);
+  const url   = String(body.url||"").trim();
+  if(!topic) throw new Error("분석할 주제(상품·카테고리)가 필요합니다");
+
+  const baseHtml = String(body.baseHtml||"");
+  const feedback = String(body.feedback||"").slice(0,1500);
+  const isRevise = !!(baseHtml && feedback);
+
+  let research = "", sources = [];
+  if(!isRevise){
+    // ── 실제 조사 3축 (무료 Gemini 그라운딩 우선 → 실패 시 폴백) ──
+    const qs = [
+      { k:"키워드",   q: topic+" 검색 키워드 연관검색어 소비자가 실제로 검색하는 말 2026" },
+      { k:"경쟁사",   q: topic+" 잘 파는 판매자 상위노출 상세페이지 후기 마케팅 사례" },
+      { k:"트렌드",   q: topic+" 시장 트렌드 시즌 수요 소비자 반응 2026" }
+    ];
+    for(let i=0;i<qs.length;i++){
+      _step("리서치 "+(i+1)+"/3 · "+qs[i].k+" 조사 중");
+      try{
+        const r = await researchWeb(qs[i].q, 1400);
+        const t = String(r.text||"").trim();
+        if(t) research += "\n\n===== ["+qs[i].k+"] =====\n"+t;
+        if(Array.isArray(r.sources)) sources = sources.concat(r.sources);
+      }catch(e){ /* 한 축이 실패해도 나머지로 진행 */ }
+    }
+    if(url){ _step("참고 URL 학습 중"); try{ await learnFromWebUrls(d, [url]); }catch(_){} }
+  }
+
+  const kbS = knowledgeText("strategy");   // 벤치마크로 축적한 후킹·마케팅 지식
+  const kbC = knowledgeText("scout");      // 트렌드·소재 가공 지식
+  const srcList = sources.slice(0,10).map((x,i)=>"["+(i+1)+"] "+(x.title||x.url||"")+" — "+(x.url||"")).join("\n");
+
+  let sys, user;
+  if(isRevise){
+    sys = "너는 민앤팜의 '"+a.no+" "+a.kr+"' 오세라다."+ADDRESS
+      + " 아래 '기존 리서치 보고서 HTML'을 요청대로 수정해, 수정된 '완전한 단일 HTML 문서'를 다시 출력하라. "
+      + "요청한 부분만 반영하고 나머지 구조·톤·디자인은 유지하라. 자료에 없는 숫자·순위를 새로 지어내지 마라. "
+      + "설명·머리말 없이 HTML만 출력(```html 금지)."
+      + designSystemBlock();
+    user = "[기존 보고서 HTML]\n"+baseHtml+"\n\n[수정 요청]\n"+feedback;
+  } else {
+    _step("보고서 작성 중 (1~3분)");
+    sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 오세라다."+ADDRESS
+      + " 쇼핑몰 사장님에게 납품할 '리서치 보고서' 한 장을 만든다. 사장님은 바빠서 3분 안에 읽고 바로 움직여야 한다. "
+      + "\n\n★ 절대 규칙: (1) 아래 [조사자료]에 실제로 나온 내용만 근거로 써라. "
+      + "자료에 없는 검색량·순위·점유율 숫자를 지어내면 보고서 가치가 0이 된다. "
+      + "확실치 않으면 숫자 대신 '자료상 확인 불가 — 직접 확인 필요'라고 정직하게 적어라. "
+      + "(2) '고객 중심으로 소통하세요' 같은 일반론 금지 — 이 주제에서만 통하는 구체적인 것만. "
+      + "(3) 모든 판단에 근거를 붙여라."
+      + "\n\n[보고서 구성 — 이 순서대로 섹션을 만들어라]"
+      + "\n① 한 장 요약 : 핵심 결론 5줄 + '이번 주 당장 할 일' 3가지 (제일 위, 이것만 읽어도 되게)"
+      + "\n② 키워드 지도 : 표(키워드 / 사람들이 이 말로 뭘 찾는가 / 경쟁 강도 / 우리가 먹을 수 있나). 8~15개."
+      + "\n③ 경쟁사 분석 : 잘 파는 곳 3~5곳 — 무엇을 잘하는가 / 어디가 비었는가"
+      + "\n④ 기회(빈틈) : 남들이 안 하고 있는데 수요는 있는 것. 이게 이 보고서의 핵심 가치다."
+      + "\n⑤ 30일 실행 플랜 : 1~4주차, 주차별로 '무엇을·어디에·몇 개'"
+      + "\n⑥ 근거 자료 : 참고한 출처 목록"
+      + "\n\n[형식] 완전한 단일 HTML 문서(<!DOCTYPE html>~</html>, CSS는 <style> 인라인). "
+      + "A4 인쇄/PDF 저장이 되게 @media print 포함. 표는 실제 <table>로. 읽기 쉬운 여백·타이포. "
+      + "차트가 필요하면 CSS 막대(div width %)로만 — 외부 라이브러리 금지. "
+      + "설명·머리말 없이 HTML만 출력(```html 같은 마크다운 금지)."
+      + (kbS?("\n\n[우리가 벤치마크로 배운 마케팅 지식]\n"+kbS.slice(0,800)):"")
+      + (kbC?("\n\n[트렌드 가공 지식]\n"+kbC.slice(0,600)):"")
+      + designSystemBlock() + profileContext();
+    user = "분석 주제: "+topic
+      + (info?("\n추가 정보: "+info):"")
+      + (memo?("\n의뢰인 지시: "+memo):"")
+      + (url?("\n참고 URL: "+url):"")
+      + "\n\n[조사자료 — 실제 검색 결과]"+(research||"\n(조사 실패 — 자료 없음. 이 경우 보고서 맨 위에 '⚠️ 실시간 조사에 실패해 일반 지식 기반입니다. 숫자는 직접 확인하세요'라고 크게 표시하라)")
+      + (srcList?("\n\n[출처]\n"+srcList):"");
+  }
+
+  let html = await anthropic(sys, user, 8000);
+  html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+
+  DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
+  DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?"[리서치 보고서 수정]":"[리서치 보고서 작성]"), note:topic+(isRevise?(" — "+feedback.slice(0,50)):"") });
+  if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+  DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
+  saveDB();
+  return { ok:true, html, topic, sources:sources.slice(0,10), by:a.kr };
 }
 // ===== 상품페이지 백그라운드 작업 큐 (앱을 나가도 안 끊김) =====
 function trimPageJobs(){
@@ -6495,7 +6753,11 @@ function trimCycleJobs(){
   DB.cycleJobs = DB.cycleJobs || [];
   if (DB.cycleJobs.length > 30) DB.cycleJobs = DB.cycleJobs.slice(-30);
   const n = DB.cycleJobs.length, keep = 8;   // 최근 8개만 상세(HTML 등) 유지, 이전 것은 용량 절약
-  DB.cycleJobs.forEach((j,i)=>{ if(i < n-keep && j.results && j.results.page){ j.results.pageDropped=true; delete j.results.page; } });
+  DB.cycleJobs.forEach((j,i)=>{ if(i < n-keep && j.results){
+    if(j.results.page){ j.results.pageDropped=true; delete j.results.page; }
+    if(j.results.home){ j.results.homeDropped=true; delete j.results.home; }
+    if(j.results.report){ j.results.reportDropped=true; delete j.results.report; }
+  } });
 }
 // 이번 결과에서 잘 된 요소를 짧은 노하우로 뽑아 부서 지식에 누적
 async function accumulateFromResult(dept, topic, resultText, research){
@@ -6519,6 +6781,7 @@ async function accumulateFromResult(dept, topic, resultText, research){
 var CYCLE_FORMATS = {
   sns:     { dept:"creation", label:"SNS 게시물", instruct:"바로 게시 가능한 완성형 SNS 게시물(플랫폼에 맞는 카피 + 해시태그 8~15개). 첫 줄에서 스크롤을 멈추게 하는 후킹.", rq:"SNS 후킹·차별화·최신 트렌드" },
   blog:    { dept:"creation", label:"블로그 글",  instruct:"검색 상위노출을 노린 완성형 블로그 글: ① 클릭되는 제목(H1, 핵심 키워드 포함) ② 첫 문단 3줄 안에 후킹 ③ ##/### 소제목으로 스캔 가능한 구조 ④ 경험·전문성·신뢰(E-E-A-T) ⑤ 자연스러운 CTA ⑥ 끝에 메타설명·추천 태그. 마크다운으로 완성.", rq:"블로그 상위노출·제목·구조·가독성 최신 요령" },
+  cafe:    { dept:"advisory", label:"카페글", instruct:"네이버 카페·다음 카페에 그대로 붙여넣을 수 있는 완성형 커뮤니티 글: ① 카페 게시판에서 눌리는 제목 3안 ② 홍보 티가 나지 않는 경험담·후기·정보공유 톤(1인칭, 솔직하게, 광고 문구 금지) ③ 사진 들어갈 자리를 [사진1: 어떤 사진인지] 형태로 표시 ④ 회원들이 댓글 달고 싶어지는 질문으로 마무리 ⑤ 마지막에 '네이버 카페 팁'과 '다음 카페 팁'을 각각 1~2줄(말머리·등업·홍보글 규정 주의). 카페는 대놓고 홍보하면 삭제·강퇴 대상이니 반드시 정보·경험 중심으로.", rq:"네이버 카페 다음 카페 홍보 글 잘 쓰는 법, 카페 후기글·정보글 구조와 규정" },
   youtube: { dept:"creation", label:"유튜브 기획", instruct:"유튜브 완성형 기획안: ① 후킹 제목 3안 ② 타깃·핵심 메시지 ③ 영상 구성(도입 훅→전개→마무리 CTA, 타임라인) ④ 나레이션/자막 대본 ⑤ 썸네일 문구 2안 ⑥ 설명란·태그. 바로 촬영·편집 가능하게 구체적으로.", rq:"유튜브 조회수 잘 나오는 후킹·구성·썸네일 최신" }
 };
 // 텍스트형 결과물 한 종류 생성(학습→생성→보강→재생성→누적)
@@ -6535,7 +6798,8 @@ async function cycleGenText(job, fmt, setStep){
   sys += " 아래 주제로 "+spec.instruct+" 되묻지 말고 완성본만, 한국어로.";
   const userMsg = "주제: "+topic+(url?("\n참고 URL(학습 반영됨): "+url):"")+(info?("\n추가 정보: "+info):"")+(memo?("\n지시: "+memo):"");
   let out = "";
-  try{ const g = await createReviewedContent(sys, userMsg, topic, workEngine()); out = g.content||""; }
+  try{ const g = await createReviewedContent(sys, userMsg, topic, workEngine()); out = g.content||"";
+       if(g.viral){ job._viral = job._viral||{}; job._viral[fmt] = g.viral; } }
   catch(e){ out = await genText(sys, userMsg, 1800, workEngine()); }
   setStep(spec.label+" · 개선 자료 수집 중");
   let research = "";
@@ -6547,7 +6811,8 @@ async function cycleGenText(job, fmt, setStep){
         sys+"\n\n[추가 조사자료 — 이 좋은 요소를 반영해 더 좋게]\n"+research,
         userMsg+"\n\n(아래 초안을 위 조사자료로 더 완성도 높게 개선한 최종본만 출력)\n\n[초안]\n"+out,
         topic, workEngine());
-      if(rev.content && rev.content.length>50) out = rev.content;
+      if(rev.content && rev.content.length>50){ out = rev.content;
+        if(rev.viral){ job._viral = job._viral||{}; job._viral[fmt] = rev.viral; } }
     }catch(_){}
   }
   setStep(spec.label+" · 배운 것 누적 중");
@@ -6569,7 +6834,47 @@ async function runCycleJob(id, appUrl){
 
     if(o.sns)     results.sns     = await cycleGenText(job, "sns", setStep);
     if(o.blog)    results.blog    = await cycleGenText(job, "blog", setStep);
+    if(o.cafe)    results.cafe    = await cycleGenText(job, "cafe", setStep);
     if(o.youtube) results.youtube = await cycleGenText(job, "youtube", setStep);
+
+    // ---------- 📊 리서치 보고서 (HTML) ----------
+    if(o.report){
+      setStep("리서치 보고서 · 시작");
+      try{
+        const genR = await reportPipeline({ topic: topic, info: info, memo: memo, url: String(job.url||"") },
+                                          (s2)=>setStep("리서치 보고서 · "+s2));
+        results.report = genR.html || "";
+        results.reportTopic = topic;
+      }catch(e){ job._warn=(job._warn||"")+"보고서 생성 실패: "+String(e.message||e).slice(0,60)+"; "; }
+    }
+
+    // ---------- 홈페이지 (HTML) ----------
+    if(o.home){
+      const dh = "analytics"; const urlH = String(job.url||"").trim();
+      if(urlH){ setStep("홈페이지 · 참고 URL 학습 중"); try{ await learnFromWebUrls(dh, [urlH]); }catch(e){ job._warn=(job._warn||"")+"홈페이지 학습 일부 실패; "; } }
+      setStep("홈페이지 · 초안 생성 중");
+      let homeHtml = "";
+      try{
+        const genH = await productPagePipeline({ kind:"home", dept:dh, product: topic, info: info+(memo?("\n[지시] "+memo):""), brand:"민앤팜" }, (s2)=>setStep("홈페이지 · "+s2));
+        homeHtml = genH.html || "";
+      }catch(e){ job._warn=(job._warn||"")+"홈페이지 생성 실패: "+String(e.message||e).slice(0,60)+"; "; }
+      let homeResearch = "";
+      if(homeHtml){
+        setStep("홈페이지 · 개선 자료 수집 중");
+        try{ const r = await researchWeb(topic+" 브랜드 공식 홈페이지 잘 만든 사례 구성·카피·신뢰", 1100); homeResearch = String(r.text||"").trim(); }catch(_){}
+        if(homeResearch){
+          setStep("홈페이지 · 자료 반영해 재생성 중");
+          try{
+            const revH = await productPagePipeline({ kind:"home", dept:dh, product: topic, info: info, baseHtml: homeHtml,
+              feedback: "아래 최신 조사자료의 좋은 요소(구성·카피·신뢰 장치)를 반영해 더 완성도 높게 개선해줘. 전체 톤·구조는 유지하고 개선점만 자연스럽게:\n"+homeResearch }, (s2)=>setStep("홈페이지 · "+s2));
+            if(revH.html && revH.html.length>200) homeHtml = revH.html;
+          }catch(_){}
+        }
+      }
+      results.home = homeHtml; results.homeTopic = topic;
+      setStep("홈페이지 · 배운 것 누적 중");
+      await accumulateFromResult(dh, topic, "(홈페이지 HTML 생성 완료: "+topic+")", homeResearch);
+    }
 
     // ---------- 상품페이지 (HTML) ----------
     if(o.page){
@@ -6599,11 +6904,14 @@ async function runCycleJob(id, appUrl){
       await accumulateFromResult(d, topic, "(상품페이지 HTML 생성 완료: "+topic+")", pageResearch);
     }
 
+    if(job._viral) results.viral = job._viral;
     job.results = results;
     job.status = "done"; job.doneAt = Date.now(); job.step = "완료"; trimCycleJobs(); saveDB();
-    const parts = []; if(results.sns) parts.push("SNS"); if(results.blog) parts.push("블로그"); if(results.youtube) parts.push("유튜브"); if(results.page) parts.push("상품페이지");
+    const parts = []; if(results.sns) parts.push("SNS"); if(results.blog) parts.push("블로그"); if(results.cafe) parts.push("카페글"); if(results.youtube) parts.push("유튜브"); if(results.page) parts.push("상품페이지"); if(results.home) parts.push("홈페이지"); if(results.report) parts.push("리서치 보고서");
     const base = String(appUrl||(DB.state&&DB.state.appBase)||"").replace(/\/$/,"");
-    try{ kakaoNotify("🔄 선순환 완료 — "+topic+"\n생성: "+(parts.join(" + ")||"(결과 없음)")+(job._warn?("\n⚠️ "+job._warn):"")+"\n앱 '📚 학습 > 🔄 선순환'에서 결과를 확인하고, 마음에 안 들면 '🔁 고쳐줘'로 수정·학습시키세요.", base); }catch(_){}
+    let vsum = "";
+    if(results.viral){ const vs=Object.keys(results.viral).map(k=>{ const L=(CYCLE_FORMATS[k]?CYCLE_FORMATS[k].label:k); return L+" "+results.viral[k].score+"점"; }); if(vs.length) vsum = "\n🔥 예상 반응: "+vs.join(" · "); }
+    try{ kakaoNotify("🔄 선순환 완료 — "+topic+"\n생성: "+(parts.join(" + ")||"(결과 없음)")+vsum+(job._warn?("\n⚠️ "+job._warn):"")+"\n앱 '📚 학습 > 🔄 선순환'에서 결과를 확인하고, 마음에 안 들면 '🔁 고쳐줘'로 수정·학습시키세요.", base); }catch(_){}
   }catch(e){
     job.status = "error"; job.error = String(e.message||e); job.doneAt = Date.now(); job.step = "실패"; saveDB();
     try{ kakaoNotify("⚠️ 선순환 실패 — "+String(job.topic||"")+"\n"+String(e.message||e).slice(0,140)); }catch(_){}
@@ -6616,13 +6924,17 @@ app.post("/api/cycle/start", (req,res)=>{
     const b = req.body || {};
     const url = String(b.url||"").trim();
     const topic = String(b.topic||"").trim();
-    const sns = !!b.sns, blog = !!b.blog, youtube = !!b.youtube, page = !!b.page;
+    const sns = !!b.sns, blog = !!b.blog, youtube = !!b.youtube, page = !!b.page, home = !!b.home, cafe = !!b.cafe, report = !!b.report;
     if(!topic) return res.status(400).json({ error:"주제(무엇을 만들지)를 입력하세요" });
-    if(!sns && !blog && !youtube && !page) return res.status(400).json({ error:"결과물(SNS·블로그·유튜브·상품페이지) 중 하나 이상 선택하세요" });
+    if(!sns && !blog && !youtube && !page && !home && !cafe && !report) return res.status(400).json({ error:"결과물(SNS·블로그·카페글·유튜브·상품페이지·홈페이지·리서치보고서) 중 하나 이상 선택하세요" });
     if(url && !/^https?:\/\/.+/.test(url)) return res.status(400).json({ error:"URL은 https:// 로 시작해야 해요 (비워도 됨)" });
     DB.cycleJobs = DB.cycleJobs || [];
-    const job = { id:String(Date.now())+"_c"+Math.floor(Math.random()*1000), url, topic, info:String(b.info||"").slice(0,2000), memo:String(b.memo||"").slice(0,800),
-      outputs:{ sns, blog, youtube, page }, status:"queued", at:Date.now(), source:"now" };
+    // 🎤 사전 인터뷰 답변이 있으면 '맥락'으로 memo에 합쳐 모든 부서 프롬프트에 주입
+    let memo = String(b.memo||"").slice(0,800);
+    const itv = String(b.interview||"").trim();
+    if(itv) memo = (memo?(memo+"\n\n"):"") + "[사전 인터뷰 — 클라이언트가 직접 답한 방향. 이 맥락에 정확히 맞춰라]\n" + itv.slice(0,1500);
+    const job = { id:String(Date.now())+"_c"+Math.floor(Math.random()*1000), url, topic, info:String(b.info||"").slice(0,2000), memo:memo.slice(0,2500),
+      outputs:{ sns, blog, youtube, page, home, cafe, report }, status:"queued", at:Date.now(), source:"now", interviewed:!!itv };
     DB.cycleJobs.push(job); trimCycleJobs(); saveDB();
     res.json({ ok:true, jobId:job.id, status:"queued" });
     setImmediate(()=>{ runCycleJob(job.id, String(b.appUrl||"")).catch(e=>logError("cycle-start", e)); });
@@ -6634,20 +6946,20 @@ app.get("/api/cycle/status", (req,res)=>{
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
   res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", warn:j._warn||"",
     topic:j.topic, outputs:j.outputs, doneAt:j.doneAt||0,
-    results: j.results ? { sns:j.results.sns||"", blog:j.results.blog||"", youtube:j.results.youtube||"", page:j.results.page||"", pageProduct:j.results.pageProduct||"", pageDropped:!!j.results.pageDropped } : null });
+    results: j.results ? { sns:j.results.sns||"", blog:j.results.blog||"", cafe:j.results.cafe||"", youtube:j.results.youtube||"", page:j.results.page||"", home:j.results.home||"", report:j.results.report||"", pageProduct:j.results.pageProduct||"", homeTopic:j.results.homeTopic||"", pageDropped:!!j.results.pageDropped, homeDropped:!!j.results.homeDropped } : null });
 });
 // 목록(결과 이력)
 app.get("/api/cycle/list", (req,res)=>{
   const jobs = (DB.cycleJobs||[]).slice(-12).reverse().map(j=>({
     id:j.id, status:j.status, step:j.step||"", topic:j.topic, outputs:j.outputs, at:j.at, doneAt:j.doneAt||0, source:j.source||"now",
-    hasSns: !!(j.results&&j.results.sns), hasBlog: !!(j.results&&j.results.blog), hasYoutube: !!(j.results&&j.results.youtube), hasPage: !!(j.results&&j.results.page), pageDropped: !!(j.results&&j.results.pageDropped), error:j.error||"" }));
+    hasSns: !!(j.results&&j.results.sns), hasBlog: !!(j.results&&j.results.blog), hasCafe: !!(j.results&&j.results.cafe), hasYoutube: !!(j.results&&j.results.youtube), hasPage: !!(j.results&&j.results.page), hasHome: !!(j.results&&j.results.home), hasReport: !!(j.results&&j.results.report), viral:(j.results&&j.results.viral)||null, pageDropped: !!(j.results&&j.results.pageDropped), homeDropped: !!(j.results&&j.results.homeDropped), error:j.error||"" }));
   res.json({ ok:true, jobs });
 });
 // 결과 하나 상세(SNS 본문 / 페이지 HTML)
 app.get("/api/cycle/result", (req,res)=>{
   const j = (DB.cycleJobs||[]).find(x=>x.id===String(req.query.id||""));
   if(!j || !j.results) return res.status(404).json({ error:"결과가 없어요" });
-  res.json({ ok:true, id:j.id, topic:j.topic, sns:j.results.sns||"", blog:j.results.blog||"", youtube:j.results.youtube||"", page:j.results.page||"", pageProduct:j.results.pageProduct||"", pageDropped:!!j.results.pageDropped });
+  res.json({ ok:true, id:j.id, topic:j.topic, viral:j.results.viral||null, sns:j.results.sns||"", blog:j.results.blog||"", cafe:j.results.cafe||"", youtube:j.results.youtube||"", page:j.results.page||"", home:j.results.home||"", report:j.results.report||"", reportTopic:j.results.reportTopic||"", pageProduct:j.results.pageProduct||"", homeTopic:j.results.homeTopic||"", pageDropped:!!j.results.pageDropped, homeDropped:!!j.results.homeDropped });
 });
 // 예약 등록/목록/삭제 (1회/매일/매주)
 app.post("/api/cycle/reserve", (req,res)=>{
@@ -6655,25 +6967,25 @@ app.post("/api/cycle/reserve", (req,res)=>{
     const b = req.body || {};
     const url = String(b.url||"").trim();
     const topic = String(b.topic||"").trim();
-    const sns = !!b.sns, blog = !!b.blog, youtube = !!b.youtube, page = !!b.page;
+    const sns = !!b.sns, blog = !!b.blog, youtube = !!b.youtube, page = !!b.page, home = !!b.home, cafe = !!b.cafe, report = !!b.report;
     const repeat = (["once","daily","weekly"].indexOf(b.repeat)>=0) ? b.repeat : "once";
     const time = /^\d{1,2}:\d{2}$/.test(String(b.time||"")) ? String(b.time) : "";
     const days = Array.isArray(b.days) ? b.days.map(n=>parseInt(n,10)).filter(n=>n>=0&&n<=6) : [];
     if(!topic) return res.status(400).json({ error:"주제를 입력하세요" });
-    if(!sns && !blog && !youtube && !page) return res.status(400).json({ error:"결과물을 하나 이상 선택하세요" });
+    if(!sns && !blog && !youtube && !page && !home && !cafe && !report) return res.status(400).json({ error:"결과물을 하나 이상 선택하세요" });
     if(!time) return res.status(400).json({ error:"실행 시각(HH:MM)을 입력하세요" });
     if(url && !/^https?:\/\/.+/.test(url)) return res.status(400).json({ error:"URL은 https:// 로 시작해야 해요" });
     if(repeat==="weekly" && !days.length) return res.status(400).json({ error:"매주 예약은 요일을 하나 이상 선택하세요" });
     DB.cycleReservations = DB.cycleReservations || [];
     const rv = { id:String(Date.now())+"_r"+Math.floor(Math.random()*1000), url, topic, info:String(b.info||"").slice(0,2000), memo:String(b.memo||"").slice(0,800),
-      sns, blog, youtube, page, repeat, time, days, lastRunDay:"", at:Date.now() };
+      sns, blog, youtube, page, home, cafe, report, repeat, time, days, lastRunDay:"", at:Date.now() };
     DB.cycleReservations.push(rv); saveDB();
     res.json({ ok:true, reservation:rv });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 app.get("/api/cycle/reservations", (req,res)=>{
   res.json({ ok:true, reservations:(DB.cycleReservations||[]).map(r=>({
-    id:r.id, url:r.url, topic:r.topic, memo:r.memo||"", sns:!!r.sns, blog:!!r.blog, youtube:!!r.youtube, page:!!r.page, repeat:r.repeat, time:r.time, days:r.days||[], lastRunDay:r.lastRunDay||"" })) });
+    id:r.id, url:r.url, topic:r.topic, memo:r.memo||"", sns:!!r.sns, blog:!!r.blog, cafe:!!r.cafe, youtube:!!r.youtube, page:!!r.page, home:!!r.home, report:!!r.report, repeat:r.repeat, time:r.time, days:r.days||[], lastRunDay:r.lastRunDay||"" })) });
 });
 app.post("/api/cycle/reserve/delete", (req,res)=>{
   const id = String((req.body||{}).id||"");
@@ -6690,7 +7002,7 @@ app.post("/api/cycle/feedback", (req,res)=>{
   const feedback = String(b.feedback||"").slice(0,1500).trim();
   const remember = !!b.remember;
   if(!feedback) return res.status(400).json({ error:"어떻게 고칠지 입력하세요" });
-  if(["sns","blog","youtube","page"].indexOf(kind)<0) return res.status(400).json({ error:"결과물 종류 오류" });
+  if(["sns","blog","cafe","youtube","page","home","report"].indexOf(kind)<0) return res.status(400).json({ error:"결과물 종류 오류" });
   if(!job.results[kind]) return res.status(404).json({ error:"해당 결과물이 없어요" });
   res.json({ ok:true, jobId:job.id, status:"started" });
   setImmediate(async ()=>{
@@ -6698,14 +7010,26 @@ app.post("/api/cycle/feedback", (req,res)=>{
     const prevStatus = job.status;
     try{
       job.status = "running"; job.step = "🔁 수정 반영 중"; job.progAt = Date.now(); saveDB();
-      if(kind === "page"){
-        const cur = job.results.page || "";
-        const rev = await productPagePipeline({ product: job.results.pageProduct||job.topic, info: job.info,
-          baseHtml: cur, feedback: feedback }, (s)=>{ job.step="🔁 상품페이지 "+s; job.progAt=Date.now(); saveDB(); });
-        if(rev.html && rev.html.length>200) job.results.page = rev.html;
-        if(remember){ commitKnowledge("monetization", "클라이언트 고정 취향(상품페이지): "+feedback, "피드백 학습");
-          recordLearnLog({ dept:"monetization", deptKr:(AGENTS.monetization?AGENTS.monetization.kr:"커머스"), kind:"feedback", ok:true, note:"고정 취향 학습: "+feedback.slice(0,60) });
-          try{ await absorbToLeader(["monetization"], "피드백"); }catch(_){}
+      if(kind === "report"){
+        const cur = job.results.report || "";
+        const rev = await reportPipeline({ topic: job.results.reportTopic||job.topic, info: job.info, memo: job.memo,
+          baseHtml: cur, feedback: feedback }, (s2)=>{ job.step="🔁 보고서 "+s2; job.progAt=Date.now(); saveDB(); });
+        if(rev.html && rev.html.length>200) job.results.report = rev.html;
+        if(remember){ commitKnowledge("ops", "클라이언트 고정 취향(리서치 보고서): "+feedback, "피드백 학습");
+          recordLearnLog({ dept:"ops", deptKr:(AGENTS.ops?AGENTS.ops.kr:"총괄"), kind:"feedback", ok:true, note:"고정 취향 학습: "+feedback.slice(0,60) });
+        }
+      } else if(kind === "page" || kind === "home"){
+        const isH = (kind==="home");
+        const kd = isH ? "analytics" : "monetization";
+        const knm = isH ? "홈페이지" : "상품페이지";
+        const cur = job.results[kind] || "";
+        const rev = await productPagePipeline({ kind:(isH?"home":"product"), dept:kd,
+          product: (isH?(job.results.homeTopic||job.topic):(job.results.pageProduct||job.topic)), info: job.info,
+          baseHtml: cur, feedback: feedback }, (s)=>{ job.step="🔁 "+knm+" "+s; job.progAt=Date.now(); saveDB(); });
+        if(rev.html && rev.html.length>200) job.results[kind] = rev.html;
+        if(remember){ commitKnowledge(kd, "클라이언트 고정 취향("+knm+"): "+feedback, "피드백 학습");
+          recordLearnLog({ dept:kd, deptKr:(AGENTS[kd]?AGENTS[kd].kr:kd), kind:"feedback", ok:true, note:"고정 취향 학습: "+feedback.slice(0,60) });
+          try{ await absorbToLeader([kd], "피드백"); }catch(_){}
         }
       } else {
         const spec = CYCLE_FORMATS[kind]; const d = spec.dept; const a = AGENTS[d];
@@ -6724,12 +7048,46 @@ app.post("/api/cycle/feedback", (req,res)=>{
         }
       }
       job.status = "done"; job.step = "완료"; job.doneAt = Date.now(); trimCycleJobs(); saveDB();
-      try{ kakaoNotify("🔁 수정 완료 — "+job.topic+" ("+(CYCLE_FORMATS[kind]?CYCLE_FORMATS[kind].label:kind)+")\n"+(remember?"✅ 앞으로도 이 취향을 기억합니다":"이번 결과에만 반영")); }catch(_){}
+      try{ const _knm = CYCLE_FORMATS[kind]?CYCLE_FORMATS[kind].label:(kind==="page"?"상품페이지":(kind==="home"?"홈페이지":(kind==="report"?"리서치 보고서":kind))); kakaoNotify("🔁 수정 완료 — "+job.topic+" ("+_knm+")\n"+(remember?"✅ 앞으로도 이 취향을 기억합니다":"이번 결과에만 반영")); }catch(_){}
     }catch(e){
       job.status = prevStatus==="done"?"done":"error"; job.error = String(e.message||e); job.step="수정 실패"; saveDB();
       logError("cycle-feedback", e);
     }finally{ endJobMode(); }
   });
+});
+// 🎤 v223: 생성 전 인터뷰 — "제약을 주기보다 맥락을 받아라".
+// 비싼 산출물(상품페이지·홈페이지)일수록 8000토큰짜리 재생성보다 질문 3개가 훨씬 싸다.
+app.post("/api/cycle/interview", async (req,res)=>{
+  try{
+    const b = req.body || {};
+    const topic = String(b.topic||"").trim();
+    if(!topic) return res.status(400).json({ error:"주제를 먼저 입력하세요" });
+    const info = String(b.info||"").slice(0,1200);
+    const memo = String(b.memo||"").slice(0,600);
+    const o = b.outputs || {};
+    const wants = [];
+    if(o.sns) wants.push("SNS 게시물"); if(o.blog) wants.push("블로그 글"); if(o.cafe) wants.push("카페글");
+    if(o.youtube) wants.push("유튜브 기획"); if(o.page) wants.push("상품 상세페이지"); if(o.home) wants.push("브랜드 홈페이지"); if(o.report) wants.push("리서치 보고서");
+    const sys = "너는 민앤팜(전남 고흥 특산물)의 총괄 비서 오세라다."+ADDRESS
+      + " 클라이언트가 '"+topic+"'로 ["+(wants.join(", ")||"콘텐츠")+"]를 만들려 한다. "
+      + "바로 만들기 전에, 결과물의 방향을 가르는 '진짜 중요한 질문' 3개만 던져라. "
+      + "규칙: (1) 뻔한 질문(예: '어떤 톤을 원하세요?') 금지 — 답에 따라 결과물이 실제로 확 달라지는 갈림길만. "
+      + "(2) 클라이언트가 미처 생각 못 했을 맹점을 찔러라. (3) 각 질문에 '왜 묻는지' 한 줄과, 고르기 쉽게 선택지 2~3개를 제시하되 자유 서술도 가능하게. "
+      + "반드시 JSON만 출력(설명·마크다운 금지): "
+      + '{"questions":[{"q":"질문","why":"이걸 알면 결과물이 어떻게 달라지는지 한 줄","options":["선택지1","선택지2"]}]}'
+      + brandBlock() + profileContext();
+    const user = "주제: "+topic+(info?("\n추가 정보: "+info):"")+(memo?("\n내 지시 메모: "+memo):"")+"\n원하는 결과물: "+(wants.join(", ")||"미정");
+    const raw = await anthropic(sys, user, 700);
+    const j = safeJson(raw, null);
+    let qs = (j && Array.isArray(j.questions)) ? j.questions : [];
+    qs = qs.filter(x=>x&&x.q).slice(0,3).map(x=>({
+      q: String(x.q).slice(0,160),
+      why: String(x.why||"").slice(0,120),
+      options: (Array.isArray(x.options)?x.options:[]).map(v=>String(v).slice(0,60)).slice(0,3)
+    }));
+    if(!qs.length) return res.json({ ok:false, error:"질문을 만들지 못했어요. 그냥 바로 실행하셔도 됩니다." });
+    res.json({ ok:true, questions:qs });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 자연어 예약 지시 파싱 → 확인용 구조 반환 (저장은 프론트가 확인 후 reserve/start 호출)
 app.post("/api/cycle/parse", async (req,res)=>{
@@ -6737,18 +7095,18 @@ app.post("/api/cycle/parse", async (req,res)=>{
     const text = String((req.body||{}).text||"").slice(0,600).trim();
     if(!text) return res.status(400).json({ error:"지시 문장을 입력하세요" });
     const sys = "아래 한국어 예약/생성 지시를 분석해 JSON만 출력한다(설명·마크다운 금지). "
-      + "형식: {\"topic\":\"핵심 주제\",\"outputs\":{\"sns\":true|false,\"blog\":true|false,\"youtube\":true|false,\"page\":true|false},"
+      + "형식: {\"topic\":\"핵심 주제\",\"outputs\":{\"sns\":true|false,\"blog\":true|false,\"cafe\":true|false,\"youtube\":true|false,\"page\":true|false,\"home\":true|false,\"report\":true|false},"
       + "\"repeat\":\"once|daily|weekly\",\"time\":\"HH:MM\",\"days\":[0~6, 일=0 토=6],\"url\":\"있으면 http주소 아니면 빈칸\",\"memo\":\"말투·강조점 등 부가 지시(있으면)\"}. "
-      + "규칙: 결과물 종류를 못 정하면 sns=true. '블로그'는 blog, '유튜브/영상/쇼츠'는 youtube, '상세페이지/상품페이지'는 page, 그 외 게시물은 sns. "
+      + "규칙: 결과물 종류를 못 정하면 sns=true. '블로그'는 blog, '네이버 카페/다음 카페/카페글'은 cafe, '유튜브/영상/쇼츠'는 youtube, '상세페이지/상품페이지'는 page, '홈페이지/공식홈/웹사이트/랜딩'은 home, '리서치/시장조사/경쟁사분석/키워드분석/보고서'는 report, 그 외 게시물은 sns. "
       + "'매일'→daily, '매주 O요일'→weekly+days, 반복 언급 없으면 once. 시각 표현('아침 8시','새벽 2시' 등)을 HH:MM 24시로. 시각 없으면 09:00. days는 weekly일 때만 채운다.";
     const raw = await anthropic(sys, text, 400);
     const j = safeJson(raw, null);
     if(!j || !j.topic){ return res.json({ ok:false, error:"이해하지 못했어요. 예: '매일 아침 8시에 복숭아 블로그 써줘'처럼 다시 써주세요." }); }
     const o = j.outputs || {};
-    const anyOut = !!(o.sns||o.blog||o.youtube||o.page);
+    const anyOut = !!(o.sns||o.blog||o.youtube||o.page||o.home||o.cafe||o.report);
     const parsed = {
       topic: String(j.topic||"").slice(0,120),
-      outputs: { sns: anyOut?!!o.sns:true, blog:!!o.blog, youtube:!!o.youtube, page:!!o.page },
+      outputs: { sns: anyOut?!!o.sns:true, blog:!!o.blog, cafe:!!o.cafe, youtube:!!o.youtube, page:!!o.page, home:!!o.home, report:!!o.report },
       repeat: (["once","daily","weekly"].indexOf(j.repeat)>=0)?j.repeat:"once",
       time: /^\d{1,2}:\d{2}$/.test(String(j.time||""))?String(j.time):"09:00",
       days: Array.isArray(j.days)?j.days.map(n=>parseInt(n,10)).filter(n=>n>=0&&n<=6):[],
@@ -6800,7 +7158,9 @@ async function runDesignJob(id, appUrl){
         try{
           const vSys = "너는 민앤팜(전남 고흥 특산물)의 아트디렉터다."+brandBlock()
             + " 코딩 전에 비주얼을 먼저 확정한다. AI가 방향 없이 만들면 흔한 평균값('분포 수렴')으로 도망쳐 싸구려 티가 난다. '깔끔·모던' 대신 구체적 미학 스타일과 결 맞는 브랜드 레퍼런스, 색·폰트·레이아웃·시그니처를 못 박아라. JSON만: {\"aesthetic\":\"구체적 미학 스타일\",\"reference\":\"결 맞는 브랜드 레퍼런스 느낌\",\"mood\":\"\",\"palette\":[{\"name\":\"\",\"hex\":\"#______\",\"use\":\"\"}],\"typography\":{\"heading\":\"구체적으로(흔한 Inter류 금지)\",\"body\":\"\"},\"layout\":\"이 페이지만의 배치 한두 줄(흔한 가운데정렬 히어로+카드3개 금지)\",\"signature\":\"강렬한 한 방 요소 하나\"}. palette 4~6개.";
-          const vRaw = await anthropic(vSys, spec.label+" — "+brief.slice(0,600)+(memo?("\n지시:"+memo):""), 700);
+          const vRaw = await anthropic(vSys + designSystemBlock()
+            + (hasDesignSystem()? " ★브랜드 디자인 시스템이 있으므로 palette·typography는 위 도면의 색·폰트를 그대로 옮겨 담아라(새 색 창작 금지). aesthetic·layout·signature만 새로 정하라." : ""),
+            spec.label+" — "+brief.slice(0,600)+(memo?("\n지시:"+memo):""), 700);
           const vj = safeJson(vRaw, null);
           if(vj){ const pal=(vj.palette||[]).map(p=>"· "+(p.name||"")+" "+(p.hex||"")+(p.use?(" ("+p.use+")"):"")).join("\n");
             visualBlock = "\n\n[먼저 확정한 비주얼 — 이 미학·레퍼런스·색·타이포·레이아웃·시그니처에 정확히 맞춰 설계, hex를 실제 CSS에 사용]\n"
@@ -6814,7 +7174,7 @@ async function runDesignJob(id, appUrl){
         sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 수석 웹디자이너다. "+ADDRESS
           + " 아래 요청으로 '실제로 바로 열리는 완성형 단일 HTML 문서'를 만들어라. "+spec.hint
           + " 반드시: (1) <!DOCTYPE html>~</html> 완전한 문서, CSS는 <style>에 인라인. (2) 고급스러운 여백·타이포·색감, 모바일 반응형. (3) 사진 자리는 <div class=\"img-ph\">[이미지: 묘사]</div> 플레이스홀더. (4) 과장광고 금지. (5) 'AI가 만든 흔한 웹' 티 금지 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목+아이콘 카드 3개' 같은 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색·폰트·레이아웃을 실제로 구현하며 시그니처 요소를 눈에 띄게 살려라. 설명·마크다운 없이 HTML만."
-          + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext();
+          + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + designSystemBlock() + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext();
         user = "요청: "+spec.label+"\n브리프: "+brief+(url?("\n참고(학습됨): "+url):"");
       }
       setStep("마무리 중");
@@ -7171,7 +7531,7 @@ setInterval(async ()=>{
       rv.lastRunDay = day;
       DB.cycleJobs = DB.cycleJobs || [];
       const job = { id:String(Date.now())+"_c"+Math.floor(Math.random()*1000), url:rv.url, topic:rv.topic, info:rv.info||"", memo:rv.memo||"",
-        outputs:{ sns:!!rv.sns, blog:!!rv.blog, youtube:!!rv.youtube, page:!!rv.page }, status:"queued", at:Date.now(), source:"reserve" };
+        outputs:{ sns:!!rv.sns, blog:!!rv.blog, cafe:!!rv.cafe, youtube:!!rv.youtube, page:!!rv.page, home:!!rv.home, report:!!rv.report }, status:"queued", at:Date.now(), source:"reserve" };
       DB.cycleJobs.push(job); trimCycleJobs();
       if (rv.repeat === "once"){ DB.cycleReservations = DB.cycleReservations.filter(x=>x.id!==rv.id); }
       saveDB();
