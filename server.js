@@ -3384,6 +3384,30 @@ function designSystemBlock(){
     + "미학 스타일·레이아웃 구성·시그니처 요소만 이번 주제에 맞게 새로 정하라. "
     + "위 '쓰지 않을 것' 항목은 어떤 경우에도 쓰지 마라.)";
 }
+// v226: 생성된 HTML이 '열어보면 백지'인지 서버에서 먼저 검사한다.
+// 잘림(</html> 없음), 본문 없음, JS 의존 리빌 → 사용자가 빈 화면을 보기 전에 잡는다.
+function checkHtmlOutput(html){
+  const h = String(html||"");
+  const problems = [];
+  if(h.length < 300) problems.push("HTML이 너무 짧음("+h.length+"자)");
+  if(!/<\/html\s*>/i.test(h)) problems.push("문서가 잘림(</html> 없음)");
+  const bm = h.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+  const body = bm ? bm[1] : "";
+  const textLen = body.replace(/<script[\s\S]*?<\/script>/gi,"").replace(/<style[\s\S]*?<\/style>/gi,"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim().length;
+  if(!bm) problems.push("<body>가 없음");
+  else if(textLen < 80) problems.push("본문 글자가 거의 없음("+textLen+"자)");
+  return { ok: problems.length===0, problems, len:h.length, textLen };
+}
+// JS 없이는 안 보이는 리빌 패턴을 CSS로 무력화 (안전망)
+function hardenHtml(html){
+  let h = String(html||"");
+  if(!/<\/body\s*>/i.test(h)) return h;
+  const guard = '<style id="__visguard">'
+    + '/* 안전망: JS가 실패해도 콘텐츠가 보이도록 */'
+    + '[class*="reveal"],[class*="fade"],[class*="animate"],[data-aos],[data-reveal]{opacity:1!important;visibility:visible!important;transform:none!important}'
+    + '</style>';
+  return h.replace(/<\/body\s*>/i, guard+"</body>");
+}
 function hasDesignSystem(){
   const ds = (DB.state && DB.state.designSystem) || null;
   return !!(ds && ds.on !== false && String(ds.text||"").trim());
@@ -4318,7 +4342,7 @@ async function productPagePipeline(body, setStep){
       + (isHome
           ? " 아래 브랜드로, 위 비주얼 디렉션의 미학 스타일·레퍼런스를 살린 전문가 수준의 '실제로 바로 열리는 완성형 HTML 브랜드 홈페이지(공식 홈)' 하나를 만들어라. "
           : " 아래 상품으로, 위 비주얼 디렉션의 미학 스타일·레퍼런스를 살린 전문가 수준의 '실제로 바로 열리는 완성형 HTML 상품페이지' 하나를 만들어라. ")
-      + "반드시 지킬 것: (1) 완전한 단일 HTML 문서(<!DOCTYPE html>부터 </html>까지, CSS는 <style>에 인라인). "
+      + "반드시 지킬 것: (1) 완전한 단일 HTML 문서(<!DOCTYPE html>부터 </html>까지, CSS는 <style>에 인라인). " + "★필수: 콘텐츠는 자바스크립트 없이도 즉시 보여야 한다. opacity:0 / visibility:hidden 상태로 시작해서 JS(IntersectionObserver 등)로 나타나게 하는 스크롤 리빌은 금지 — JS가 한 줄이라도 실패하면 페이지 전체가 백지가 된다. 애니메이션은 CSS @keyframes로만, 끝난 상태가 아니라 처음부터 보이는 상태에서 시작하라(animation-fill-mode 의존 금지). localStorage·sessionStorage·쿠키는 절대 쓰지 마라(샌드박스에서 예외를 던져 스크립트가 죽는다). "
       + (isHome
           ? "(2) 홈페이지 구성: 상단 헤더+내비게이션(홈·브랜드·상품·후기·문의, 앵커 링크로 동작), 히어로(브랜드 슬로건+대표 비주얼), 브랜드 스토리(우리는 누구인가·왜 이 땅에서), 대표 상품 카드 3~6개(이름·한 줄 설명·가격 자리), 산지/농장 소개, 고객 후기, 문의·주문 안내(연락처·오시는 길)+푸터. 단일 페이지 스크롤형으로. "
           : "(2) 히어로 섹션(풀블리드 대형 비주얼 + 브랜드 스토리 한 문장), 상품 소개, 스토리텔링, 상세 특징, 구매 유도(CTA) 섹션 포함. ")
@@ -4359,7 +4383,53 @@ async function productPagePipeline(body, setStep){
   DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1; if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
   if (formula) logKnowledgeApplied(d, (isRevise?(KIND_NM+" 수정"):(KIND_NM+" 제작")), product);
   saveDB();
-  return { ok:true, html, product, kind, dept:d, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, by:a.kr };
+  const _chk = checkHtmlOutput(html);
+  if(!_chk.ok){
+    _step("⚠️ 결과물 이상 감지 — 다시 만드는 중 ("+_chk.problems.join(", ")+")");
+    try{
+      const retry = await anthropic(sys + "\n\n★이전 시도가 실패했다: "+_chk.problems.join(", ")+". 반드시 <!DOCTYPE html>로 시작해 </html>로 끝나는 완전한 문서를, 본문 텍스트를 충분히 담아 출력하라.", user, 8000);
+      const h2 = String(retry).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+      if(checkHtmlOutput(h2).ok) html = h2;
+    }catch(_){}
+  }
+  html = hardenHtml(html);
+  return { ok:true, html, product, kind, dept:d, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, check:checkHtmlOutput(html), by:a.kr };
+}
+// v227: 보고서 검수관 — 팔 수 있는 보고서인지 '근거'로 심사한다.
+// 디자인 검수(색·레이아웃)와 완전히 다른 축이다. 지어낸 숫자 하나면 보고서 가치가 0이 된다.
+async function reviewReportHtml(html, topic, research){
+  const h = String(html||"");
+  // 자동 점검(결정적) — AI 판단 이전에 기계적으로 잡을 수 있는 것
+  const issues = [];
+  const bodyText = h.replace(/<script[\s\S]*?<\/script>/gi,"").replace(/<style[\s\S]*?<\/style>/gi,"").replace(/<[^>]+>/g," ");
+  if(!/<table/i.test(h)) issues.push("키워드 지도가 실제 <table>이 아님");
+  if(!/@media\s+print/i.test(h)) issues.push("@media print 없음(인쇄·PDF 불가)");
+  const secs = ["요약","키워드","경쟁","기회","30일","근거"];
+  const missing = secs.filter(k=> bodyText.indexOf(k)<0);
+  if(missing.length) issues.push("빠진 섹션: "+missing.join(", "));
+  if(bodyText.replace(/\s+/g," ").trim().length < 600) issues.push("내용이 너무 얇음");
+
+  const sys = "너는 민앤팜의 '글3 이야기팀·블로그 작가' 정유진이자, 보고서 감사관이다. "
+    + "이 리서치 보고서는 쇼핑몰 사장님에게 '팔 물건'이다. 냉정하게 심사하라.\n"
+    + "★심사 기준 (하나라도 걸리면 FAIL):\n"
+    + "① 조작 여부 — [조사자료]에 없는 검색량·순위·점유율·퍼센트 숫자를 지어냈는가? (가장 중요. 하나라도 있으면 무조건 FAIL)\n"
+    + "② 일반론 — '고객 중심으로 소통하세요', '꾸준히 올리세요' 같은 누구나 할 말이 섞였는가?\n"
+    + "③ 빈틈(기회) — ④번 섹션이 '남들이 안 하는 구체적인 것'인가, 아니면 뻔한 말인가?\n"
+    + "④ 실행 가능성 — 30일 플랜이 '무엇을·어디에·몇 개'까지 적혔는가?\n"
+    + "⑤ 정직성 — 모르는 건 '자료상 확인 불가'라고 적었는가, 아니면 아는 척했는가?\n"
+    + (issues.length ? ("자동 점검에서 발견된 문제(반드시 FAIL 처리하고 반영): "+issues.join(" / ")+"\n") : "")
+    + "반드시 한 줄만 출력(설명 금지):\nVERDICT: PASS 또는 FAIL | (FAIL이면 무엇을 어떻게 고칠지 구체적으로)";
+  let pass=true, feedback="";
+  try{
+    const out = await anthropic(sys,
+      "주제: "+(topic||"")
+      + "\n\n[조사자료 — 이 안에 있는 사실만 근거로 인정한다]\n"+String(research||"(없음)").slice(0,6000)
+      + "\n\n[심사 대상 보고서 HTML]\n"+h.slice(0,12000), 600);
+    const m = String(out).match(/VERDICT:\s*(PASS|FAIL)\s*\|?\s*(.*)/i);
+    if(m){ pass=/PASS/i.test(m[1]); feedback=String(m[2]||"").trim(); }
+  }catch(e){ /* 검수 실패가 발행을 막지는 않는다 */ }
+  if(issues.length){ pass=false; feedback=(feedback?feedback+" ":"")+"[자동점검] "+issues.join(" / "); }
+  return { pass, feedback, lint:issues };
 }
 // ===== 📊 v225: 리서치 보고서 (경쟁사·키워드·트렌드 → 사장님용 1장) =====
 // 팔 수 있는 산출물. 근거 없는 일반론이 나오면 가치가 0이므로 반드시 '실제 검색'을 먼저 돌리고,
@@ -4425,7 +4495,7 @@ async function reportPipeline(body, setStep){
       + "\n④ 기회(빈틈) : 남들이 안 하고 있는데 수요는 있는 것. 이게 이 보고서의 핵심 가치다."
       + "\n⑤ 30일 실행 플랜 : 1~4주차, 주차별로 '무엇을·어디에·몇 개'"
       + "\n⑥ 근거 자료 : 참고한 출처 목록"
-      + "\n\n[형식] 완전한 단일 HTML 문서(<!DOCTYPE html>~</html>, CSS는 <style> 인라인). "
+      + "\n\n[형식] 완전한 단일 HTML 문서(<!DOCTYPE html>~</html>, CSS는 <style> 인라인). " + "★필수: 콘텐츠는 자바스크립트 없이도 즉시 보여야 한다. opacity:0 / visibility:hidden 상태로 시작해서 JS(IntersectionObserver 등)로 나타나게 하는 스크롤 리빌은 금지 — JS가 한 줄이라도 실패하면 페이지 전체가 백지가 된다. 애니메이션은 CSS @keyframes로만, 끝난 상태가 아니라 처음부터 보이는 상태에서 시작하라(animation-fill-mode 의존 금지). localStorage·sessionStorage·쿠키는 절대 쓰지 마라(샌드박스에서 예외를 던져 스크립트가 죽는다). "
       + "A4 인쇄/PDF 저장이 되게 @media print 포함. 표는 실제 <table>로. 읽기 쉬운 여백·타이포. "
       + "차트가 필요하면 CSS 막대(div width %)로만 — 외부 라이브러리 금지. "
       + "설명·머리말 없이 HTML만 출력(```html 같은 마크다운 금지)."
@@ -4446,9 +4516,46 @@ async function reportPipeline(body, setStep){
   DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
   DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?"[리서치 보고서 수정]":"[리서치 보고서 작성]"), note:topic+(isRevise?(" — "+feedback.slice(0,50)):"") });
   if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+  // 🔁 v227: 근거 검수 루프 — 검수관(정유진)이 '지어낸 숫자·일반론'을 잡아낼 때까지 수정
+  const _reviews = [];
+  const _maxLoops = Math.max(0, Math.min(3, (DB.state && DB.state.designReviewLoops!=null) ? (+DB.state.designReviewLoops||0) : 1));
+  if(!isRevise && _maxLoops>0 && html.length>300){
+    for(let i=0;i<_maxLoops;i++){
+      _step("검수관이 근거 점검 중 ("+(i+1)+"/"+_maxLoops+")");
+      let rv;
+      try{ rv = await reviewReportHtml(html, topic, research); }
+      catch(e){ break; }
+      _reviews.push({ round:i+1, pass:rv.pass, feedback:rv.feedback, lint:rv.lint||[] });
+      if(rv.pass) break;
+      _step("검수 반영해 보고서 수정 중 ("+(i+1)+"/"+_maxLoops+")");
+      try{
+        const fixSys = "너는 민앤팜의 '"+a.no+" "+a.kr+"' 오세라다. 아래 보고서 HTML을 검수 지적대로 고쳐 완전한 단일 HTML 문서로 다시 출력하라. "
+          + "★지어낸 숫자는 반드시 삭제하거나 '자료상 확인 불가 — 직접 확인 필요'로 바꿔라. 일반론은 이 주제에서만 통하는 구체적인 내용으로 교체하라. "
+          + "구조·디자인은 유지. 설명 없이 HTML만 출력(```html 금지)."
+          + designSystemBlock();
+        const fixed = await anthropic(fixSys,
+          "[검수 지적]\n"+rv.feedback
+          + "\n\n[조사자료 — 이 안의 사실만 쓸 수 있다]\n"+String(research||"(없음)").slice(0,5000)
+          + "\n\n[현재 보고서 HTML]\n"+html.slice(0,14000), 8000);
+        const h3 = String(fixed).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+        if(h3.length>300) html = h3; else break;
+      }catch(e){ break; }
+    }
+  }
+
   DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
   saveDB();
-  return { ok:true, html, topic, sources:sources.slice(0,10), by:a.kr };
+  const _chk = checkHtmlOutput(html);
+  if(!_chk.ok){
+    _step("⚠️ 보고서 이상 감지 — 다시 만드는 중 ("+_chk.problems.join(", ")+")");
+    try{
+      const retry = await anthropic(sys + "\n\n★이전 시도가 실패했다: "+_chk.problems.join(", ")+". 반드시 완전한 HTML 문서를, 본문을 충분히 담아 출력하라.", user, 8000);
+      const h2 = String(retry).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+      if(checkHtmlOutput(h2).ok) html = h2;
+    }catch(_){}
+  }
+  html = hardenHtml(html);
+  return { ok:true, html, topic, sources:sources.slice(0,10), reviews:_reviews, check:checkHtmlOutput(html), by:a.kr };
 }
 // ===== 상품페이지 백그라운드 작업 큐 (앱을 나가도 안 끊김) =====
 function trimPageJobs(){
@@ -6845,6 +6952,7 @@ async function runCycleJob(id, appUrl){
                                           (s2)=>setStep("리서치 보고서 · "+s2));
         results.report = genR.html || "";
         results.reportTopic = topic;
+        results.reportReviews = genR.reviews || [];
       }catch(e){ job._warn=(job._warn||"")+"보고서 생성 실패: "+String(e.message||e).slice(0,60)+"; "; }
     }
 
@@ -7173,7 +7281,7 @@ async function runDesignJob(id, appUrl){
         setStep("디자인 코딩 중");
         sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 수석 웹디자이너다. "+ADDRESS
           + " 아래 요청으로 '실제로 바로 열리는 완성형 단일 HTML 문서'를 만들어라. "+spec.hint
-          + " 반드시: (1) <!DOCTYPE html>~</html> 완전한 문서, CSS는 <style>에 인라인. (2) 고급스러운 여백·타이포·색감, 모바일 반응형. (3) 사진 자리는 <div class=\"img-ph\">[이미지: 묘사]</div> 플레이스홀더. (4) 과장광고 금지. (5) 'AI가 만든 흔한 웹' 티 금지 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목+아이콘 카드 3개' 같은 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색·폰트·레이아웃을 실제로 구현하며 시그니처 요소를 눈에 띄게 살려라. 설명·마크다운 없이 HTML만."
+          + " ★필수: 콘텐츠는 자바스크립트 없이도 즉시 보여야 한다. opacity:0 / visibility:hidden 상태로 시작해서 JS(IntersectionObserver 등)로 나타나게 하는 스크롤 리빌은 금지 — JS가 한 줄이라도 실패하면 페이지 전체가 백지가 된다. 애니메이션은 CSS @keyframes로만, 끝난 상태가 아니라 처음부터 보이는 상태에서 시작하라(animation-fill-mode 의존 금지). localStorage·sessionStorage·쿠키는 절대 쓰지 마라(샌드박스에서 예외를 던져 스크립트가 죽는다). 반드시: (1) <!DOCTYPE html>~</html> 완전한 문서, CSS는 <style>에 인라인. (2) 고급스러운 여백·타이포·색감, 모바일 반응형. (3) 사진 자리는 <div class=\"img-ph\">[이미지: 묘사]</div> 플레이스홀더. (4) 과장광고 금지. (5) 'AI가 만든 흔한 웹' 티 금지 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목+아이콘 카드 3개' 같은 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색·폰트·레이아웃을 실제로 구현하며 시그니처 요소를 눈에 띄게 살려라. 설명·마크다운 없이 HTML만."
           + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + designSystemBlock() + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext();
         user = "요청: "+spec.label+"\n브리프: "+brief+(url?("\n참고(학습됨): "+url):"");
       }
