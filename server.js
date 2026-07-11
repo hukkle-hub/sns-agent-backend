@@ -1045,8 +1045,18 @@ const SPEC_DEFAULT = {
     { id:"platform_tips", auto:0, must:1, label:"네이버 카페 팁 · 다음 카페 팁 각각 포함" },
     { id:"no_ad_tone",    auto:0, must:1, label:"홍보 티가 나지 않는 경험담·정보공유 톤" }
   ],
+  "쇼츠 영상": [
+    { id:"hook",       auto:0, must:1, label:"첫 1초에 손가락을 멈추게 하는 후킹 (인사·자기소개로 시작하지 않음)" },
+    { id:"readable",   auto:1, must:1, label:"폰에서 읽히는 글자 크기 (메인 80 이상)" },
+    { id:"len",        auto:1, must:1, label:"요청한 길이에 맞음" },
+    { id:"renderable", auto:1, must:1, label:"렌더 엔진이 그릴 수 있는 요소·애니메이션만 사용" },
+    { id:"brandcolor", auto:1, must:0, label:"브랜드 도면 색을 사용" },
+    { id:"cta",        auto:0, must:1, label:"마지막에 행동 유도(주문·방문·팔로우)" },
+    { id:"noclutter",  auto:0, must:0, label:"한 화면에 텍스트 2개 이하 · 여백 확보" }
+  ],
   "_기본": [
     { id:"visual",        auto:0, must:0, label:"확정된 비주얼 디렉션(미학·팔레트·레이아웃·시그니처)을 그대로 구현함" },
+    { id:"layout_grid",   auto:1, must:0, label:"레이아웃 규격(컨테이너 폭·여백·타이포 스케일)을 숫자대로 지킴" },
     { id:"instruction",   auto:0, must:1, label:"클라이언트가 지시한 내용이 전부 반영됨" },
     { id:"complete",      auto:0, must:1, label:"손대지 않고 바로 쓸 수 있음 (빈칸·placeholder 없음)" },
     { id:"no_fake",       auto:0, must:1, label:"근거 없는 사실·수치를 지어내지 않음" },
@@ -1116,6 +1126,21 @@ function machineVerify(kind, content, vdir){
         set("visual", used.length >= Math.ceil(hx.length*0.6),
             "확정 팔레트 "+used.length+"/"+hx.length+" 사용" + (used.length < Math.ceil(hx.length*0.6) ? " → ❌ 정한 색을 안 씀" : ""));
       }
+    }
+    // 레이아웃 규격을 실제로 지켰는가 (숫자로 못 박았는데 무시하면 '아무 웹사이트'가 된다)
+    if(layoutGuardOn()){
+      const g = layoutGuard();
+      const lo = h.toLowerCase();
+      const gaps = [];
+      if(lo.indexOf("max-width:"+g.container+"px") < 0 && lo.indexOf("max-width: "+g.container+"px") < 0) gaps.push("컨테이너 "+g.container+"px 미적용");
+      if(!/@media[^{]*max-width/i.test(h)) gaps.push("모바일 브레이크포인트 없음");
+      const sizes = (h.match(/font-size\s*:\s*(\d+)px/gi)||[]).map(x=>parseInt(x.replace(/\D/g,""),10));
+      if(sizes.length){
+        const allowed = g.scale.concat(g.scale.map(v=>Math.round(v*0.6)), g.scale.map(v=>Math.round(v*0.7)));
+        const stray = sizes.filter(v => !allowed.some(a => Math.abs(a-v) <= 3));
+        if(stray.length > Math.max(2, Math.round(sizes.length*0.3))) gaps.push("타이포 스케일 벗어난 크기 "+stray.length+"개 (제각각이면 아마추어처럼 보임)");
+      }
+      set("layout_grid", gaps.length===0, gaps.length ? ("❌ "+gaps.join(" / ")) : ("컨테이너 "+g.container+"px · 스케일 준수"));
     }
     // 인라인 스크립트 문법 오류
     const scripts = [...h.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m=>m[1]);
@@ -1284,6 +1309,18 @@ async function experienceBriefing(pid, ctx, research, setStep){
 
 // ═══ 품질 앵커 API ═══
 // 📋 요구 명세(체크리스트) 조회·편집 — 오세라가 무엇을 검증할지 직접 정한다
+// 📐 레이아웃 규격 조회·수정
+app.get("/api/layout-guard", (req,res)=>{
+  res.json({ ok:true, on: layoutGuardOn(), guard: layoutGuard(), defaults: LAYOUT_GUARD_DEFAULT });
+});
+app.post("/api/layout-guard", (req,res)=>{
+  const b = req.body || {};
+  DB.state = DB.state || {};
+  if(typeof b.on === "boolean") DB.state.layoutGuardOff = !b.on;
+  if(b.guard && typeof b.guard === "object") DB.state.layoutGuard = b.guard;
+  saveDB();
+  res.json({ ok:true, on: layoutGuardOn(), guard: layoutGuard() });
+});
 app.get("/api/specs", (req,res)=>{
   const custom = (DB.state && DB.state.specs) || {};
   const kinds = Object.keys(SPEC_DEFAULT);
@@ -4500,7 +4537,12 @@ async function handleInstruction(instruction, source, images, history, shell){
 }
 
 // ========================= 엔드포인트 =========================
-app.get("/", (req,res)=> res.send("SNS 에이전트 확장 백엔드 작동 중"));
+// v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
+//   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
+const SERVER_VERSION = "v248";
+const SERVER_BOOTED_AT = Date.now();
+app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
+app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
 let KEEPALIVE_ON=false; // 자기-핑 활성 여부(서버 자동 깨우기)
 // 외부 핑(Keep-alive): 서버를 깨우고, 근무 중이고 자율수행이 밀렸으면 그 자리에서 한 사이클 실행 + 상태 보고
 let _lastPingAt = 0, _lastPingSavedAt = 0;
@@ -4885,7 +4927,7 @@ async function oseraReview(kindLabel, content, topic, ctx){
 
 // 오세라 게이트: 기준 미달이면 보완 재작성(최대 2회) → 재심사. 통과해야 passed=true.
 // regen(fix, issues) 는 '보완 지시를 받아 결과물을 다시 만드는' 함수. 없으면 심사만 한다.
-// ═══ v245: 최종 관문 — 완성본이 나가는 '모든' 경로가 여기를 통과해야 한다.
+// ═══ v246: 최종 관문 — 완성본이 나가는 '모든' 경로가 여기를 통과해야 한다.
 //   지금까지 선순환·디자인만 검증했고, 🔁 고쳐줘 / 콘텐츠 재활용 / 영상 기획 / 상품페이지 단독 탭은
 //   검증 없이 그대로 나갔다. '검증 안 받은 결과물이 나가는 길'이 하나라도 있으면 안 된다.
 async function verifyFinal(kindLabel, content, topic, regenSys, regenUser, setStep, specCtx, engine){
@@ -4930,7 +4972,7 @@ async function oseraGate(kindLabel, content, topic, regen, setStep, specCtx){
     if(rv.score >= rv.min) break;                         // 통과
     if(!regen || i===2) break;                            // 보완 횟수 소진
 
-    // ★ v245: '미충족 2건'만으론 아무것도 알 수 없다 → 무엇이 왜 미충족인지 그대로 쓴다
+    // ★ v246: '미충족 2건'만으론 아무것도 알 수 없다 → 무엇이 왜 미충족인지 그대로 쓴다
     const _miss = (rv.checks||[]).filter(x=>!x.pass);
     const _names = _miss.slice(0,3).map(x=>(x.must?"[필수] ":"")+x.label.split("(")[0].trim()).join(" / ");
     _step("🔧 오세라 지적 반영 — 이행률 "+rv.score+"% (기준 "+rv.min+"%) · 미충족 "+_miss.length+"건 보완 중"
@@ -5507,6 +5549,8 @@ async function productPagePipeline(body, setStep){
   const baseHtml = String(body.baseHtml||"");
   const feedback = String(body.feedback||"").slice(0,1500);
   const isRevise = !!(baseHtml && feedback);
+  // 🖼 v248: 참고 시안 이미지 — 글로 상상하지 말고 '직접 보고' 디렉션을 뽑는다
+  const refImgs = prepRefImages(body.refImages);
   let sys, user;
   if (isRevise){
     sys = "너는 민앤팜(고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 수석 웹디자이너다. "+ADDRESS
@@ -5529,9 +5573,14 @@ async function productPagePipeline(body, setStep){
         + "②이 상품 결에 맞는 실제 브랜드 레퍼런스 느낌(프리미엄 식품이면 오설록·마켓컬리·에르메스 푸드 같은, AI가 잘 아는 독창적 브랜드 — 아무 브랜드나 말고 결이 맞는 것). "
         + "③색·폰트·레이아웃·시그니처를 명확히. "
         + "반드시 JSON만(설명 금지): {\"aesthetic\":\"구체적 미학 스타일(한 단어~한 줄)\",\"reference\":\"레퍼런스 브랜드/느낌 + 왜 이 결이 맞는지 짧게\",\"mood\":\"전체 무드 한 줄\",\"palette\":[{\"name\":\"\",\"hex\":\"#______\",\"use\":\"용도\"}],\"typography\":{\"heading\":\"제목 폰트 느낌(구체적으로, 흔한 Inter류 금지)\",\"body\":\"본문 느낌\"},\"layout\":\"화면 배치를 한두 줄로 — 흔한 '가운데 정렬 히어로+아이콘 카드 3개'는 피하고 이 상품만의 구조로\",\"signature\":\"이 페이지만의 강렬한 한 방 요소 하나\",\"imagePlan\":[{\"slot\":\"히어로/상세1 등\",\"desc\":\"구도·색·분위기까지 구체적 이미지 묘사\"}]}. palette 4~6개, imagePlan 3~5개.";
-      const vRaw = await anthropic(vSys + designSystemBlock()
-        + (hasDesignSystem()? " ★브랜드 디자인 시스템이 있으므로 palette·typography는 위 도면의 색·폰트를 '그대로' JSON에 옮겨 담아라(새 색 창작 금지). aesthetic·layout·signature만 이번 주제에 맞게 새로 정하라." : ""),
-        "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n정보: "+info.slice(0,900)+(formula?("\n\n[품질 공식 참고]\n"+formula.slice(0,600)):""), 900);
+      const vRaw = await anthropic(vSys + designSystemBlock() + layoutGuardBlock()
+        + (hasDesignSystem()? " ★브랜드 디자인 시스템이 있으므로 palette·typography는 위 도면의 색·폰트를 '그대로' JSON에 옮겨 담아라(새 색 창작 금지). aesthetic·layout·signature만 이번 주제에 맞게 새로 정하라." : "")
+        + (refImgs.length ? (" ★★클라이언트가 참고 시안 이미지 "+refImgs.length+"장을 첨부했다. 상상하지 말고 '이 이미지를 직접 보고' 디렉션을 뽑아라. "
+            + "이미지의 레이아웃 구조·여백 리듬·타이포 위계·색 분위기·시그니처 요소를 관찰해 그대로 옮겨라. "
+            + "단, 브랜드 도면의 색이 있으면 색은 도면을 따르고 '구조와 분위기'만 이미지에서 가져와라.") : ""),
+        (refImgs.length ? "[첨부된 참고 시안 이미지를 보고 분석하라]\n\n" : "")
+        + "브랜드: "+brand+"\n상품: "+product+(price?("\n가격: "+price):"")+"\n정보: "+info.slice(0,900)+(formula?("\n\n[품질 공식 참고]\n"+formula.slice(0,600)):""),
+        900, refImgs);
       const vj = safeJson(vRaw, null);
       if(vj){
         const pal = (vj.palette||[]).map(p=>"· "+(p.name||"")+" "+(p.hex||"")+(p.use?(" ("+p.use+")"):"")).join("\n");
@@ -5560,11 +5609,12 @@ async function productPagePipeline(body, setStep){
       + "(4) 과장광고·허위표현 금지, 실제 판매에 쓸 수 있는 신뢰감 있는 카피. "
       + "(5) 절대 'AI가 만든 흔한 웹' 티를 내지 마라 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목 + 아이콘 박힌 카드 3개' 같은 평균적 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색(hex)·폰트·레이아웃을 실제 화면에 그대로 구현하라. 특히 '시그니처(한 방 요소)'는 눈에 띄게 살려 이 페이지만의 인상을 만들어라. "
       + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
-      + formulaBlock + photoBlock + visualBlock + designSystemBlock() + _expBrief + profileContext(KIND_NM+" "+product+" "+info.slice(0,200));
+      + formulaBlock + photoBlock + visualBlock + designSystemBlock() + layoutGuardBlock() + _expBrief + profileContext(KIND_NM+" "+product+" "+info.slice(0,200))
+      + (refImgs.length ? "\n\n★참고 시안 이미지가 첨부돼 있다. 이미지의 레이아웃·여백·타이포 위계를 그대로 구현하라. AI가 흔히 만드는 뻔한 구조로 도망가지 마라." : "");
     user = "브랜드: "+brand+"\n"+(isHome?"홈페이지 주제":"상품")+": "+product+(price?("\n가격: "+price):"")+"\n"+(isHome?"참고 정보":"상품 정보")+":\n"+info;
   }
   _step((body.baseHtml?("✍️ 수정 요청 반영해 "+KIND_NM+" 재작성 중"):("✍️ 확정된 비주얼·브랜드 도면대로 "+KIND_NM+" 작성 중"))+" (1~3분)");
-  let html = await anthropic(sys, user, 8000); // 페이지는 길어야 하므로 큰 토큰
+  let html = await anthropic(sys, user, 8000, (typeof refImgs!=="undefined" && !isRevise) ? refImgs : undefined); // 페이지는 길어야 하므로 큰 토큰
   _step("📦 코드 정리 후 오세라에게 넘기는 중");
   // 혹시 코드펜스가 붙어 나오면 제거
   html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
@@ -5794,6 +5844,277 @@ async function reportPipeline(body, setStep){
   }
   return { ok:true, html, topic, sources:sources.slice(0,10), reviews:_reviews, osera:_osera, oseraPassed:_oseraPassed, check:checkHtmlOutput(html), by:a.kr };
 }
+// ═══════════════════════════════════════════════════════════════════
+// v248: ① 수치 가드레일  ② 시안 이미지 먼저
+//
+// ① "AI가 만든 티"의 절반은 여백·정렬·타이포가 제멋대로여서 생긴다.
+//    지금까지 비주얼 디렉션에 '숫자'가 없었다 — "넓은 여백"을 AI가 알아서 해석했다.
+//    → 컨테이너 폭·패딩·섹션 간격·타이포 스케일을 px로 못 박는다. 기계로 검증도 한다.
+//
+// ② 지금까지 비주얼 디렉션을 '글'로만 잡았다 → AI가 글을 읽고 '상상해서' 코딩했다.
+//    → 참고 이미지를 올리면 Claude가 '직접 보고' 디렉션을 뽑는다. 상상이 아니라 관찰.
+// ═══════════════════════════════════════════════════════════════════
+const LAYOUT_GUARD_DEFAULT = {
+  container: 1200,      // 컨테이너 최대 폭
+  padDesktop: 80,       // 좌우 패딩 (데스크탑)
+  padMobile: 20,        // 좌우 패딩 (모바일)
+  sectionDesktop: 120,  // 섹션 상하 여백 (데스크탑)
+  sectionMobile: 64,    // 섹션 상하 여백 (모바일)
+  proseWidth: 680,      // 본문 최대 폭 (읽기 편한 줄 길이)
+  heroMinVh: 88,        // 히어로 최소 높이(vh)
+  radius: 12,           // 모서리 반경
+  scale: [96, 56, 32, 20, 15]   // 타이포 스케일 (h1/h2/h3/본문/캡션)
+};
+function layoutGuard(){
+  const g = (DB.state && DB.state.layoutGuard) || {};
+  const d = LAYOUT_GUARD_DEFAULT;
+  const num = (v, dv, lo, hi)=>{ const n = parseInt(v,10); return (n>=lo && n<=hi) ? n : dv; };
+  return {
+    container:      num(g.container,      d.container,      600, 1600),
+    padDesktop:     num(g.padDesktop,     d.padDesktop,     16, 160),
+    padMobile:      num(g.padMobile,      d.padMobile,      8, 48),
+    sectionDesktop: num(g.sectionDesktop, d.sectionDesktop, 40, 240),
+    sectionMobile:  num(g.sectionMobile,  d.sectionMobile,  24, 120),
+    proseWidth:     num(g.proseWidth,     d.proseWidth,     420, 900),
+    heroMinVh:      num(g.heroMinVh,      d.heroMinVh,      40, 100),
+    radius:         num(g.radius,         d.radius,         0, 40),
+    scale: (Array.isArray(g.scale) && g.scale.length===5) ? g.scale.map((x,i)=>num(x, d.scale[i], 10, 220)) : d.scale
+  };
+}
+function layoutGuardOn(){ const st=DB.state||{}; return st.layoutGuardOff !== true; }
+function layoutGuardBlock(){
+  if(!layoutGuardOn()) return "";
+  const g = layoutGuard();
+  return "\n\n[레이아웃 규격 — 이 숫자를 그대로 CSS에 써라. '넉넉하게' 같은 말로 대충 넘기지 마라]\n"
+    + "· 컨테이너 최대 폭: max-width: "+g.container+"px; margin: 0 auto;\n"
+    + "· 좌우 패딩: 데스크탑 "+g.padDesktop+"px / 모바일 "+g.padMobile+"px\n"
+    + "· 섹션 상하 여백: 데스크탑 "+g.sectionDesktop+"px / 모바일 "+g.sectionMobile+"px\n"
+    + "· 본문 글 최대 폭: "+g.proseWidth+"px (줄이 길면 안 읽힌다)\n"
+    + "· 히어로 최소 높이: min-height: "+g.heroMinVh+"vh\n"
+    + "· 모서리 반경: "+g.radius+"px (전부 통일)\n"
+    + "· 타이포 스케일(px): 대제목 "+g.scale[0]+" / 소제목 "+g.scale[1]+" / 항목 "+g.scale[2]+" / 본문 "+g.scale[3]+" / 캡션 "+g.scale[4]+"\n"
+    + "  (모바일은 대제목·소제목을 0.55~0.7배로 줄여라. clamp() 권장)\n"
+    + "· 이 스케일 밖의 글자 크기를 임의로 만들지 마라. 크기가 제각각이면 아마추어처럼 보인다.";
+}
+
+// 참고 이미지 정리 — Claude 멀티모달 입력 형식으로 (dataURL → {media_type, data})
+function prepRefImages(arr){
+  if(!Array.isArray(arr)) return [];
+  const out = [];
+  arr.slice(0,4).forEach(function(x){
+    const s0 = String((x && (x.data || x)) || "");
+    const m = s0.match(/^data:(image\/(png|jpeg|jpg|webp|gif));base64,(.+)$/i);
+    if(m){
+      const mt = m[1].toLowerCase().replace("image/jpg","image/jpeg");
+      const b64 = m[3];
+      if(b64.length < 5 * 1024 * 1024) out.push({ media_type: mt, data: b64 });   // 약 3.7MB 원본 상한
+    }
+  });
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v247: 🎬 쇼츠 — 텍스트 → 실제 영상 파일
+//
+// 지금까지 팀에이전트가 만드는 건 전부 '글'이었다. 필름팀 3명이 있는데 영상이 안 나왔다.
+// (임채원=기획서, 서다은=대본, 노아라=편집 지시서 — 전부 종이에서 끝났다)
+//
+// 설계: AI에게 '코드'를 짜게 하지 않는다. 깨지니까.
+//   → AI는 '선언형 장면 스펙(JSON)'만 만든다.
+//   → 앱이 고정된 렌더 엔진으로 그린다 → 같은 스펙이면 항상 같은 영상.
+//   → 그래서 오세라가 '기계 검증'을 할 수 있다 (장면 수·길이·브랜드 색·글자 길이).
+//   → 녹화는 브라우저 표준(canvas.captureStream + MediaRecorder) — 서버 부담 0원.
+//
+// 한계(정직하게): 실사형 시네마틱은 못 만든다. 타이포·인포그래픽·모션그래픽 전용.
+// ═══════════════════════════════════════════════════════════════════
+const SHORTS_RATIOS = {
+  "9:16": { w:1080, h:1920, kr:"세로 (쇼츠·릴스·틱톡)" },
+  "1:1":  { w:1080, h:1080, kr:"정사각 (인스타 피드)" },
+  "16:9": { w:1920, h:1080, kr:"가로 (유튜브)" }
+};
+const SHORTS_ANIMS = ["fade","fadeUp","fadeDown","slideL","slideR","zoomIn","zoomOut","growX","typewriter","countUp","pop"];
+const SHORTS_ELEMENTS = ["text","rect","circle","line","bar"];
+
+// 렌더 엔진이 실제로 지원하는 것만 쓰게 강제한다 (AI가 없는 기능을 지어내면 화면이 빈다)
+function shortsSpecSchema(){
+  return "{\n"
+    + '  "meta": { "title":"영상 제목", "fps":30, "bg":"#색상" },\n'
+    + '  "scenes": [\n'
+    + '    { "dur": 3.0, "bg":"#색상", "transition":"fade|cut",\n'
+    + '      "elements": [\n'
+    + '        { "type":"text", "text":"문구", "x":540, "y":800, "size":92, "weight":800, "color":"#FFF",\n'
+    + '          "align":"center|left|right", "maxWidth":900, "anim":"fadeUp", "delay":0.2, "dur":0.6 },\n'
+    + '        { "type":"rect",   "x":420,"y":1020,"w":240,"h":8,  "color":"#색상", "radius":4, "anim":"growX", "delay":0.9 },\n'
+    + '        { "type":"circle", "x":540,"y":600,"r":180, "color":"#색상", "anim":"pop", "delay":0.1 },\n'
+    + '        { "type":"line",   "x":100,"y":500,"x2":980,"y2":500,"color":"#색상","width":3,"anim":"growX" },\n'
+    + '        { "type":"bar",    "x":140,"y":1200,"w":800,"h":40,"pct":72,"color":"#색상","bg":"#eee","label":"72%","anim":"growX" }\n'
+    + '      ] }\n'
+    + '  ]\n'
+    + "}";
+}
+
+// ───────── 기계 검증 (결정론적 — 렌더러가 실제로 그릴 수 있는지 코드로 확인) ─────────
+function verifyShortsSpec(spec, opt){
+  const o = opt || {};
+  const problems = [];
+  const warn = [];
+  if(!spec || !Array.isArray(spec.scenes) || !spec.scenes.length) return { ok:false, problems:["장면(scenes)이 없음"], total:0 };
+
+  const R = SHORTS_RATIOS[o.ratio] || SHORTS_RATIOS["9:16"];
+  let total = 0;
+  const usedColors = new Set();
+
+  spec.scenes.forEach((sc, i)=>{
+    const n = i+1;
+    const d = +sc.dur || 0;
+    if(!(d >= 0.8 && d <= 12)) problems.push(n+"번 장면 길이 이상 ("+d+"초 — 0.8~12초여야 함)");
+    total += d;
+    if(sc.bg) usedColors.add(String(sc.bg).toLowerCase());
+    if(!Array.isArray(sc.elements) || !sc.elements.length){ problems.push(n+"번 장면에 요소가 없음(빈 화면)"); return; }
+
+    sc.elements.forEach((el, k)=>{
+      const tag = n+"번 장면 "+(k+1)+"번 요소";
+      if(SHORTS_ELEMENTS.indexOf(String(el.type)) < 0){ problems.push(tag+": 렌더러가 모르는 종류 '"+el.type+"'"); return; }
+      if(el.anim && SHORTS_ANIMS.indexOf(String(el.anim)) < 0) problems.push(tag+": 없는 애니메이션 '"+el.anim+"'");
+      if(el.color) usedColors.add(String(el.color).toLowerCase());
+      // 화면 밖으로 나가는 요소
+      const x = +el.x, y = +el.y;
+      if(!(x >= -50 && x <= R.w+50)) problems.push(tag+": x좌표 "+x+" 가 화면 밖 (0~"+R.w+")");
+      if(!(y >= -50 && y <= R.h+50)) problems.push(tag+": y좌표 "+y+" 가 화면 밖 (0~"+R.h+")");
+      if(el.type === "text"){
+        const t = String(el.text||"");
+        if(!t.trim()) problems.push(tag+": 빈 텍스트");
+        if(t.length > 60) warn.push(tag+": 글자가 너무 김("+t.length+"자) — 쇼츠는 한 화면에 20자 안쪽이 읽힘");
+        const sz = +el.size || 0;
+        if(!(sz >= 24 && sz <= 220)) problems.push(tag+": 글자 크기 "+sz+" (24~220 사이여야 읽힘)");
+      }
+      // 애니메이션 타이밍이 장면 길이를 넘으면 안 보인다
+      const delay = +el.delay || 0;
+      if(delay >= d) problems.push(tag+": delay "+delay+"초가 장면 길이 "+d+"초를 넘어 화면에 안 나옴");
+    });
+  });
+
+  // 총 길이
+  const want = +o.seconds || 0;
+  if(want && (total < want*0.6 || total > want*1.6)) problems.push("총 길이 "+total.toFixed(1)+"초 — 요청한 "+want+"초와 너무 다름");
+  if(total < 5) problems.push("총 길이가 너무 짧음 ("+total.toFixed(1)+"초)");
+  if(total > 90) problems.push("총 길이가 너무 김 ("+total.toFixed(1)+"초 — 쇼츠는 60초 이하)");
+
+  // 브랜드 도면 색을 실제로 썼는가
+  const ds = (DB.state && DB.state.designSystem) || null;
+  if(ds && ds.on !== false && String(ds.text||"").trim()){
+    const hexes = (String(ds.text).match(/#[0-9a-f]{6}/gi)||[]).map(x=>x.toLowerCase());
+    if(hexes.length){
+      const used = hexes.filter(h=> usedColors.has(h));
+      if(used.length < Math.min(2, hexes.length)) problems.push("브랜드 도면 색을 안 씀 (도면 "+hexes.length+"개 중 "+used.length+"개만 사용)");
+    }
+  }
+  return { ok: problems.length===0, problems, warn, total: Math.round(total*10)/10, scenes: spec.scenes.length };
+}
+
+// ───────── 쇼츠 생성 파이프라인 ─────────
+async function shortsPipeline(body, setStep){
+  const _step = (typeof setStep==="function") ? setStep : function(){};
+  const topic   = String(body.topic||"").trim().slice(0,120);
+  if(!topic) throw new Error("주제가 필요합니다");
+  const ratio   = SHORTS_RATIOS[body.ratio] ? body.ratio : "9:16";
+  const R       = SHORTS_RATIOS[ratio];
+  const seconds = Math.max(10, Math.min(60, parseInt(body.seconds,10) || 20));
+  const memo    = String(body.memo||"").slice(0,600);
+  const info    = String(body.info||"").slice(0,1500);
+
+  // ① 경험 훑기 (선순환에서 이미 훑었으면 재사용)
+  let expBrief = String(body.expBrief||"");
+  if(!expBrief && expSweepOn()){
+    try{ expBrief = await experienceBriefing(curProjectId(), "쇼츠 영상 "+topic, info, _step); }catch(e){}
+  }
+
+  // ② 대본 — 서다은(필2, 대본 작가)
+  _step("✍️ 서다은(필2) 대본 작가 — 첫 1초에 손가락을 멈추게 할 후킹부터 씁니다");
+  const wr = AGENTS.scout;
+  const scriptSys = "너는 민앤팜(전남 고흥 특산물)의 '"+wr.no+" "+wr.kr+"' 서다은이다."+ADDRESS
+    + " "+seconds+"초짜리 "+R.kr+" 쇼츠 대본을 쓴다.\n"
+    + "★규칙: (1) 첫 1초에 손가락을 멈추게 하는 후킹. 인사·자기소개 금지.\n"
+    + "(2) 한 화면에 들어갈 문구는 20자 안쪽. 쇼츠는 읽을 시간이 없다.\n"
+    + "(3) 장면마다 '무엇을 보여줄지' 한 줄. (4) 마지막에 행동 유도 한 줄.\n"
+    + "(5) 지어낸 수치·효능 금지.\n"
+    + "반드시 JSON만: {\"hook\":\"첫 문구\",\"beats\":[{\"copy\":\"화면 문구(20자 이내)\",\"note\":\"이 장면에서 보여줄 것\",\"sec\":3}],\"cta\":\"마지막 행동 유도\"}"
+    + brandBlock() + expBrief + profileContext("쇼츠 영상 대본 "+topic);
+  const scriptRaw = await anthropic(scriptSys, "주제: "+topic+(info?("\n정보: "+info):"")+(memo?("\n지시: "+memo):"")+"\n길이: "+seconds+"초", 1200);
+  const script = safeJson(scriptRaw, null) || { hook:topic, beats:[], cta:"" };
+
+  // ③ 장면 스펙 — 노아라(필3, 편집·썸네일)
+  _step("🎬 노아라(필3) 편집 — 대본을 장면·타이포·모션으로 옮기는 중");
+  const ed = AGENTS.editing;
+  const specSys = "너는 민앤팜의 '"+ed.no+" "+ed.kr+"' 노아라다. 대본을 '장면 스펙(JSON)'으로 옮긴다.\n"
+    + "★이 스펙은 우리 렌더 엔진이 그대로 그린다. 아래에 없는 기능은 절대 쓰지 마라 — 쓰면 화면이 빈다.\n"
+    + "화면 크기: "+R.w+" x "+R.h+" (좌표는 이 안에서만)\n"
+    + "쓸 수 있는 요소: "+SHORTS_ELEMENTS.join(", ")+"\n"
+    + "쓸 수 있는 애니메이션: "+SHORTS_ANIMS.join(", ")+"\n"
+    + "\n[스키마 — 이 형식 그대로]\n" + shortsSpecSchema()
+    + "\n\n★필수 규칙:\n"
+    + "1. 총 길이 약 "+seconds+"초. 장면 "+Math.max(3, Math.round(seconds/4))+"~"+Math.max(5, Math.round(seconds/2.5))+"개.\n"
+    + "2. 글자 크기: 메인 카피 80~140, 보조 40~60. 작으면 폰에서 안 읽힌다.\n"
+    + "3. 한 장면에 텍스트 2개 이하. 여백을 넉넉히.\n"
+    + "4. delay는 반드시 그 장면 dur보다 작게. (크면 화면에 안 나온다)\n"
+    + "5. 색은 아래 브랜드 도면의 hex를 그대로 써라. 없으면 고흥 특산물에 어울리는 색 3개로 통일.\n"
+    + "6. 배경과 글자의 명도 대비를 확실히. 회색 배경에 회색 글자 금지.\n"
+    + "반드시 JSON만 출력(설명·마크다운 금지)."
+    + designSystemBlock() + brandBlock();
+
+  const specUser = "[대본]\n" + JSON.stringify(script)
+    + "\n\n주제: " + topic + "\n비율: " + ratio + " ("+R.w+"x"+R.h+")\n길이: "+seconds+"초"
+    + (memo ? ("\n연출 지시: "+memo) : "");
+
+  let spec = null, lastProblems = [];
+  for(let i=0;i<3;i++){
+    const raw = await anthropic(i===0 ? specSys : (specSys + "\n\n[이전 시도가 렌더 검사에서 실패했다 — 반드시 고쳐라]\n· " + lastProblems.slice(0,8).join("\n· ")),
+                                specUser, 4000);
+    const cand = safeJson(raw, null);
+    const chk = verifyShortsSpec(cand, { ratio, seconds });
+    if(chk.ok){ spec = cand; lastProblems = []; break; }
+    lastProblems = chk.problems || ["JSON 파싱 실패"];
+    spec = cand;
+    if(i < 2) _step("🔧 렌더 검사 실패 → 장면 스펙 수정 중 ("+(i+1)+"/2) — " + lastProblems.slice(0,2).join(" / "));
+  }
+  if(!spec) throw new Error("장면 스펙을 만들지 못했어요: " + lastProblems.join(" / "));
+
+  const check = verifyShortsSpec(spec, { ratio, seconds });
+  spec.meta = spec.meta || {};
+  spec.meta.w = R.w; spec.meta.h = R.h;
+  spec.meta.fps = Math.max(24, Math.min(30, +spec.meta.fps || 30));
+  spec.meta.title = spec.meta.title || topic;
+
+  // ④ 오세라 최종 검증
+  let osera = null, oseraPassed = true;
+  try{
+    const g = await oseraGate("쇼츠 영상", JSON.stringify(spec, null, 1), topic, async function(fix, issues){
+      const fixRaw = await anthropic(specSys + "\n\n[👑 총괄 오세라 지적 — 전부 반영해 스펙을 다시 내라]\n"
+        + (issues&&issues.length?("· "+issues.join("\n· ")+"\n"):"") + "가장 중요한 수정: " + fix,
+        specUser + "\n\n[현재 스펙]\n" + JSON.stringify(spec), 4000);
+      const c2 = safeJson(fixRaw, null);
+      if(c2 && verifyShortsSpec(c2, { ratio, seconds }).ok){ spec = c2; spec.meta = Object.assign({}, spec.meta, { w:R.w, h:R.h, fps:30, title:topic }); }
+      return JSON.stringify(spec, null, 1);
+    }, _step, { memo: memo + "\n" + info, brief: topic });
+    osera = g.review; oseraPassed = g.passed;
+  }catch(e){}
+
+  // 경험으로 저장
+  try{
+    recordExperience({ type:"result", kind:"쇼츠 영상", topic, score: osera ? osera.score : null,
+      note: (memo?("지시: "+memo.slice(0,80)+" / "):"") + check.scenes+"장면 · "+check.total+"초",
+      body: JSON.stringify(script).slice(0,1500) });
+  }catch(_){}
+
+  DB.deptMemory=DB.deptMemory||{}; DB.deptMemory.editing=DB.deptMemory.editing||[];
+  DB.deptMemory.editing.push({ at:Date.now(), instruction:"[쇼츠 영상 제작]", note:topic+" — "+check.scenes+"장면 "+check.total+"초" });
+  if(DB.deptMemory.editing.length>40) DB.deptMemory.editing = DB.deptMemory.editing.slice(-40);
+  DB.exp=DB.exp||{}; DB.exp.editing=(DB.exp.editing||0)+1; DB.exp.scout=(DB.exp.scout||0)+1;
+  saveDB();
+
+  return { ok:true, spec, script, ratio, seconds, check, osera, oseraPassed };
+}
+
 // ===== 상품페이지 백그라운드 작업 큐 (앱을 나가도 안 끊김) =====
 function trimPageJobs(){
   DB.pageJobs = DB.pageJobs || [];
@@ -5808,7 +6129,7 @@ async function runPageJob(id, appUrl){
   j.status="running"; j.startedAt=Date.now(); j.step="대기 중"; saveDB();
   beginJobMode();   // 작업 중 한도로 끊기지 않게
   try{
-    // v245: 단독 탭에서 만든 상품페이지도 반드시 검증한다 (기존엔 수정(revise) 시 무검증으로 나갔다)
+    // v246: 단독 탭에서 만든 상품페이지도 반드시 검증한다 (기존엔 수정(revise) 시 무검증으로 나갔다)
     const _in = Object.assign({}, (j.input||{}), { gate:true });
     const out = await productPagePipeline(_in, function(s){ logStep(j, s); });
     j.html = out.html; j.appliedFormula = !!out.appliedFormula; j.visualDirection = out.visualDirection||null;
@@ -7512,6 +7833,7 @@ app.get("/api/errors", (req,res)=> res.json((DB.errors||[]).slice(-50)));
 // ===== 🩺 시스템 건강 상태: 오류(묶음)·작업·API·저장을 한 화면에 =====
 app.get("/api/health", (req,res)=>{
   const now = Date.now();
+  const _ver = SERVER_VERSION;
   const groups = {};
   (DB.errors||[]).forEach(e=>{
     const key = (e.where||"")+"|"+String(e.msg||"").slice(0,60);
@@ -7534,7 +7856,7 @@ app.get("/api/health", (req,res)=>{
   if(storage.saveFailStreak>0) problems.push("데이터 저장 실패 "+storage.saveFailStreak+"회");
   if(learn.stuck+page.stuck>0) problems.push("멈춘 작업 "+(learn.stuck+page.stuck)+"건");
   if(errs24h>10) problems.push("최근 24시간 오류 "+errs24h+"건");
-  res.json({ ok:true, at:now, status: problems.length?"warn":"ok", problems,
+  res.json({ ok:true, version:_ver, bootedAt:SERVER_BOOTED_AT, at:now, status: problems.length?"warn":"ok", problems,
     errors:{ total:(DB.errors||[]).length, last24h:errs24h, groups:errorGroups },
     rateWaits:{ last24h:rateWaits24h, note:"Gemini 무료 한도로 잠시 쉰 횟수 — 오류 아님(자동 재시도됨)" },
     jobs:{ learn, page }, api, storage });
@@ -7607,7 +7929,7 @@ async function runRepurposeJob(id, appUrl){
         +(knowledgeText("monetization")?("\n\n[전환 품질 공식]\n"+knowledgeText("monetization")):"")
         +"\n\n아래 '원본 콘텐츠'를 핵심 손실 없이 아래 형식으로 재가공하라. 형식: "+REPURPOSE_FORMATS[p]+" 브랜드 사실·수치는 왜곡 금지. 결과물만 출력(설명 금지).";
       let _v = stripFences(await anthropic(sys, "[원본]\n"+String(j.source).slice(0,8000), 1500));
-      // v245: 재활용 결과물도 '완성본' — 오세라 검증 없이 나가면 안 된다
+      // v246: 재활용 결과물도 '완성본' — 오세라 검증 없이 나가면 안 된다
       try{
         logStep(j, "👑 총괄 오세라 검증 중 — "+(REPURPOSE_KR[p]||p));
         const g = await verifyFinal((REPURPOSE_KR[p]||p), _v, String(j.source||"").slice(0,60),
@@ -7682,7 +8004,7 @@ async function runVideoPlanJob(id, appUrl){
       saveDB();
       start=end+1;
     }
-    // v245: 영상 기획도 완성본 — 오세라가 요구 이행을 검증한다
+    // v246: 영상 기획도 완성본 — 오세라가 요구 이행을 검증한다
     try{
       const planTxt = "[콘셉트]\n"+JSON.stringify(j.concept||{})+"\n\n[콘텐츠 캘린더 "+(j.days_plan||[]).length+"일]\n"+JSON.stringify((j.days_plan||[]).slice(0,20));
       logStep(j, "👑 총괄 오세라 검증 중 — 요청한 플랫폼·기간·구성이 다 들어갔는지 대조");
@@ -8465,7 +8787,7 @@ app.post("/api/cycle/feedback", (req,res)=>{
         const rev = await reportPipeline({ topic: job.results.reportTopic||job.topic, info: job.info, memo: job.memo,
           baseHtml: cur, feedback: feedback }, (s2)=>{ logStep(job, "🔁 보고서 · "+s2); });
         let _r = (rev.html && rev.html.length>200) ? rev.html : cur;
-        // v245: 수정본도 '최종본'이다 — 검증 없이 나가면 안 된다
+        // v246: 수정본도 '최종본'이다 — 검증 없이 나가면 안 된다
         const gR = await verifyFinal("리서치 보고서", _r, job.results.reportTopic||job.topic,
           "너는 민앤팜 오세라다. 아래 보고서를 지적대로 고쳐 완전한 단일 HTML로 다시 출력하라. 설명 없이 HTML만."+designSystemBlock(),
           "[현재 보고서]\n"+_r.slice(0,14000), (st)=>logStep(job, "🔁 보고서 · "+st),
@@ -8481,7 +8803,7 @@ app.post("/api/cycle/feedback", (req,res)=>{
         const kd = isH ? "analytics" : "monetization";
         const knm = isH ? "홈페이지" : "상품페이지";
         const cur = job.results[kind] || "";
-        // v245: 수정본도 최종본 → gate:true
+        // v246: 수정본도 최종본 → gate:true
         const rev = await productPagePipeline({ kind:(isH?"home":"product"), dept:kd,
           product: (isH?(job.results.homeTopic||job.topic):(job.results.pageProduct||job.topic)), info: job.info,
           baseHtml: cur, feedback: feedback, gate:true }, (s)=>{ logStep(job, "🔁 "+knm+" · "+s); });
@@ -8499,7 +8821,7 @@ app.post("/api/cycle/feedback", (req,res)=>{
         const cur = job.results[kind] || "";
         const um = "[기존 "+spec.label+"]\n"+cur+"\n\n[클라이언트 수정 요청]\n"+feedback+"\n\n(요청대로 고친 완성본만)";
         let out = "";
-        // v245: 수정본도 최종본 → 오세라 검증을 거친다
+        // v246: 수정본도 최종본 → 오세라 검증을 거친다
         try{ const g = await createReviewedContent(sys, um, job.topic, workEngine(), { gate:true }); out = g.content||"";
              if(g.osera){ job.results.osera = job.results.osera||{}; job.results.osera[kind] = g.osera; } }
         catch(e){
@@ -8632,9 +8954,12 @@ async function runDesignJob(id, appUrl){
         try{
           const vSys = "너는 민앤팜(전남 고흥 특산물)의 아트디렉터다."+brandBlock()
             + " 코딩 전에 비주얼을 먼저 확정한다. AI가 방향 없이 만들면 흔한 평균값('분포 수렴')으로 도망쳐 싸구려 티가 난다. '깔끔·모던' 대신 구체적 미학 스타일과 결 맞는 브랜드 레퍼런스, 색·폰트·레이아웃·시그니처를 못 박아라. JSON만: {\"aesthetic\":\"구체적 미학 스타일\",\"reference\":\"결 맞는 브랜드 레퍼런스 느낌\",\"mood\":\"\",\"palette\":[{\"name\":\"\",\"hex\":\"#______\",\"use\":\"\"}],\"typography\":{\"heading\":\"구체적으로(흔한 Inter류 금지)\",\"body\":\"\"},\"layout\":\"이 페이지만의 배치 한두 줄(흔한 가운데정렬 히어로+카드3개 금지)\",\"signature\":\"강렬한 한 방 요소 하나\"}. palette 4~6개.";
-          const vRaw = await anthropic(vSys + designSystemBlock()
-            + (hasDesignSystem()? " ★브랜드 디자인 시스템이 있으므로 palette·typography는 위 도면의 색·폰트를 그대로 옮겨 담아라(새 색 창작 금지). aesthetic·layout·signature만 새로 정하라." : ""),
-            spec.label+" — "+brief.slice(0,600)+(memo?("\n지시:"+memo):""), 700);
+          const _dRefs = prepRefImages(job.refImages);
+          const vRaw = await anthropic(vSys + designSystemBlock() + layoutGuardBlock()
+            + (hasDesignSystem()? " ★브랜드 디자인 시스템이 있으므로 palette·typography는 위 도면의 색·폰트를 그대로 옮겨 담아라(새 색 창작 금지). aesthetic·layout·signature만 새로 정하라." : "")
+            + (_dRefs.length ? (" ★★참고 시안 이미지 "+_dRefs.length+"장이 첨부됐다. 상상하지 말고 이미지를 직접 보고, 레이아웃 구조·여백 리듬·타이포 위계·시그니처를 관찰해 그대로 옮겨라.") : ""),
+            (_dRefs.length ? "[첨부된 참고 시안 이미지를 보고 분석하라]\n\n" : "")
+            + spec.label+" — "+brief.slice(0,600)+(memo?("\n지시:"+memo):""), 700, _dRefs);
           const vj = safeJson(vRaw, null);
           if(vj){ const pal=(vj.palette||[]).map(p=>"· "+(p.name||"")+" "+(p.hex||"")+(p.use?(" ("+p.use+")"):"")).join("\n");
             visualBlock = "\n\n[먼저 확정한 비주얼 — 이 미학·레퍼런스·색·타이포·레이아웃·시그니처에 정확히 맞춰 설계, hex를 실제 CSS에 사용]\n"
@@ -8652,7 +8977,7 @@ async function runDesignJob(id, appUrl){
         sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 수석 웹디자이너다. "+ADDRESS
           + " 아래 요청으로 '실제로 바로 열리는 완성형 단일 HTML 문서'를 만들어라. "+spec.hint
           + " ★필수: 콘텐츠는 자바스크립트 없이도 즉시 보여야 한다. opacity:0 / visibility:hidden 상태로 시작해서 JS(IntersectionObserver 등)로 나타나게 하는 스크롤 리빌은 금지 — JS가 한 줄이라도 실패하면 페이지 전체가 백지가 된다. 애니메이션은 CSS @keyframes로만, 끝난 상태가 아니라 처음부터 보이는 상태에서 시작하라(animation-fill-mode 의존 금지). localStorage·sessionStorage·쿠키는 절대 쓰지 마라(샌드박스에서 예외를 던져 스크립트가 죽는다). 반드시: (1) <!DOCTYPE html>~</html> 완전한 문서, CSS는 <style>에 인라인. (2) 고급스러운 여백·타이포·색감, 모바일 반응형. (3) 사진 자리는 <div class=\"img-ph\">[이미지: 묘사]</div> 플레이스홀더. (4) 과장광고 금지. (5) 'AI가 만든 흔한 웹' 티 금지 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목+아이콘 카드 3개' 같은 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색·폰트·레이아웃을 실제로 구현하며 시그니처 요소를 눈에 띄게 살려라. 설명·마크다운 없이 HTML만."
-          + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + designSystemBlock() + dExpBrief + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext(spec.label+" "+brief.slice(0,200));
+          + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + designSystemBlock() + layoutGuardBlock() + dExpBrief + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext(spec.label+" "+brief.slice(0,200));
         user = "요청: "+spec.label+"\n브리프: "+brief+(url?("\n참고(학습됨): "+url):"");
       }
       setStep("📦 코드 정리 후 오세라에게 넘기는 중");
@@ -8660,7 +8985,7 @@ async function runDesignJob(id, appUrl){
       html = String(html).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
       // v242: 익명 검수관 루프 제거 — 검증은 총괄 오세라가 한다(비주얼 디렉션도 명세로 검증)
 
-      // 👑 오세라 최종 검증 — v245: 수정(고쳐줘) 결과도 최종본이므로 반드시 검증
+      // 👑 오세라 최종 검증 — v246: 수정(고쳐줘) 결과도 최종본이므로 반드시 검증
       {
         try{
           const g = await oseraGate(spec.label, html, brief, async function(fx, iss){
@@ -8709,6 +9034,89 @@ async function runDesignJob(id, appUrl){
   }finally{ endJobMode(); }
 }
 // v228: 실패한 작업을 원본 입력 그대로 다시 실행 (목록 응답은 brief가 잘려 있어 프론트가 재구성하면 안 된다)
+// ═══ 🎬 쇼츠 작업 큐 ═══
+function trimShortsJobs(){ DB.shortsJobs = DB.shortsJobs || []; if(DB.shortsJobs.length > 20) DB.shortsJobs = DB.shortsJobs.slice(-20); }
+async function runShortsJob(id, appUrl){
+  const j = (DB.shortsJobs||[]).find(x=>String(x.id)===String(id));
+  if(!j) return;
+  j.status="running"; j.startedAt=Date.now(); saveDB();
+  beginJobMode();
+  try{
+    logStep(j, "🎬 쇼츠 제작 시작 — "+j.topic+" ("+j.ratio+" · "+j.seconds+"초)");
+    const out = await shortsPipeline({ topic:j.topic, ratio:j.ratio, seconds:j.seconds, memo:j.memo, info:j.info },
+                                     (st)=>logStep(j, st));
+    j.spec = out.spec; j.script = out.script; j.check = out.check;
+    j.osera = out.osera || null; j.oseraPassed = out.oseraPassed !== false;
+    j.status = "done";
+    doneJob(j, "✅ 완료 — "+out.check.scenes+"장면 "+out.check.total+"초"
+      + ((out.osera && out.osera.score!=null) ? (" · 오세라 "+out.osera.score+"%") : ""));
+    trimShortsJobs(); saveDB();
+    try{ kakaoNotify("🎬 쇼츠 완성 — '"+j.topic+"'\n"+out.check.scenes+"장면 · "+out.check.total+"초\n앱 만들기 > 쇼츠 탭에서 재생·녹화·다운로드하세요."); }catch(_){}
+  }catch(e){
+    failJob(j, e, "shorts-job");
+    try{ kakaoNotify("⚠️ 쇼츠 제작 실패 — "+(j.error||"")); }catch(_){}
+  }finally{ endJobMode(); }
+}
+app.get("/api/shorts/ratios", (req,res)=> res.json({ ok:true, ratios: SHORTS_RATIOS }));
+app.post("/api/shorts/start", (req,res)=>{
+  try{
+    const b = req.body || {};
+    const topic = String(b.topic||"").trim();
+    if(!topic) return res.status(400).json({ error:"무엇에 대한 영상인지 입력하세요" });
+    DB.shortsJobs = DB.shortsJobs || [];
+    const job = { id:String(Date.now())+"_v"+Math.floor(Math.random()*1000),
+      topic: topic.slice(0,120),
+      ratio: SHORTS_RATIOS[b.ratio] ? b.ratio : "9:16",
+      seconds: Math.max(10, Math.min(60, parseInt(b.seconds,10)||20)),
+      memo: String(b.memo||"").slice(0,600),
+      info: String(b.info||"").slice(0,1500),
+      status:"queued", at:Date.now() };
+    DB.shortsJobs.push(job); trimShortsJobs(); saveDB();
+    res.json({ ok:true, jobId:job.id, status:"queued" });
+    setImmediate(()=>{ runShortsJob(job.id, String(b.appUrl||"")).catch(e=>logError("shorts-start", e)); });
+  }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
+});
+app.get("/api/shorts/status", (req,res)=>{
+  const j = (DB.shortsJobs||[]).find(x=>x.id===String(req.query.id||""));
+  if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  res.json({ ok:true, id:j.id, topic:j.topic, ratio:j.ratio, seconds:j.seconds,
+    status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
+    steps:(j.steps||[]).slice(-60), startedAt:j.startedAt||j.at||0,
+    check:j.check||null, osera:j.osera||null, doneAt:j.doneAt||0 });
+});
+app.get("/api/shorts/list", (req,res)=>{
+  const jobs = (DB.shortsJobs||[]).slice(-14).reverse().map(j=>({
+    id:j.id, topic:j.topic, ratio:j.ratio, seconds:j.seconds, status:j.status, step:j.step||"",
+    at:j.at, doneAt:j.doneAt||0, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
+    check:j.check||null, osera:j.osera||null, hasSpec: !!j.spec }));
+  res.json({ ok:true, jobs });
+});
+app.get("/api/shorts/get", (req,res)=>{
+  const j = (DB.shortsJobs||[]).find(x=>x.id===String(req.query.id||""));
+  if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  if(!j.spec) return res.status(404).json({ error:"장면 스펙이 없어요 (아직 제작 중이거나 실패했어요)" });
+  res.json({ ok:true, id:j.id, topic:j.topic, ratio:j.ratio, seconds:j.seconds,
+    spec:j.spec, script:j.script||null, check:j.check||null, osera:j.osera||null });
+});
+app.post("/api/shorts/delete", (req,res)=>{
+  const id = String((req.body&&req.body.id)||"");
+  const before=(DB.shortsJobs||[]).length;
+  DB.shortsJobs = (DB.shortsJobs||[]).filter(x=>String(x.id)!==id);
+  if(DB.shortsJobs.length===before) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  saveDB(); res.json({ ok:true });
+});
+app.post("/api/shorts/retry", (req,res)=>{
+  const id = String((req.body&&req.body.id)||"");
+  const old = (DB.shortsJobs||[]).find(x=>x.id===id);
+  if(!old) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  const job = { id:String(Date.now())+"_v"+Math.floor(Math.random()*1000),
+    topic:old.topic, ratio:old.ratio, seconds:old.seconds, memo:old.memo||"", info:old.info||"",
+    status:"queued", at:Date.now(), retryOf:old.id };
+  DB.shortsJobs.push(job); trimShortsJobs(); saveDB();
+  res.json({ ok:true, jobId:job.id, status:"queued" });
+  setImmediate(()=>{ runShortsJob(job.id, String((req.body&&req.body.appUrl)||"")).catch(e=>logError("shorts-retry", e)); });
+});
+
 app.post("/api/design/retry", (req,res)=>{
   const id = String((req.body&&req.body.id)||"");
   const old = (DB.designJobs||[]).find(x=>x.id===id);
@@ -8716,6 +9124,7 @@ app.post("/api/design/retry", (req,res)=>{
   DB.designJobs = DB.designJobs || [];
   const job = { id:String(Date.now())+"_d"+Math.floor(Math.random()*1000),
     kind:old.kind, brief:old.brief, memo:old.memo||"", url:old.url||"",
+    refImages: old.refImages||[],
     status:"queued", at:Date.now(), retryOf:old.id };
   DB.designJobs.push(job); trimDesignJobs(); saveDB();
   res.json({ ok:true, jobId:job.id, status:"queued" });
@@ -8732,7 +9141,8 @@ app.post("/api/design/start", (req,res)=>{
     if(url && !/^https?:\/\/.+/.test(url)) return res.status(400).json({ error:"URL은 https:// 로 시작해야 해요" });
     DB.designJobs = DB.designJobs || [];
     const job = { id:String(Date.now())+"_d"+Math.floor(Math.random()*1000), kind, brief:brief.slice(0,1500),
-      memo:String(b.memo||"").slice(0,800), url, status:"queued", at:Date.now() };
+      memo:String(b.memo||"").slice(0,800), url, status:"queued", at:Date.now(),
+      refImages: Array.isArray(b.refImages) ? b.refImages.slice(0,4) : [] };   // 🖼 참고 시안 이미지
     DB.designJobs.push(job); trimDesignJobs(); saveDB();
     res.json({ ok:true, jobId:job.id, status:"queued" });
     setImmediate(()=>{ runDesignJob(job.id, String(b.appUrl||"")).catch(e=>logError("design-start", e)); });
@@ -8806,7 +9216,8 @@ setInterval(async ()=>{
       [DB.pageJobs,      "상품페이지"],
       [DB.learnJobs,     "학습"],
       [DB.videoJobs,     "영상"],
-      [DB.repurposeJobs, "재활용"]
+      [DB.repurposeJobs, "재활용"],
+      [DB.shortsJobs,    "쇼츠"]
     ];
     for (const [arr, label] of QUEUES){
       for (const jb of (arr||[])){
@@ -9733,6 +10144,7 @@ const PORT = process.env.PORT || 3000;
       _cleanup(DB.cycleJobs, "cycle");
       _cleanup(DB.designJobs, "design");
       _cleanup(DB.videoJobs, "video");
+      _cleanup(DB.shortsJobs, "shorts");
       if(_orphan){ try{ saveDB(); }catch(e){} console.log("재시작 정리 — 중단 작업 "+_orphan+"건 error 처리(재실행 안 함)"); }
     }catch(e){ try{ logError("boot-cleanup", e); }catch(_){} }
   }, 4000);
