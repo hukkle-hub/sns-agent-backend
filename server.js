@@ -346,6 +346,40 @@ async function anthropic(system, user, maxTokens = 1500, images){
   }
   return full.trim();
 }
+// ===== v229: 실패를 '정확하고 자세하게' 남기는 공통 기록기 =====
+// 문제: 기존엔 job.step="실패"로 덮어써서 '어느 단계에서 죽었는지'가 사라졌고,
+//       에러 메시지도 200자로 잘려 원인 파악이 불가능했다.
+// 원인을 분류해 사용자가 '무엇을 하면 되는지'까지 알 수 있게 한다.
+function classifyError(msg){
+  const m = String(msg||"").toLowerCase();
+  if(/분당 토큰|rate limit|429/.test(m))                 return { kind:"rate",    ko:"분당 요청 한도 초과",   fix:"1~2분 뒤 🔄 다시 시도하세요. 자주 겪으면 설정에서 검수 루프를 줄이세요." };
+  if(/abort|timeout|timed out|etimedout/.test(m))        return { kind:"timeout", ko:"응답 시간 초과",        fix:"결과물이 길어 시간이 초과됐어요. 🔄 다시 시도하거나, 브리프를 조금 짧게 나눠 주세요." };
+  if(/api_key|api key|401|unauthorized|invalid x-api/.test(m)) return { kind:"key", ko:"API 키 문제",       fix:"Render 환경변수의 ANTHROPIC_API_KEY / GEMINI_API_KEY를 확인하세요." };
+  if(/credit|billing|quota|insufficient/.test(m))        return { kind:"quota",   ko:"크레딧·쿼터 소진",     fix:"API 잔액을 확인하세요. 무료 우선 모드(NVIDIA)를 켜면 일부를 무료로 돌립니다." };
+  if(/fetch failed|network|enotfound|econnreset|socket/.test(m)) return { kind:"net", ko:"네트워크 오류",    fix:"일시적 네트워크 문제예요. 🔄 다시 시도하세요." };
+  if(/json|parse|unexpected token/.test(m))              return { kind:"parse",   ko:"AI 응답 형식 오류",    fix:"AI가 형식을 어겼어요. 🔄 다시 시도하면 대개 해결됩니다." };
+  if(/overload|529|서버 과부하/.test(m))                  return { kind:"busy",    ko:"AI 서버 과부하",       fix:"잠시 뒤 🔄 다시 시도하세요." };
+  if(/재시작/.test(m))                                    return { kind:"restart", ko:"서버 재시작으로 중단",  fix:"Render 무료 플랜은 유휴 시 잠들어요. 🔄 다시 시도하세요." };
+  return { kind:"other", ko:"알 수 없는 오류", fix:"🔄 다시 시도해 보세요. 계속되면 오류 원문을 개발자에게 전달하세요." };
+}
+function failJob(job, e, tag){
+  if(!job) return;
+  const raw = String((e && (e.stack || e.message)) || e || "알 수 없는 오류");
+  const msg = String((e && e.message) || e || "알 수 없는 오류");
+  const c = classifyError(msg);
+  job.status   = "error";
+  job.failStep = job.step || "(단계 기록 없음)";   // ★ step을 덮어쓰지 않는다 — 어디서 죽었는지가 핵심 단서
+  job.error    = msg.slice(0, 600);
+  job.errorKind= c.kind;
+  job.errorKo  = c.ko;
+  job.errorFix = c.fix;
+  job.errorRaw = raw.slice(0, 1200);              // 전체 원문(개발자용)
+  job.failedAt = Date.now();
+  job.doneAt   = Date.now();
+  try{ saveDB(); }catch(_){}
+  try{ logError(tag || "job", e); }catch(_){}
+  return job;
+}
 function logError(where, e){
   const msg = String((e && e.message) || e);
   // Gemini 무료 한도는 '오류'가 아니라 '잠시 쉼'(다음 주기 자동 재시도) → 오류 집계에서 제외, 따로 카운트
@@ -725,17 +759,21 @@ app.post("/api/explain12", async (req,res)=>{
 });
 // 🧠 실수 규칙(반복 금지) 장부 — 조회/추가/삭제. 여기 담긴 규칙은 모든 생성 프롬프트에 자동 주입됨.
 app.get("/api/lessons", (req,res)=>{
-  const now=Date.now();
-  res.json({ ok:true, lessons:(DB.lessons||[]).slice(-50).map(x=>({
+  const all = projRules();
+  const lim = Math.max(20, Math.min(500, parseInt(req.query.limit,10)||200));
+  const rows = all.slice(-lim).reverse().map(x=>({
     id:x.id, text:x.text||"", guide:x.guide||"", at:x.at||0, source:x.source||"", pinned:!!x.pinned,
-    stale: !!(x.at && !x.pinned && (now-x.at) >= LESSON_TTL_MS)
-  })) });
+    applied:x.applied||0,
+    avg: (x.applied>=1) ? Math.round((x.scoreSum||0)/x.applied) : null,   // 이 규칙이 주입됐을 때 평균 점수
+    lastUsed:x.lastUsed||0
+  }));
+  res.json({ ok:true, total:all.length, injectMax:lessonInjectMax(), lessons:rows });
 });
 app.post("/api/lessons", async (req,res)=>{
   try{
     const t=String((req.body&&req.body.text)||"").trim();
     if(!t) return res.status(400).json({ error:"규칙 내용이 필요해요 (예: '가짜 데이터로 테스트 통과라고 보고하지 마라')" });
-    DB.lessons = DB.lessons || [];
+    const _R = projRules();
     const guide = await toGuideline(t);              // 금지문 → 지향문
     const dup = findSimilarLesson(t);                // 비슷한 규칙이 이미 있으면 교체(병합)
     let item, merged=false;
@@ -745,20 +783,20 @@ app.post("/api/lessons", async (req,res)=>{
     } else {
       item={ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), text:t.slice(0,300), guide, at:Date.now(),
              pinned:!!(req.body&&req.body.pinned), source:(req.body&&req.body.source)||"수동" };
-      DB.lessons.push(item);
-      if(DB.lessons.length>60) DB.lessons = DB.lessons.slice(-60);
+      _R.push(item); saveProjRules(_R);
+      // v234: 상한 없음 — 자료는 많을수록 좋다. 주입만 선별한다.
     }
     saveDB();
-    res.json({ ok:true, item, merged, count:DB.lessons.length });
+    res.json({ ok:true, item, merged, count:projRules().length });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 🔁 기존 규칙 전체를 지향문으로 일괄 변환 + 유사 규칙 병합 (버튼용)
 app.post("/api/lessons/rewrite", (req,res)=>{
-  res.json({ ok:true, status:"started", count:(DB.lessons||[]).length });
+  res.json({ ok:true, status:"started", count:projRules().length });
   setImmediate(async ()=>{
     beginJobMode();
     try{
-      const arr = (DB.lessons||[]).slice();
+      const arr = projRules().slice();
       for(const x of arr){
         if(x.guide) continue;                        // 이미 변환된 건 건너뜀(비용 절약)
         x.guide = await toGuideline(x.text||"");
@@ -766,13 +804,14 @@ app.post("/api/lessons/rewrite", (req,res)=>{
       }
       // 유사 규칙 병합(뒤엣것이 최신이므로 남기고 앞엣것 제거)
       const keep=[];
-      for(let i=(DB.lessons||[]).length-1; i>=0; i--){
-        const cur = DB.lessons[i];
+      const _all = projRules();
+      for(let i=_all.length-1; i>=0; i--){
+        const cur = _all[i];
         const dup = keep.find(k=> _lsnSim(cur.guide||cur.text, k.guide||k.text)>=0.55);
         if(!dup) keep.unshift(cur);
       }
-      DB.lessons = keep; saveDB();
-      try{ kakaoNotify("🧠 품질 규칙 정리 완료 — "+DB.lessons.length+"개 (금지문 → 지향문 전환·중복 병합)"); }catch(_){}
+      saveProjRules(keep);
+      try{ kakaoNotify("🧠 품질 규칙 정리 완료 — "+projRules().length+"개 (금지문 → 지향문 전환·중복 병합)"); }catch(_){}
     }catch(e){ logError("lessons-rewrite", e); }
     finally{ endJobMode(); }
   });
@@ -796,9 +835,703 @@ app.post("/api/design-system/draft", async (req,res)=>{
     res.json({ ok:true, text: text.slice(0,1800) });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
+// 📈 v233: 검수 추이 — 학습이 실제로 효과가 있는지 '첫판 점수'로 측정한다.
+// 최종 점수는 보완이 올려주니까 착시가 생긴다. 진짜 지표는 '보완 없이 처음 받은 점수'다.
+app.get("/api/osera/stats", (req,res)=>{
+  const log = (DB.oseraLog||[]).slice();
+  if(!log.length) return res.json({ ok:true, empty:true, buckets:[], recent:[], total:0 });
+  // 10건 단위로 묶어 추이를 본다 (주 단위는 표본이 들쭉날쭉해서 왜곡됨)
+  const SIZE = 10;
+  const buckets = [];
+  for(let i=0;i<log.length;i+=SIZE){
+    const g = log.slice(i, i+SIZE);
+    if(g.length < 3 && buckets.length) break;                 // 표본 3건 미만 꼬리는 버림
+    const firsts = g.map(x=>(typeof x.first==="number"?x.first:x.score));
+    const avgFirst = Math.round(firsts.reduce((a,b)=>a+b,0)/firsts.length);
+    const avgFinal = Math.round(g.map(x=>x.score).reduce((a,b)=>a+b,0)/g.length);
+    const rewrote  = g.filter(x=>x.tries>0).length;
+    buckets.push({
+      n: g.length,
+      idx: buckets.length+1,
+      avgFirst,                                                // ★ 맨몸 실력
+      avgFinal,                                                // 보완 후
+      rewriteRate: Math.round(rewrote/g.length*100),           // ★ 재작성 확률
+      passRate: Math.round(g.filter(x=>x.passed).length/g.length*100),
+      rules: g[g.length-1].rules||0,                           // 그때 축적돼 있던 규칙 수
+      from: g[0].at, to: g[g.length-1].at
+    });
+  }
+  // 초반 vs 최근 비교
+  let verdict = null;
+  if(buckets.length >= 2){
+    const a = buckets[0], b = buckets[buckets.length-1];
+    const d = anchorDrift();
+    const drift = d ? d.drift : null;                          // 채점 인플레이션 보정치
+    const rawDelta = b.avgFirst - a.avgFirst;
+    verdict = {
+      firstDelta: rawDelta,                                    // 겉보기 상승분
+      drift: drift,                                            // 채점이 후해진 정도
+      trueDelta: (drift!=null) ? Math.round((rawDelta - drift)*10)/10 : null,  // ★ 진짜 품질 향상분
+      rewriteDelta: b.rewriteRate - a.rewriteRate,
+      early: a, late: b
+    };
+  }
+  res.json({ ok:true, total:log.length, buckets, verdict,
+    recent: log.slice(-20).reverse().map(x=>({ at:x.at, kind:x.kind, first:x.first, score:x.score, tries:x.tries, passed:x.passed, rules:x.rules })) });
+});
+// ═══════════════════════════════════════════════════════════════════
+// v236: 계층적 증류 — 경험을 '빠짐없이 전부' 읽는다
+//
+// 문제: 프롬프트에 담을 수 있는 양에는 물리적 한계(컨텍스트 창)가 있다.
+//       그래서 지금까지는 '최신 80건만' 읽었다 → 나머지 경험은 버려졌다. 이건 틀렸다.
+// 해법: 잘라내지 말고 '나눠서 전부' 읽는다.
+//       ① 경험을 40건씩 배치로 나눠 각각 통찰(insight)로 압축 → 배치 통찰은 영구 보관
+//       ② 통찰들을 모아 최종 규칙을 뽑는다
+//       ③ 통찰이 너무 많아지면 통찰끼리 다시 압축(2단계) — 재귀적으로 무한 확장
+//       ④ 이미 읽은 경험은 통찰로 남아 있으므로, 다음 증류 때는 '새 경험만' 읽는다(증분)
+//          → 경험이 1만 건이 되어도 비용은 새로 늘어난 만큼만 든다
+// 결과: 어떤 경험도 버려지지 않는다. 전부 규칙에 반영된다.
+// ═══════════════════════════════════════════════════════════════════
+const DISTILL_BATCH = 40;          // 한 번에 읽는 경험 수
+const INSIGHT_FOLD = 12;           // 통찰이 이만큼 쌓이면 통찰끼리 한 번 더 압축
+
+function distillState(pid){
+  const p = projectsAll()[pid]; if(!p) return null;
+  p.distill = p.distill || { running:false, step:"", done:0, total:0, at:0 };
+  return p.distill;
+}
+function _expLine(x){
+  return "["+(x.type||"")+"/"+(x.kind||"-")+(x.score!=null?(" "+x.score+"점"):"")+"] "
+       + (x.topic?(x.topic+" — "):"")
+       + String(x.note||"").slice(0,160)
+       + (x.body ? ("\n   " + String(x.body).replace(/\s+/g," ").slice(0,220)) : "");
+}
+
+// 배치 하나를 통찰로 압축
+async function distillBatch(proj, batch, idx, total){
+  const sys = "너는 품질 분석가다. 아래는 '"+proj.name+"' 프로젝트("+(proj.brief||"")+")에서 실제로 쌓인 경험 "+batch.length+"건이다.\n"
+    + "이 묶음에서 '이 프로젝트에 실제로 통하는/안 통하는 패턴'만 뽑아라.\n"
+    + "★규칙: (1) 어떤 프로젝트에나 통하는 뻔한 말 금지. (2) 점수가 낮았던 원인과 높았던 이유를 근거로. "
+    + "(3) 조사자료·발상에서 얻은 '이 분야 고유의 사실'도 포함. (4) 없는 걸 지어내지 마라.\n"
+    + "출력: 마크다운 없이 '· '로 시작하는 항목 5~10줄. 각 줄 한 문장.";
+  const user = batch.map(_expLine).join("\n\n").slice(0, 22000);
+  try{
+    const out = await anthropic(sys, user, 900);
+    return String(out||"").trim().slice(0, 2000);
+  }catch(e){ return ""; }
+}
+
+// 통찰이 너무 많아지면 통찰끼리 한 번 더 압축 (2단계 — 무한 확장 가능)
+async function foldInsights(proj, insights){
+  const sys = "너는 품질 분석가다. 아래는 '"+proj.name+"' 프로젝트의 경험을 묶음별로 압축한 통찰들이다.\n"
+    + "겹치는 것은 합치고, 서로 모순되면 더 근거가 강한 쪽을 남겨, 하나의 통합 통찰로 다시 압축하라.\n"
+    + "정보를 잃지 마라 — 개수만 줄이는 게 아니라 '더 높은 수준의 원칙'으로 올려라.\n"
+    + "출력: '· '로 시작하는 항목 10~16줄.";
+  const user = insights.map((x,i)=>"◆ 묶음 "+(i+1)+" (경험 "+x.expCount+"건)\n"+x.text).join("\n\n").slice(0, 30000);
+  try{
+    const out = await anthropic(sys, user, 1600);
+    const t = String(out||"").trim();
+    return t ? t.slice(0,3500) : "";
+  }catch(e){ return ""; }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v237: 작업 전 '경험 훑기'
+//
+// 규칙(증류물)만으로는 부족하다. 규칙은 일반화된 요약이라 이번 작업의 디테일을 놓친다.
+// → 새 작업을 시작할 때, 자료수집을 마친 뒤 '이 프로젝트의 경험을 통째로 한 번 훑고' 들어간다.
+//   ① 아직 안 읽은 경험이 있으면 먼저 배치로 읽어 통찰을 갱신 (증분 — 두 번 안 읽는다)
+//   ② 통찰 전체 + 이번 주제와 관련된 원본 경험을 함께 읽어
+//      "이번 작업 브리핑"을 만든다 (과거에 뭘 잘했고 뭘 틀렸나 / 이미 아는 사실 / 조심할 것)
+//   ③ 그 브리핑을 모든 생성 프롬프트에 주입
+// ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// v239: 오세라 재설계 — '심미 채점관'이 아니라 '명세 검증관'
+//
+// 잘못 만든 것: 오세라에게 "잘 쓴 글인가"를 주관적으로 채점시켰다.
+//   → 기준이 흔들리고(드리프트), 취향 싸움이 되고, 검증이 아니라 감상이 됐다.
+//
+// 오세라가 해야 할 일:
+//   ① 각 부서가 요구한 대로 만들었는가  (명세 대조 — 요구사항 하나하나 체크)
+//   ② 기능이 제대로 작동하는가          (기계 검증 — 코드로 확인, 흔들릴 수 없음)
+//
+// 점수 = 요구 항목 충족률 × 100.  주관 점수가 아니라 '이행률'이다.
+//   같은 결과물이면 언제 채점해도 같은 점수가 나온다 → 드리프트가 원천적으로 없다.
+// ═══════════════════════════════════════════════════════════════════
+
+// 결과물 종류별 '기능 요건' — 이건 취향이 아니라 사양이다. 설정에서 편집 가능.
+const SPEC_DEFAULT = {
+  "상품페이지": [
+    { id:"html_complete", auto:1, must:1, label:"완전한 HTML 문서 (<!DOCTYPE>~</html>)" },
+    { id:"html_body",     auto:1, must:1, label:"본문 텍스트가 실제로 들어있음" },
+    { id:"no_js_hide",    auto:1, must:1, label:"JS 없이도 내용이 보임 (스크롤 리빌로 숨기지 않음)" },
+    { id:"responsive",    auto:1, must:0, label:"모바일 반응형 (@media)" },
+    { id:"sections",      auto:0, must:1, label:"히어로 · 상품 소개 · 스토리 · 상세 특징 · 구매 유도(CTA) 섹션이 모두 있음" },
+    { id:"img_slots",     auto:1, must:0, label:"사진 들어갈 자리가 표시됨" },
+    { id:"no_fake_num",   auto:0, must:1, label:"근거 없는 수치·효능을 지어내지 않음" }
+  ],
+  "홈페이지": [
+    { id:"html_complete", auto:1, must:1, label:"완전한 HTML 문서" },
+    { id:"html_body",     auto:1, must:1, label:"본문 텍스트가 실제로 들어있음" },
+    { id:"no_js_hide",    auto:1, must:1, label:"JS 없이도 내용이 보임" },
+    { id:"nav_anchor",    auto:1, must:1, label:"내비게이션이 있고 앵커 링크가 실제 섹션과 연결됨" },
+    { id:"responsive",    auto:1, must:0, label:"모바일 반응형" },
+    { id:"sections",      auto:0, must:1, label:"헤더 · 히어로 · 브랜드 스토리 · 대표 상품 · 산지 · 후기 · 문의/푸터" }
+  ],
+  "리서치 보고서": [
+    { id:"html_complete", auto:1, must:1, label:"완전한 HTML 문서" },
+    { id:"has_table",     auto:1, must:1, label:"키워드 지도가 실제 <table> 태그" },
+    { id:"print",         auto:1, must:1, label:"@media print (인쇄·PDF 가능)" },
+    { id:"sections6",     auto:1, must:1, label:"6개 섹션 (요약·키워드·경쟁·기회·30일·근거) 전부 존재" },
+    { id:"no_fake_num",   auto:0, must:1, label:"조사자료에 없는 검색량·순위를 지어내지 않음 (모르면 '확인 불가'로 표기)" },
+    { id:"actionable",    auto:0, must:1, label:"30일 플랜에 '무엇을·어디에·몇 개'가 적혀 있음" }
+  ],
+  "카페글": [
+    { id:"titles3",       auto:0, must:1, label:"제목 3안 제시" },
+    { id:"photo_slots",   auto:1, must:1, label:"[사진N: 설명] 형태로 사진 자리 표시" },
+    { id:"platform_tips", auto:0, must:1, label:"네이버 카페 팁 · 다음 카페 팁 각각 포함" },
+    { id:"no_ad_tone",    auto:0, must:1, label:"홍보 티가 나지 않는 경험담·정보공유 톤" }
+  ],
+  "_기본": [
+    { id:"instruction",   auto:0, must:1, label:"클라이언트가 지시한 내용이 전부 반영됨" },
+    { id:"complete",      auto:0, must:1, label:"손대지 않고 바로 쓸 수 있음 (빈칸·placeholder 없음)" },
+    { id:"no_fake",       auto:0, must:1, label:"근거 없는 사실·수치를 지어내지 않음" },
+    { id:"brand",         auto:0, must:0, label:"브랜드 도면(색·폰트·금지 항목)을 지킴" }
+  ]
+};
+function specFor(kind){
+  const custom = (DB.state && DB.state.specs) || {};
+  const k = String(kind||"");
+  const base = custom[k] || SPEC_DEFAULT[k] || [];
+  const common = custom["_기본"] || SPEC_DEFAULT["_기본"];
+  return base.concat(common);
+}
+
+// ───────── ① 기계 검증 (결정론적 — 코드로 확인, 점수가 흔들릴 수 없다) ─────────
+function machineVerify(kind, content){
+  const h = String(content||"");
+  const isHtml = /<html|<!doctype/i.test(h);
+  const bodyM = h.match(/<body[^>]*>([\s\S]*)<\/body>/i);
+  const bodyRaw = bodyM ? bodyM[1] : h;
+  const text = bodyRaw.replace(/<script[\s\S]*?<\/script>/gi,"").replace(/<style[\s\S]*?<\/style>/gi,"").replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim();
+  const ds = (DB.state && DB.state.designSystem) || null;
+  const dsOn = !!(ds && ds.on!==false && String(ds.text||"").trim());
+
+  const R = {};   // id → {pass, detail}
+  const set = (id, pass, detail)=>{ R[id] = { pass: !!pass, detail: String(detail||"") }; };
+
+  if(isHtml){
+    set("html_complete", /<\/html\s*>/i.test(h) && h.length>300, /<\/html\s*>/i.test(h) ? ("문서 "+h.length+"자") : "❌ </html> 없음 — 문서가 잘림");
+    set("html_body", !!bodyM && text.length>=80, bodyM ? ("본문 "+text.length+"자") : "❌ <body> 없음");
+    // JS 없이 보이는가: opacity:0 / visibility:hidden 시작 + JS 의존
+    // ★ CSS는 <head>의 <style>에 있다 — 문서 전체를 봐야 한다 (body만 보면 못 잡는다)
+    const hidden = (h.match(/opacity\s*:\s*0(?![.\d%])|visibility\s*:\s*hidden/gi)||[]).length;
+    const hasObserver = /IntersectionObserver|scrollY|addEventListener\(\s*['"]scroll/i.test(h);
+    set("no_js_hide", !(hidden>2 && hasObserver), (hidden>2 && hasObserver) ? ("❌ opacity:0 요소 "+hidden+"개 + 스크롤 리빌 JS — JS 실패 시 백지") : "OK");
+    set("responsive", /@media[^{]*max-width|@media[^{]*screen/i.test(h), /@media/i.test(h)?"@media 있음":"❌ @media 없음");
+    set("has_table", /<table[\s>]/i.test(h), /<table[\s>]/i.test(h)?"<table> 있음":"❌ 표가 <table>이 아님");
+    set("print", /@media\s+print/i.test(h), /@media\s+print/i.test(h)?"@media print 있음":"❌ 인쇄 스타일 없음");
+    // 내비 앵커가 실제 섹션과 연결되는가
+    const anchors = [...h.matchAll(/href\s*=\s*["']#([\w-]+)["']/gi)].map(m=>m[1]);
+    const ids = [...h.matchAll(/id\s*=\s*["']([\w-]+)["']/gi)].map(m=>m[1]);
+    const dead = anchors.filter(a=>ids.indexOf(a)<0);
+    set("nav_anchor", anchors.length>0 && dead.length===0,
+        anchors.length===0 ? "❌ 앵커 링크 없음" : (dead.length ? ("❌ 끊긴 링크: #"+dead.join(", #")) : ("앵커 "+anchors.length+"개 전부 연결됨")));
+    // 보고서 6섹션
+    const secs = ["요약","키워드","경쟁","기회","30일","근거"];
+    const missing = secs.filter(x=>text.indexOf(x)<0);
+    set("sections6", missing.length===0, missing.length ? ("❌ 빠진 섹션: "+missing.join(", ")) : "6개 섹션 전부 있음");
+    // 사진 자리
+    set("img_slots", /<img|\[사진|사진\s*자리|placeholder/i.test(h), /<img|\[사진/i.test(h)?"사진 자리 있음":"사진 자리 표시 없음");
+    // 브랜드 도면 색상 실제 사용 여부
+    if(dsOn){
+      const hexes = (String(ds.text).match(/#[0-9a-f]{6}/gi)||[]).map(x=>x.toLowerCase());
+      const used = hexes.filter(x=> h.toLowerCase().indexOf(x)>=0);
+      const bans = [];
+      if(/그라데이션|그라디언트/.test(ds.text) && /linear-gradient|radial-gradient/i.test(h)) bans.push("그라데이션");
+      if(/이모지/.test(ds.text) && /[\u{1F300}-\u{1FAFF}]/u.test(text)) bans.push("이모지");
+      set("brand", hexes.length>0 && used.length >= Math.min(2, hexes.length) && bans.length===0,
+          (hexes.length? ("도면 색 "+used.length+"/"+hexes.length+" 사용") : "도면에 색 hex 없음") + (bans.length? (" · ❌ 금지 항목 사용: "+bans.join(", ")) : ""));
+    }
+    // 인라인 스크립트 문법 오류
+    const scripts = [...h.matchAll(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/gi)].map(m=>m[1]);
+    let jsBad = "";
+    scripts.forEach(js=>{ try{ new Function(js); }catch(e){ jsBad = String(e.message||e).slice(0,60); } });
+    if(scripts.length) set("js_ok", !jsBad, jsBad ? ("❌ JS 문법 오류: "+jsBad) : ("스크립트 "+scripts.length+"개 문법 OK"));
+  } else {
+    set("html_complete", true, "(HTML 아님)");
+    set("html_body", text.length>=50, "본문 "+text.length+"자");
+    // 텍스트 결과물
+    set("photo_slots", /\[사진\s*\d|\[이미지/i.test(h), /\[사진/i.test(h)?"사진 자리 표시 있음":"❌ [사진N: …] 표시 없음");
+  }
+  set("complete", !/lorem ipsum|TODO|여기에 (내용|텍스트)|placeholder|xxx|OOO/i.test(text), /lorem|TODO|placeholder/i.test(text) ? "❌ 미완성 표시 발견" : "미완성 표시 없음");
+  return R;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// v238: 품질 앵커 — "점수가 오른 게 진짜인가, 채점자가 후해진 건가"
+//
+// 문제: 만드는 것도 Claude, 채점하는 것도 Claude다.
+//   규칙·경험이 쌓이면 채점 프롬프트도 함께 부풀어 '기준 자체가 움직일' 수 있다.
+//   첫판 65 → 90이 되어도, 그게 품질 향상인지 채점 인플레이션인지 구분이 안 된다.
+//   (성과 데이터와는 무관한, '품질 측정의 신뢰성' 문제다)
+//
+// 해법: 고정 표본(앵커)을 박아둔다.
+//   ① 과거 결과물을 앵커로 고정 — 이 글은 절대 안 바뀐다
+//   ② 주기적으로 앵커를 '다시 채점'한다
+//   ③ 같은 글의 점수가 올라가면 → 품질이 아니라 채점 인플레이션 → 경고 + 보정치
+//   ④ 앵커를 채점 프롬프트에 예시로 넣어 눈금이 못 움직이게 못 박는다
+// ═══════════════════════════════════════════════════════════════════
+function anchorsAll(){ DB.anchors = DB.anchors || []; return DB.anchors; }
+
+function anchorExamplesBlock(){
+  const a = anchorsAll().filter(x=>x && x.excerpt && typeof x.baseScore==="number");
+  if(a.length < 2) return "";
+  const sorted = a.slice().sort((x,y)=>x.baseScore - y.baseScore);
+  const picks = [sorted[0], sorted[sorted.length-1]];
+  if(sorted.length >= 3) picks.splice(1, 0, sorted[Math.floor(sorted.length/2)]);
+  return "\n[채점 눈금 고정 — 아래는 과거에 확정된 점수다. 이 눈금에 맞춰라. 기준을 스스로 후하게 바꾸지 마라]\n"
+    + picks.map(x=>"· "+x.baseScore+"점짜리 "+(x.kind||"결과물")+" ("+(x.topic||"")+"): "+String(x.excerpt).slice(0,220)).join("\n")
+    + "\n";
+}
+
+async function rescoreAnchor(x){
+  try{
+    const rv = await oseraReview(x.kind||"결과물", x.content||x.excerpt||"", x.topic||"");
+    if(!rv) return null;
+    x.rescores = x.rescores || [];
+    x.rescores.push({ at: Date.now(), score: rv.score });
+    if(x.rescores.length > 30) x.rescores = x.rescores.slice(-30);
+    saveDB();
+    return rv.score;
+  }catch(e){ return null; }
+}
+
+function anchorDrift(){
+  const a = anchorsAll().filter(x=>x && typeof x.baseScore==="number" && x.rescores && x.rescores.length);
+  if(!a.length) return null;
+  const deltas = a.map(x=> x.rescores[x.rescores.length-1].score - x.baseScore);
+  const avg = deltas.reduce((p,c)=>p+c,0) / deltas.length;
+  return {
+    n: a.length,
+    drift: Math.round(avg*10)/10,
+    detail: a.map(x=>({ id:x.id, kind:x.kind, topic:x.topic, base:x.baseScore,
+      now:x.rescores[x.rescores.length-1].score,
+      delta:x.rescores[x.rescores.length-1].score - x.baseScore,
+      at:x.rescores[x.rescores.length-1].at }))
+  };
+}
+
+function expSweepOn(){ const st=DB.state||{}; return st.expSweep!==false; }   // 기본 켜짐
+
+// ① 아직 통찰로 안 읽은 경험을 마저 읽는다 (규칙 생성은 하지 않음 — 훑기만)
+async function syncInsights(pid, setStep){
+  const _step = (typeof setStep==="function") ? setStep : function(){};
+  const proj = projectsAll()[pid]; if(!proj) return 0;
+  proj.insights = proj.insights || [];
+  const all = experienceFor(pid, {}).slice().sort((a,b)=>(a.at||0)-(b.at||0));
+  if(!all.length) return 0;
+  const coveredUntil = proj.insights.reduce((m,x)=>Math.max(m, x.to||0), 0);
+  const fresh = all.filter(x=> (x.at||0) > coveredUntil);
+  if(!fresh.length) return 0;
+
+  const batches = [];
+  for(let k=0;k<fresh.length;k+=DISTILL_BATCH) batches.push(fresh.slice(k, k+DISTILL_BATCH));
+  for(let b=0;b<batches.length;b++){
+    _step("경험 훑는 중 — 새 경험 "+(b+1)+"/"+batches.length+" 묶음");
+    const text = await distillBatch(proj, batches[b], b, batches.length);
+    if(text){
+      proj.insights.push({ id:String(Date.now())+"_i"+b, at:Date.now(),
+        from:batches[b][0].at, to:batches[b][batches[b].length-1].at,
+        expCount:batches[b].length, text });
+      saveDB();
+    }
+  }
+  if(proj.insights.length > INSIGHT_FOLD){
+    _step("경험 훑는 중 — 통찰 "+proj.insights.length+"개 압축");
+    const folded = await foldInsights(proj, proj.insights);
+    if(folded){
+      const covered = proj.insights.reduce((a,x)=>a+(x.expCount||0),0);
+      const to = proj.insights.reduce((m,x)=>Math.max(m,x.to||0),0);
+      const from = proj.insights.reduce((m,x)=>Math.min(m,x.from||Infinity), Infinity);
+      proj.insights = [{ id:String(Date.now())+"_fold", at:Date.now(), from:(isFinite(from)?from:0), to, expCount:covered, text:folded, folded:true }];
+      saveDB();
+    }
+  }
+  return fresh.length;
+}
+
+// 이번 주제와 관련된 원본 경험 (통찰은 요약이라 디테일이 빠지므로 원본도 함께 본다)
+function relevantExperience(pid, ctx, cap){
+  const toks = _lsnTokens(ctx||"");
+  const arr = experienceFor(pid, {});
+  const scored = arr.map(x=>{
+    const hay = _lsnTokens((x.topic||"")+" "+(x.kind||"")+" "+(x.note||""));
+    let rel=0; toks.forEach(t=>{ if(hay.indexOf(t)>=0) rel++; });
+    // 실패 경험은 정보량이 크다 — 낮은 점수에 가중치
+    const fail = (typeof x.score==="number" && x.score < 75) ? 1 : 0;
+    const win  = (typeof x.score==="number" && x.score >= 88) ? 1 : 0;
+    return { x, rel, fail, win, at:x.at||0 };
+  });
+  scored.sort((a,b)=> (b.rel-a.rel) || (b.fail-a.fail) || (b.win-a.win) || (b.at-a.at));
+  return scored.slice(0, cap||20).map(v=>v.x);
+}
+
+// ② 이번 작업 브리핑을 만든다
+async function experienceBriefing(pid, ctx, research, setStep){
+  const _step = (typeof setStep==="function") ? setStep : function(){};
+  if(!expSweepOn()) return "";
+  const proj = projectsAll()[pid]; if(!proj) return "";
+  const total = experienceFor(pid, {}).length;
+  if(!total) return "";
+
+  try{ await syncInsights(pid, _step); }catch(e){ /* 훑기 실패가 작업을 막지 않는다 */ }
+
+  const insights = (proj.insights||[]);
+  const covered  = insights.reduce((a,x)=>a+(x.expCount||0),0);
+  const rel      = relevantExperience(pid, ctx, 20);
+
+  _step("경험 "+total+"건 훑고 이번 작업 브리핑 만드는 중");
+  const sys = "너는 '"+proj.name+"' 프로젝트("+(proj.brief||"")+")의 작업 브리퍼다.\n"
+    + "지금 새 작업을 시작한다. 아래는 이 프로젝트가 지금까지 쌓은 경험 전부("+covered+"건을 압축한 통찰)와, "
+    + "이번 주제와 특히 관련된 과거 경험 원본이다.\n"
+    + "이걸 근거로 '이번 작업 브리핑'을 써라. 만드는 사람이 이것만 읽고 바로 잘 만들 수 있게.\n\n"
+    + "★반드시 이 구성으로 (각 항목 없으면 생략):\n"
+    + "◆ 이미 아는 것 — 과거 조사·경험으로 확보된 이 주제의 사실 (다시 조사할 필요 없는 것)\n"
+    + "◆ 통했던 것 — 점수가 높았던 결과물이 실제로 뭘 했나 (재현할 것)\n"
+    + "◆ 반복한 실수 — 점수가 낮았던 원인. 이번에 같은 실수를 하지 않으려면\n"
+    + "◆ 쓸 만한 발상 — 과거 비주얼 디렉션·인터뷰에서 이번에 살릴 것\n"
+    + "◆ 이번에 특히 조심할 것 — 한 줄\n\n"
+    + "★금지: 뻔한 일반론('고객 중심으로','꾸준히'). 경험에 없는 걸 지어내는 것. 12줄 이내로 압축.";
+
+  const user = "이번 작업: " + String(ctx||"").slice(0,300)
+    + (research ? ("\n\n[방금 수집한 자료]\n" + String(research).slice(0,2500)) : "")
+    + "\n\n[이 프로젝트 경험 통찰 — 경험 "+covered+"건 전부를 압축한 것]\n"
+    + insights.map((x,i)=>"— 묶음 "+(i+1)+" (경험 "+x.expCount+"건)\n"+x.text).join("\n\n").slice(0, 24000)
+    + (rel.length ? ("\n\n[이번 주제와 관련된 과거 경험 원본]\n" + rel.map(_expLine).join("\n\n").slice(0, 8000)) : "");
+
+  try{
+    const out = await anthropic(sys, user, 1400);
+    const t = String(out||"").trim();
+    if(!t) return "";
+    return "\n\n[📚 경험 브리핑 — 이 프로젝트가 쌓은 경험 "+total+"건을 전부 훑어 정리한 것. 반드시 반영하라]\n" + t.slice(0,3000);
+  }catch(e){ return ""; }
+}
+
+// ═══ 품질 앵커 API ═══
+// 📋 요구 명세(체크리스트) 조회·편집 — 오세라가 무엇을 검증할지 직접 정한다
+app.get("/api/specs", (req,res)=>{
+  const custom = (DB.state && DB.state.specs) || {};
+  const kinds = Object.keys(SPEC_DEFAULT);
+  res.json({ ok:true, kinds,
+    specs: kinds.reduce((acc,k)=>{ acc[k] = custom[k] || SPEC_DEFAULT[k]; return acc; }, {}),
+    defaults: SPEC_DEFAULT });
+});
+app.post("/api/specs", (req,res)=>{
+  const b = req.body || {};
+  const kind = String(b.kind||"");
+  if(!SPEC_DEFAULT[kind]) return res.status(400).json({ error:"알 수 없는 결과물 종류" });
+  const items = Array.isArray(b.items) ? b.items : null;
+  if(!items) return res.status(400).json({ error:"항목이 필요해요" });
+  DB.state = DB.state || {}; DB.state.specs = DB.state.specs || {};
+  DB.state.specs[kind] = items.slice(0,20).map((x,i)=>({
+    id: String((x&&x.id)||("c"+i)).replace(/[^a-zA-Z0-9_]/g,"").slice(0,20) || ("c"+i),
+    label: String((x&&x.label)||"").slice(0,120),
+    must: !!(x && x.must),
+    auto: !!(x && x.auto)                       // auto는 기계 검증이 가능한 항목만 (기존 id 유지 시)
+  })).filter(x=>x.label);
+  saveDB();
+  res.json({ ok:true, kind, count: DB.state.specs[kind].length });
+});
+app.post("/api/specs/reset", (req,res)=>{
+  const kind = String((req.body&&req.body.kind)||"");
+  if(DB.state && DB.state.specs && DB.state.specs[kind]) delete DB.state.specs[kind];
+  saveDB();
+  res.json({ ok:true, kind, items: SPEC_DEFAULT[kind]||[] });
+});
+
+app.get("/api/anchors", (req,res)=>{
+  const a = anchorsAll();
+  res.json({ ok:true, total:a.length, drift: anchorDrift(),
+    anchors: a.slice(-20).reverse().map(x=>({
+      id:x.id, kind:x.kind, topic:x.topic, baseScore:x.baseScore, at:x.at,
+      excerpt:String(x.excerpt||"").slice(0,90),
+      now: (x.rescores&&x.rescores.length) ? x.rescores[x.rescores.length-1].score : null,
+      checks: (x.rescores||[]).length
+    })) });
+});
+// 앵커 지정 — 지금까지 만든 결과물 중 대표를 골라 '기준 표본'으로 박는다
+app.post("/api/anchors/add", (req,res)=>{
+  const b = req.body || {};
+  const content = String(b.content||"").trim();
+  const score = parseInt(b.score, 10);
+  if(!content || content.length < 50) return res.status(400).json({ error:"내용이 너무 짧아요" });
+  if(!(score >= 0 && score <= 100)) return res.status(400).json({ error:"확정 점수(0~100)가 필요해요" });
+  const a = anchorsAll();
+  const item = {
+    id: String(Date.now())+"_a"+Math.floor(Math.random()*1000),
+    at: Date.now(),
+    kind: String(b.kind||"결과물").slice(0,24),
+    topic: String(b.topic||"").slice(0,80),
+    baseScore: score,                                  // ★ 이 점수는 절대 안 바뀐다 — 눈금이다
+    content: content.slice(0, 8000),
+    excerpt: content.replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim().slice(0, 260),
+    rescores: []
+  };
+  a.push(item);
+  if(a.length > 20) a.splice(0, a.length-20);           // 앵커는 20개면 충분 (많을수록 재채점 비용↑)
+  saveDB();
+  res.json({ ok:true, id:item.id, total:a.length });
+});
+app.post("/api/anchors/delete", (req,res)=>{
+  const id = String((req.body&&req.body.id)||"");
+  DB.anchors = anchorsAll().filter(x=>String(x.id)!==id);
+  saveDB();
+  res.json({ ok:true, total:DB.anchors.length });
+});
+// 🎯 앵커 자동 구성 — 쌓인 경험(결과물+점수)에서 점수대가 골고루 퍼지도록 자동 선별
+// 손으로 고를 필요 없다. 낮은 점수·중간·높은 점수를 대표하는 결과물을 눈금으로 박는다.
+app.post("/api/anchors/auto", (req,res)=>{
+  const pid = curProjectId();
+  const cands = experienceFor(pid, {})
+    .filter(x=> x.type==="result" && typeof x.score==="number" && x.body && String(x.body).length >= 120);
+  if(cands.length < 4) return res.status(400).json({ error:"결과물 경험이 4건 이상 필요해요 (지금 "+cands.length+"건). 결과물을 몇 개 더 만들어 주세요." });
+
+  cands.sort((a,b)=>a.score-b.score);
+  // 점수 구간을 균등하게 훑어 6개 뽑는다 (최저 ~ 최고)
+  const N = Math.min(6, cands.length);
+  const picks = [];
+  for(let i=0;i<N;i++){
+    const idx = Math.round(i*(cands.length-1)/(N-1));
+    if(!picks.includes(cands[idx])) picks.push(cands[idx]);
+  }
+  const a = anchorsAll();
+  const added = [];
+  picks.forEach(x=>{
+    const item = {
+      id: String(Date.now())+"_a"+Math.floor(Math.random()*10000),
+      at: Date.now(),
+      kind: x.kind || "결과물",
+      topic: x.topic || "",
+      baseScore: x.score,                                 // ★ 그때 받은 점수 = 눈금
+      content: String(x.body).slice(0,8000),
+      excerpt: String(x.body).replace(/<[^>]+>/g," ").replace(/\s+/g," ").trim().slice(0,260),
+      rescores: [],
+      auto: true
+    };
+    a.push(item); added.push({ score:x.score, kind:item.kind, topic:item.topic });
+  });
+  if(a.length > 20) a.splice(0, a.length-20);
+  saveDB();
+  res.json({ ok:true, added:added.length, total:a.length, picks:added,
+    note:"점수 "+added.map(x=>x.score).join(", ")+"점 결과물을 눈금으로 박았어요. 이제 🔬 재채점으로 드리프트를 측정할 수 있습니다." });
+});
+
+// 🔬 전체 재채점 — 지금 기준으로 앵커를 다시 매겨 드리프트를 측정
+app.post("/api/anchors/recheck", (req,res)=>{
+  const a = anchorsAll();
+  if(a.length < 2) return res.status(400).json({ error:"앵커가 2개 이상 필요해요 (점수 높은 것·낮은 것)" });
+  res.json({ ok:true, status:"started", count:a.length });
+  setImmediate(async ()=>{
+    beginJobMode();
+    DB.anchorCheck = { running:true, done:0, total:a.length, at:Date.now() }; saveDB();
+    try{
+      for(let i=0;i<a.length;i++){
+        DB.anchorCheck.done = i; saveDB();
+        await rescoreAnchor(a[i]);
+      }
+      const d = anchorDrift();
+      DB.anchorCheck = { running:false, done:a.length, total:a.length, at:Date.now(), drift:(d?d.drift:null) };
+      saveDB();
+      if(d){
+        const msg = (d.drift >= 3)  ? ("⚠️ 채점 인플레이션 감지 — 같은 글에 평균 +"+d.drift+"점을 더 줍니다. 최근 점수 상승분에서 "+d.drift+"점을 빼고 보세요.")
+                  : (d.drift <= -3) ? ("⚠️ 채점이 각박해짐 — 같은 글에 평균 "+d.drift+"점. 기준이 엄해졌습니다.")
+                  : ("✅ 채점 기준 안정 (드리프트 "+d.drift+"점) — 점수 상승은 진짜 품질 향상입니다.");
+        try{ kakaoNotify("🔬 앵커 재채점 완료\n"+msg); }catch(_){}
+      }
+    }catch(e){ DB.anchorCheck = { running:false, error:String(e.message||e).slice(0,120) }; saveDB(); logError("anchor-recheck", e); }
+    finally{ endJobMode(); }
+  });
+});
+app.get("/api/anchors/status", (req,res)=>{
+  res.json({ ok:true, check: DB.anchorCheck || { running:false }, drift: anchorDrift() });
+});
+
+app.get("/api/project/distill/status", (req,res)=>{
+  const pid = String(req.query.project||"") || curProjectId();
+  const st = distillState(pid);
+  const p = projectsAll()[pid];
+  if(!st || !p) return res.status(404).json({ error:"프로젝트를 찾을 수 없어요" });
+  res.json({ ok:true, project:pid, running:!!st.running, step:st.step||"", done:st.done||0, total:st.total||0,
+    insights:(p.insights||[]).length, covered:(p.insights||[]).reduce((a,x)=>a+(x.expCount||0),0),
+    rules:(p.rules||[]).length, distilledAt:p.distilledAt||0, summary:p.distillSummary||"" });
+});
+
+app.post("/api/project/distill", (req,res)=>{
+  const pid = String((req.body&&req.body.project)||"") || curProjectId();
+  const proj = projectsAll()[pid];
+  if(!proj) return res.status(404).json({ error:"프로젝트를 찾을 수 없어요" });
+  const st = distillState(pid);
+  if(st.running) return res.status(409).json({ error:"이미 증류가 진행 중이에요" });
+  const rebuild = !!(req.body && req.body.rebuild);      // true면 통찰을 버리고 처음부터 전부 다시 읽는다
+  const keepPinned = !(req.body && req.body.keepPinned === false);
+
+  res.json({ ok:true, status:"started", project:pid });
+
+  setImmediate(async ()=>{
+    beginJobMode();
+    st.running = true; st.step = "경험 불러오는 중"; st.done = 0; st.total = 0; st.at = Date.now(); saveDB();
+    try{
+      const all = experienceFor(pid, {}).slice().sort((a,b)=>(a.at||0)-(b.at||0));   // 오래된 것부터
+      if(!all.length){ st.step="경험 없음"; try{ kakaoNotify("📚 규칙 증류: 아직 경험이 없어요."); }catch(_){} return; }
+
+      if(rebuild) proj.insights = [];
+      proj.insights = proj.insights || [];
+
+      // ① 아직 통찰로 압축되지 않은 경험만 골라 배치 처리 (증분)
+      const coveredUntil = proj.insights.reduce((m,x)=>Math.max(m, x.to||0), 0);
+      const fresh = all.filter(x=> (x.at||0) > coveredUntil);
+      const batches = [];
+      for(let k=0;k<fresh.length;k+=DISTILL_BATCH) batches.push(fresh.slice(k, k+DISTILL_BATCH));
+
+      st.total = batches.length + 1; saveDB();
+
+      for(let b=0;b<batches.length;b++){
+        st.step = "경험 읽는 중 ("+(b+1)+"/"+batches.length+" 묶음 · "+batches[b].length+"건)"; st.done = b; saveDB();
+        const text = await distillBatch(proj, batches[b], b, batches.length);
+        if(text){
+          proj.insights.push({
+            id: String(Date.now())+"_i"+b,
+            at: Date.now(),
+            from: batches[b][0].at, to: batches[b][batches[b].length-1].at,
+            expCount: batches[b].length,
+            text
+          });
+          saveDB();
+        }
+      }
+
+      // ② 통찰이 너무 많아지면 통찰끼리 한 번 더 압축 (정보는 보존, 밀도만 올림)
+      if(proj.insights.length > INSIGHT_FOLD){
+        st.step = "통찰 "+proj.insights.length+"개를 상위 원칙으로 압축 중"; saveDB();
+        const folded = await foldInsights(proj, proj.insights);
+        if(folded){
+          const covered = proj.insights.reduce((a,x)=>a+(x.expCount||0),0);
+          const to = proj.insights.reduce((m,x)=>Math.max(m,x.to||0),0);
+          const from = proj.insights.reduce((m,x)=>Math.min(m,x.from||Infinity), Infinity);
+          proj.insights = [{ id:String(Date.now())+"_fold", at:Date.now(), from:(isFinite(from)?from:0), to, expCount:covered, text:folded, folded:true }];
+          saveDB();
+        }
+      }
+
+      // ③ 전체 통찰 + 최근 원본 일부 → 최종 규칙 증류
+      st.step = "이 프로젝트의 규칙을 뽑는 중"; st.done = batches.length; saveDB();
+      const coveredCount = proj.insights.reduce((a,x)=>a+(x.expCount||0),0);
+      const recent = all.slice(-15);      // 최신 감각 보강 (통찰은 요약이라 디테일이 빠지므로)
+
+      const sys = "너는 프롬프트 엔지니어이자 품질 책임자다.\n"
+        + "[이 프로젝트] "+proj.name+" — "+(proj.brief||"")+"\n\n"
+        + "아래는 이 프로젝트의 경험 "+all.length+"건 '전부'를 묶음별로 압축한 통찰이다(빠짐없이 반영됨).\n"
+        + "이걸 근거로, 이 프로젝트에 '지금부터 적용할 지시문(규칙)'을 만들어라.\n"
+        + "★규칙:\n"
+        + "1. 이 프로젝트에만 통하는 것만. 어떤 프로젝트에나 통하는 뻔한 말('고객 중심으로','꾸준히')은 절대 금지.\n"
+        + "2. 금지형('~하지 마라')이 아니라 지향형('~하라'). 무엇을 어떻게 할지 구체적으로.\n"
+        + "3. 낮은 점수에서 반복된 원인을 잡고, 높은 점수에서 통했던 것을 살려라.\n"
+        + "4. 겹치는 건 합쳐라. 10~18개면 충분하다 — 많다고 좋은 게 아니다(프롬프트가 부풀면 발상이 갇힌다).\n"
+        + "5. 각 규칙 한 줄, 130자 이내.\n"
+        + "반드시 JSON만 출력: {\"rules\":[\"지향문1\",\"지향문2\"],\"summary\":\"이번 증류의 핵심 한 줄\"}";
+
+      const user = "◆ 경험 통찰 (경험 "+coveredCount+"건을 압축한 것)\n"
+        + proj.insights.map((x,i)=>"— 묶음 "+(i+1)+" (경험 "+x.expCount+"건)\n"+x.text).join("\n\n").slice(0, 40000)
+        + "\n\n◆ 가장 최근 경험 원본 (디테일 보강)\n"
+        + recent.map(_expLine).join("\n").slice(0, 6000);
+
+      const raw = await anthropic(sys, user, 2200);
+      const j2 = safeJson(raw, null);
+      const list = (j2 && Array.isArray(j2.rules)) ? j2.rules : [];
+      if(!list.length){ st.step="규칙 생성 실패"; try{ kakaoNotify("📚 규칙 증류 실패 — 다시 시도해 주세요."); }catch(_){} return; }
+
+      // ④ 규칙 '교체' (누적 아님). 📌 고정한 것만 살린다.
+      const pinned = keepPinned ? (proj.rules||[]).filter(x=>x && x.pinned) : [];
+      const freshRules = list.slice(0,24).map((t,i)=>({
+        id: String(Date.now())+"_d"+i,
+        text: String(t).slice(0,220), guide: String(t).slice(0,220),
+        at: Date.now(), source: "경험 증류 (경험 "+all.length+"건 전부 반영)",
+        applied: 0, scoreSum: 0
+      }));
+      proj.rules = pinned.concat(freshRules);
+      proj.distilledAt = Date.now();
+      proj.distillSummary = String((j2 && j2.summary) || "").slice(0,200);
+      proj.distillFrom = all.length;
+      st.step = "완료"; st.done = st.total;
+      saveDB();
+      try{ kakaoNotify("📚 규칙 증류 완료 — "+proj.name+"\n경험 "+all.length+"건 전부 반영 → 규칙 "+proj.rules.length+"개\n"+(proj.distillSummary||"")); }catch(_){}
+    }catch(e){
+      st.step = "실패: "+String(e.message||e).slice(0,80);
+      logError("project-distill", e);
+    }
+    finally{ st.running=false; saveDB(); endJobMode(); }
+  });
+});
+
+// 프로젝트 목록·전환·생성·삭제
+app.get("/api/projects", (req,res)=>{
+  const ps = projectsAll();
+  const exp = DB.experience || [];
+  res.json({ ok:true, current: curProjectId(),
+    projects: Object.keys(ps).map(id=>({
+      id, name: ps[id].name, brief: ps[id].brief||"",
+      rules: (ps[id].rules||[]).length,
+      exp: exp.filter(x=>x.project===id).length,
+      distilledAt: ps[id].distilledAt||0,
+      distillSummary: ps[id].distillSummary||""
+    })),
+    experienceTotal: exp.length
+  });
+});
+app.post("/api/projects/create", (req,res)=>{
+  const name = String((req.body&&req.body.name)||"").trim().slice(0,40);
+  if(!name) return res.status(400).json({ error:"프로젝트 이름을 입력하세요" });
+  const ps = projectsAll();
+  const id = "p"+Date.now().toString(36);
+  ps[id] = { id, name, brief: String((req.body&&req.body.brief)||"").slice(0,300), rules: [], distilledAt:0, at: Date.now() };
+  DB.state = DB.state || {}; DB.state.project = id;      // 새 프로젝트로 전환
+  saveDB();
+  res.json({ ok:true, id, name, note:"규칙은 비어 있어요. 경험이 쌓이면 '경험에서 규칙 뽑기'를 눌러 이 프로젝트에 맞는 규칙을 만드세요." });
+});
+app.post("/api/projects/switch", (req,res)=>{
+  const id = String((req.body&&req.body.id)||"");
+  const ps = projectsAll();
+  if(!ps[id]) return res.status(404).json({ error:"프로젝트를 찾을 수 없어요" });
+  DB.state = DB.state || {}; DB.state.project = id; saveDB();
+  res.json({ ok:true, current:id, name:ps[id].name, rules:(ps[id].rules||[]).length });
+});
+app.post("/api/projects/delete", (req,res)=>{
+  const id = String((req.body&&req.body.id)||"");
+  const ps = projectsAll();
+  if(!ps[id]) return res.status(404).json({ error:"프로젝트를 찾을 수 없어요" });
+  if(Object.keys(ps).length <= 1) return res.status(400).json({ error:"마지막 프로젝트는 지울 수 없어요" });
+  delete ps[id];
+  // ★ 경험은 지우지 않는다 — 자산이다. 프로젝트만 사라진다.
+  if(DB.state && DB.state.project===id) DB.state.project = Object.keys(ps)[0];
+  saveDB();
+  res.json({ ok:true, current: curProjectId(), note:"프로젝트는 삭제됐지만 경험 자료는 그대로 보존됩니다." });
+});
+
+// 경험 저장소 현황
+app.get("/api/experience/stats", (req,res)=>{
+  const exp = DB.experience || [];
+  const byType = {}; const byProject = {};
+  exp.forEach(x=>{ byType[x.type]=(byType[x.type]||0)+1; byProject[x.project]=(byProject[x.project]||0)+1; });
+  const scored = exp.filter(x=>typeof x.score==="number");
+  res.json({ ok:true, total: exp.length, byType, byProject,
+    avgScore: scored.length ? Math.round(scored.reduce((a,b)=>a+b.score,0)/scored.length) : null,
+    recent: exp.slice(-15).reverse().map(x=>({ at:x.at, type:x.type, kind:x.kind, topic:x.topic, score:x.score, note:(x.note||"").slice(0,90) })) });
+});
+
 app.post("/api/lessons/pin", (req,res)=>{
   const id=String((req.body&&req.body.id)||"");
-  const x=(DB.lessons||[]).find(v=>String(v.id)===id);
+  const x=projRules().find(v=>String(v.id)===id);
   if(!x) return res.status(404).json({ error:"규칙을 찾을 수 없어요" });
   x.pinned = !x.pinned; saveDB();
   res.json({ ok:true, pinned:!!x.pinned });
@@ -806,9 +1539,9 @@ app.post("/api/lessons/pin", (req,res)=>{
 app.post("/api/lessons/delete", (req,res)=>{
   try{
     const id=String((req.body&&req.body.id)||"");
-    DB.lessons = (DB.lessons||[]).filter(x=>String(x.id)!==id);
+    saveProjRules(projRules().filter(x=>String(x.id)!==id));
     saveDB();
-    res.json({ ok:true, count:DB.lessons.length });
+    res.json({ ok:true, count:projRules().length });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
 // 부서별 '학습용 유튜브 영상' 등록 (YouTube 검색 API가 막혀도 영상 학습 가능)
@@ -969,7 +1702,7 @@ async function runLearnJob(id, appUrl){
       }catch(e){ logError("proposeAfterLearn", e); }
     }
   }catch(e){
-    j.status="error"; j.error=String(e.message||e).slice(0,300); j.doneAt=Date.now(); saveDB();
+    failJob(j, e, "learn-job");
     const who = (j.kind==="deep") ? "협업 심화학습"
               : (j.dept==="auto") ? "자동배정 학습"
               : (AGENTS[j.dept] ? AGENTS[j.dept].kr+" 학습" : String(j.dept));
@@ -1029,7 +1762,7 @@ app.post("/api/learn/benchmark-start", (req,res)=>{
 app.get("/api/learn/status", (req,res)=>{
   const j=(DB.learnJobs||[]).find(x=>String(x.id)===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, step:j.step||"", error:j.error||"",
+  res.json({ ok:true, id:j.id, kind:j.kind, dept:j.dept, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
     analyzed:j.analyzed||0, autoDepts:j.autoDepts||null, knowledge:(j.status==="done"?(j.knowledge||""):""),
     result:(j.status==="done" && j.kind==="deep") ? (j.result||null) : null });
 });
@@ -1291,7 +2024,7 @@ app.post("/api/learn/web-apply", (req,res)=>{
 app.get("/api/learn/list", (req,res)=>{
   res.json({ ok:true, jobs:(DB.learnJobs||[]).slice(-12).map(j=>({
     id:j.id, kind:j.kind, dept:j.dept, status:j.status, at:j.at, doneAt:j.doneAt||0, startedAt:j.startedAt||0, step:j.step||"",
-    error:j.error||"", analyzed:j.analyzed||0, urls:(j.urls||[]).length })) });
+    error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, analyzed:j.analyzed||0, urls:(j.urls||[]).length })) });
 });
 // ===== 🏢 전 부서 협업 심화 학습 =====
 // 팀장 배정 → 부서별 가이드라인 → 제작부 예제 → 검수부 채점 → (부족하면 2라운드) → 부서 지식 갱신
@@ -3348,7 +4081,7 @@ function reactionInsights(){
   return "\n\n[과거 수집된 시청자 반응·트렌드 인사이트 — 방향성 판단에 참고]\n" + recent;
 }
 // 운영 프로필(채널 설정) — 부서가 매번 되묻지 않고 전제로 삼을 공통 맥락
-function profileContext(){
+function profileContext(ctx){
   const p = (DB.state && DB.state.profile) || null;
   const rows=[];
   if(p){
@@ -3362,15 +4095,123 @@ function profileContext(){
     if(p.extra) rows.push("기타 지침: "+p.extra);
   }
   const profileTxt = rows.length ? ("\n\n[운영 프로필 — 모든 콘텐츠·제안의 기본 전제. 이 정보로 충분하니 사용자에게 되묻지 말고 바로 진행하라]\n" + rows.map(r=>"· "+r).join("\n")) : "";
-  return profileTxt + brandBlock() + lessonsBlock();
+  return profileTxt + brandBlock() + lessonsBlock(ctx);
 }
 // 🧠 실수 규칙(반복 금지) 장부 — 과거 실패·AI 오류·거짓말 수법을 규칙으로 누적해 모든 생성에 주입, 재발 방지
 // v223: '금지 목록'은 쌓일수록 모델의 발상을 가둔다(제약 → 맥락 전환).
 // 규칙을 "~하지 마라"가 아니라 "이렇게 하라"는 지향문(guide)으로 저장·주입하고,
 // 오래되고 안 쓰이는 규칙은 만료시켜 프롬프트가 무한히 부풀지 않게 한다.
-const LESSON_MAX_INJECT = 10;                    // 프롬프트에 넣는 최대 개수
-const LESSON_TTL_MS = 180*24*3600*1000;          // 180일 지난 규칙은 주입 제외(고정 규칙 제외)
+// ═══════════════════════════════════════════════════════════════════
+// v235: 경험 저장소(무제한) + 프로젝트별 규칙(증류)
+//
+// 구조를 바로잡는다:
+//   · 축적하는 것 = 자료 · 발상 · 경험      → 무제한, 영구, 삭제 없음. 이게 자산이다.
+//   · 규칙        = 그 프로젝트 맥락에서 경험을 '증류'해 만든 지시문
+//                   → 프로젝트에 종속. 누적하지 않고 다시 뽑는다(재생성).
+//                   → 다른 프로젝트를 하면 같은 경험에서 '다른 규칙'이 나온다.
+//
+// 왜 이래야 하는가: 규칙을 전역으로 쌓으면 민앤팜 규칙이 남의 프로젝트를 오염시킨다.
+//   경험은 공유하되, 규칙은 그때그때 맥락에 맞게 뽑아 쓰는 게 맞다.
+// ═══════════════════════════════════════════════════════════════════
+
+// ───────── 경험 저장소 (무제한) ─────────
+// type: result(결과물) | review(검수 지적) | research(조사자료) | idea(발상) | outcome(실제 성과)
+function recordExperience(e){
+  if(!e || !e.type) return null;
+  DB.experience = DB.experience || [];
+  const item = {
+    id: String(Date.now())+"_x"+Math.floor(Math.random()*10000),
+    at: Date.now(),
+    project: e.project || curProjectId(),
+    type: String(e.type).slice(0,12),
+    kind: String(e.kind||"").slice(0,30),          // 결과물 종류(블로그·상품페이지·보고서…)
+    topic: String(e.topic||"").slice(0,120),
+    score: (typeof e.score==="number") ? e.score : null,
+    note: String(e.note||"").slice(0,600),          // 핵심 요약 (규칙 증류에 쓰임)
+    body: String(e.body||"").slice(0,4000)          // 원자료 발췌 (자료·발상 보존용)
+  };
+  DB.experience.push(item);
+  // ★ 상한 없음 · 만료 없음 — 자료는 많을수록 좋다
+  try{ saveDB(); }catch(_){}
+  return item;
+}
+function experienceFor(projectId, opts){
+  const o = opts || {};
+  let arr = (DB.experience||[]).filter(x=>x && (!projectId || x.project===projectId));
+  if(o.type) arr = arr.filter(x=>x.type===o.type);
+  if(o.kind) arr = arr.filter(x=>x.kind===o.kind);
+  return arr;
+}
+
+// ───────── 프로젝트 ─────────
+function projectsAll(){
+  DB.projects = DB.projects || {};
+  if(!Object.keys(DB.projects).length){
+    DB.projects["minanfarm"] = {
+      id:"minanfarm", name:"민앤팜", brief:"전남 고흥 특산물 — 한우·유자·복숭아 등 산지 직거래 및 지역 홍보",
+      rules: [], distilledAt: 0, at: Date.now()
+    };
+    // 기존 전역 규칙(DB.lessons)을 기본 프로젝트로 이관 — 데이터 손실 없이
+    if(Array.isArray(DB.lessons) && DB.lessons.length){
+      DB.projects["minanfarm"].rules = DB.lessons.slice();
+      DB.projects["minanfarm"].distilledAt = Date.now();
+    }
+    try{ saveDB(); }catch(_){}
+  }
+  return DB.projects;
+}
+function curProjectId(){
+  const ps = projectsAll();
+  const id = (DB.state && DB.state.project) || "";
+  return ps[id] ? id : Object.keys(ps)[0];
+}
+function curProject(){ return projectsAll()[curProjectId()]; }
+
+// ───────── 규칙 = 프로젝트의 것 ─────────
+function projRules(){ const p = curProject(); return (p && Array.isArray(p.rules)) ? p.rules : []; }
+function saveProjRules(rules){ const p = curProject(); if(!p) return; p.rules = rules; try{ saveDB(); }catch(_){} }
+// ═══ 주입 선별 ═══
+// 자료는 많을수록 좋다. 그러나 '한 프롬프트에 다 밀어넣는 것'은 전혀 다른 문제다.
+// 규칙 100개를 매번 다 넣으면 모델의 주의가 흩어져 오히려 품질이 떨어진다(맥락 희석).
+//   → 저장: 상한 없음, 만료 없음. 자료는 계속 쌓인다.
+//   → 주입: 이번 작업과 '관련 있는' 규칙 + '실제로 통한' 규칙을 골라 넣는다.
+//   → 효과 추적: 주입된 규칙이 몇 점을 받았는지 되먹여, 통하는 규칙이 우선 주입된다.
+function lessonInjectMax(){ const v=+((DB.state&&DB.state.lessonInject)||14); return (v>=5 && v<=40) ? v : 14; }
 function lessonText(x){ return String((x&&(x.guide||x.text))||"").trim(); }
+function _lsnTokens(t){
+  const toks = String(t||"").toLowerCase().match(/[가-힣]{2,}|[a-z0-9]{3,}/g) || [];
+  const stop = {"하라":1,"한다":1,"해라":1,"하고":1,"하며":1,"반드시":1,"항상":1,"절대":1,"모든":1,"경우":1,"내용":1,"결과":1,"사용":1,"작성":1,"만들":1};
+  const out={}; toks.forEach(x=>{ if(!stop[x]) out[x]=1; });
+  return Object.keys(out);
+}
+function _lsnRelevance(x, ctxToks){
+  if(!ctxToks || !ctxToks.length) return 0;
+  if(!x._tok) x._tok = _lsnTokens(lessonText(x)+" "+(x.tags||""));
+  let hit=0; ctxToks.forEach(c=>{ if(x._tok.indexOf(c)>=0) hit++; });
+  return hit;
+}
+function _lsnEffect(x){                       // 적용 후 평균 점수 — 실제로 통하는 규칙인가
+  const n = x.applied||0;
+  if(n < 2) return 0;                          // 표본 부족이면 중립
+  return (((x.scoreSum||0)/n) - 70) / 10;      // 70점 기준 ±
+}
+// ★ 이번 작업에 넣을 규칙을 고른다: 고정 → 관련도 → 실효성 → 최신
+function selectLessons(ctx){
+  const all = projRules().filter(x=>x && (x.guide||x.text));
+  if(!all.length) return [];
+  const ctxToks = _lsnTokens(ctx||"");
+  const scored = all.map(x=>({ x, pin:x.pinned?1:0, rel:_lsnRelevance(x,ctxToks), eff:_lsnEffect(x), age:x.at||0 }));
+  scored.sort((a,b)=> (b.pin-a.pin) || (b.rel-a.rel) || (b.eff-a.eff) || (b.age-a.age));
+  return scored.slice(0, lessonInjectMax()).map(v=>v.x);
+}
+// 검수 점수를 주입됐던 규칙들에 되먹인다 — 무엇이 통하는지 스스로 배운다
+function creditLessons(ids, score){
+  if(!Array.isArray(ids) || !ids.length) return;
+  const map={}; projRules().forEach(x=>{ map[x.id]=x; });
+  ids.forEach(id=>{ const x=map[id]; if(!x) return;
+    x.applied=(x.applied||0)+1; x.scoreSum=(x.scoreSum||0)+(+score||0); x.lastUsed=Date.now(); });
+  try{ saveDB(); }catch(_){}
+}
 // ===== 🎨 v224: 브랜드 디자인 시스템 (design.md 역할) =====
 // AI는 매번 기억이 없어서 화면마다 색·여백·버튼이 제각각이 된다.
 // 고정 도면(색·폰트·간격·금지목록)을 모든 HTML 생성에 주입해 "한 브랜드"로 보이게 한다.
@@ -3412,16 +4253,15 @@ function hasDesignSystem(){
   const ds = (DB.state && DB.state.designSystem) || null;
   return !!(ds && ds.on !== false && String(ds.text||"").trim());
 }
-function lessonsBlock(){
-  const now = Date.now();
-  const arr = (DB.lessons||[]).filter(x=>x && (x.guide||x.text))
-    .filter(x=> x.pinned || !x.at || (now - x.at) < LESSON_TTL_MS);
-  if(!arr.length) return "";
-  // 고정(pinned) 우선 → 최신 순
-  const sorted = arr.slice().sort((a,b)=> (b.pinned?1:0)-(a.pinned?1:0) || (b.at||0)-(a.at||0));
-  const rows = sorted.slice(0, LESSON_MAX_INJECT).map(x=>"· "+lessonText(x)).join("\n");
-  return "\n\n[우리 팀의 품질 원칙 — 과거 경험에서 뽑은 것. 이 방향으로 만들어라(금지 목록이 아니라 지향점이다)]\n"+rows;
+function lessonsBlock(ctx){
+  const picked = selectLessons(ctx);
+  if(!picked.length) return "";
+  const total = projRules().length;
+  LAST_INJECTED_LESSONS = picked.map(x=>x.id);            // 이번에 넣은 규칙 → 점수 되먹임에 사용
+  const rows = picked.map(x=>"· "+lessonText(x)).join("\n");
+  return "\n\n[우리 팀의 품질 원칙 — 축적 "+total+"개 중 이번 작업과 관련된 "+picked.length+"개. 이 방향으로 만들어라(금지 목록이 아니라 지향점이다)]\n"+rows;
 }
+var LAST_INJECTED_LESSONS = [];
 // 금지문("~하지 마라")을 같은 뜻의 지향문("~하라")으로 바꾼다. 실패하면 원문 유지.
 async function toGuideline(text){
   const t = String(text||"").trim();
@@ -3449,7 +4289,7 @@ function _lsnSim(a,b){
   return inter / (ga.size + gb.size - inter);
 }
 function findSimilarLesson(text){
-  const arr = DB.lessons||[];
+  const arr = projRules();
   for(const x of arr){ if(_lsnSim(text, x.text||"")>=0.55 || _lsnSim(text, x.guide||"")>=0.55) return x; }
   return null;
 }
@@ -3822,6 +4662,217 @@ async function reviewContent(text, topic, engine){
   if(!m) return { pass:true, feedback:"" }; // 파싱 실패 시 통과(막지 않음)
   return { pass:/PASS/i.test(m[1]), feedback:String(m[2]||"").trim() };
 }
+// ═══════════ 👑 v230: 오세라 최종 검수 게이트 ═══════════
+// 원칙: 플랫폼의 모든 완성본은 총괄 오세라의 검수를 통과해야만 내보낼 수 있다.
+//       평가는 언제나 100점 만점. 지적된 보완 내용은 '품질 규칙'으로 누적되어 이후 모든 생성에 자동 적용된다.
+const OSERA_AXES_DEFAULT = [
+  { k:"fact",     max:20, ko:"사실·근거",   q:"근거 없는 숫자·효능·순위를 지어내지 않았는가. 확실치 않은 건 정직하게 밝혔는가" },
+  { k:"brand",    max:20, ko:"우리다움",     q:"민앤팜(전남 고흥 특산물)의 목소리인가. 아무 브랜드나 써도 되는 글이면 감점" },
+  { k:"complete", max:20, ko:"완성도",       q:"손대지 않고 바로 쓸 수 있는가. 빈칸·placeholder·미완성 구조가 있으면 감점" },
+  { k:"impact",   max:20, ko:"성과 가능성",  q:"실제로 사람을 움직이는가. 평범하면 과감히 감점" },
+  { k:"risk",     max:20, ko:"규정·리스크",  q:"과대·허위광고, 의학적 효능 단정, 저작권·개인정보 문제가 없는가" }
+];
+// v231: 평가 기준(축·배점·심사 내용)을 운영자가 직접 설정한다.
+// 어떤 설정이든 총합은 '항상 100점'이 되도록 서버에서 강제 정규화한다 — 이게 깨지면 점수 비교가 무의미해진다.
+function oseraAxes(){
+  const raw = (DB.state && Array.isArray(DB.state.oseraAxes)) ? DB.state.oseraAxes : null;
+  if(!raw || raw.length < 2) return OSERA_AXES_DEFAULT;
+  let axes = raw.slice(0, 8)
+    .map((x,i)=>({
+      k:  String((x&&x.k)||("ax"+i)).replace(/[^a-zA-Z0-9_]/g,"").slice(0,16) || ("ax"+i),
+      ko: String((x&&x.ko)||"").slice(0,20) || ("항목"+(i+1)),
+      q:  String((x&&x.q)||"").slice(0,200),
+      max: Math.max(1, Math.min(100, parseInt((x&&x.max),10) || 0))
+    }))
+    .filter(x=>x.ko);
+  if(axes.length < 2) return OSERA_AXES_DEFAULT;
+  // 키 중복 제거
+  const seen={}; axes = axes.filter(x=>{ if(seen[x.k]) return false; seen[x.k]=1; return true; });
+  // ★ 총합 100 강제 정규화 (설정이 90이든 130이든 100으로 환산)
+  const sum = axes.reduce((a,x)=>a+x.max, 0);
+  if(sum !== 100 && sum > 0){
+    let acc=0;
+    axes = axes.map((x,i)=>{
+      let v = (i === axes.length-1) ? (100-acc) : Math.max(1, Math.round(x.max/sum*100));
+      if(i < axes.length-1) acc += v;
+      return Object.assign({}, x, { max: Math.max(1, v) });
+    });
+    // 반올림 오차 보정
+    const s2 = axes.reduce((a,x)=>a+x.max,0);
+    if(s2 !== 100) axes[axes.length-1].max = Math.max(1, axes[axes.length-1].max + (100-s2));
+  }
+  return axes;
+}
+function oseraGateOn(){ const st=DB.state||{}; return st.oseraGate!==false; }   // 기본 켜짐
+function oseraMin(){ const v=+((DB.state&&DB.state.oseraMin)||80); return (v>=50 && v<=95) ? v : 80; }
+
+async function oseraReview(kindLabel, content, topic, ctx){
+  const a = AGENTS.ops;
+  const spec = specFor(kindLabel);
+  const M = machineVerify(kindLabel, content);          // ① 기계 검증 (결정론적)
+
+  // 클라이언트가 실제로 지시한 것 (부서가 '원한 것')
+  const demand = String((ctx && ctx.memo) || "").slice(0, 1500);
+  const brief  = String((ctx && ctx.brief) || "").slice(0, 800);
+
+  // 기계가 이미 확정한 항목은 AI에게 판정을 맡기지 않는다 — 흔들릴 여지를 없앤다
+  const autoItems = spec.filter(x=>x.auto && M[x.id]);
+  const askItems  = spec.filter(x=>!(x.auto && M[x.id]));
+
+  const machineReport = autoItems.map(x=>
+    (M[x.id].pass ? "✅" : "❌") + " " + x.label + " → " + M[x.id].detail).join("\n");
+
+  const sys = "너는 민앤팜의 '"+a.no+" "+a.kr+"' 오세라다. 이 팀의 최종 검증관이다.\n"
+    + "★네 일은 '잘 쓴 글인가'를 평가하는 게 아니다. 취향·심미 평가 금지.\n"
+    + "★네 일은 두 가지다: (1) 각 부서가 요구받은 대로 만들었는가 (2) 기능이 제대로 작동하는가.\n"
+    + "요구 항목 하나하나를 결과물과 대조해 '충족/미충족'을 판정하라. 애매하면 미충족이다.\n\n"
+    + (machineReport ? ("[기계가 이미 확정한 항목 — 이건 판정하지 마라. 참고만 하라]\n"+machineReport+"\n\n") : "")
+    + "[네가 판정할 요구 항목]\n"
+    + askItems.map((x,i)=>(i+1)+". "+x.label+(x.must?" (필수)":" (권장)")).join("\n")
+    + (demand ? ("\n\n[클라이언트가 실제로 지시한 것 — 이게 최우선 요구사항이다. 하나라도 빠지면 미충족]\n"+demand) : "")
+    + (brief  ? ("\n\n[작업 브리프]\n"+brief) : "")
+    + "\n\n반드시 JSON만 출력(설명·마크다운 금지):\n"
+    + '{"checks":[{"n":1,"pass":true,"why":"근거 한 줄 — 결과물의 어느 부분을 보고 판단했는지"}],'
+    + '"missed":["클라이언트 지시 중 반영 안 된 것"],'
+    + '"fix":"미충족 항목을 채우려면 무엇을 어떻게 고쳐야 하는지"}';
+
+  const raw = await anthropic(sys, "결과물 종류: "+(kindLabel||"")+"\n주제: "+(topic||"")+"\n\n[검증 대상]\n"+String(content).slice(0,14000), 1200);
+  const j2 = safeJson(raw, null);
+
+  // ② 결과 합산 — 점수 = 요구 항목 충족률 (주관 점수 아님)
+  const results = [];
+  autoItems.forEach(x=> results.push({ id:x.id, label:x.label, must:!!x.must, pass:M[x.id].pass, why:M[x.id].detail, by:"기계" }));
+  const aiChecks = (j2 && Array.isArray(j2.checks)) ? j2.checks : [];
+  askItems.forEach((x, idx)=>{
+    const c = aiChecks.find(v=>+v.n === idx+1);
+    results.push({ id:x.id, label:x.label, must:!!x.must, pass: c ? !!c.pass : false,
+                   why: c ? String(c.why||"").slice(0,120) : "판정 못 받음(미충족 처리)", by:"검증" });
+  });
+
+  // 필수 항목은 가중치 2배 — 필수를 어기면 못 내보낸다
+  const w = (x)=> x.must ? 2 : 1;
+  const totalW = results.reduce((p,x)=>p+w(x), 0) || 1;
+  const gotW   = results.filter(x=>x.pass).reduce((p,x)=>p+w(x), 0);
+  const score  = Math.round(gotW / totalW * 100);
+
+  const failed = results.filter(x=>!x.pass);
+  const mustFailed = failed.filter(x=>x.must);
+  const missed = (j2 && Array.isArray(j2.missed)) ? j2.missed.map(x=>String(x).slice(0,120)).slice(0,5) : [];
+
+  return {
+    score,                                    // ★ 이행률 (0~100). 같은 결과물이면 항상 같은 점수.
+    max: 100,
+    checks: results,
+    passedCount: results.length - failed.length,
+    totalCount: results.length,
+    mustFailed: mustFailed.length,
+    issues: failed.slice(0,6).map(x=>(x.must?"[필수] ":"")+x.label+" — "+x.why).concat(missed.map(x=>"[지시 누락] "+x)),
+    fix: String((j2 && j2.fix) || (failed.length ? ("다음을 충족시켜라: "+failed.slice(0,3).map(x=>x.label).join(" / ")) : "")).slice(0,400),
+    rule: "",                                 // 규칙 자동생성은 하지 않는다 (경험으로만 남긴다)
+    min: oseraMin(),
+    at: Date.now()
+  };
+}
+
+// 오세라 게이트: 기준 미달이면 보완 재작성(최대 2회) → 재심사. 통과해야 passed=true.
+// regen(fix, issues) 는 '보완 지시를 받아 결과물을 다시 만드는' 함수. 없으면 심사만 한다.
+async function oseraGate(kindLabel, content, topic, regen, setStep, specCtx){
+  const _step = (typeof setStep==="function") ? setStep : function(){};
+  if(!oseraGateOn()) return { content, review:null, passed:true, skipped:true };
+
+  // ★ 원칙: 게이트는 '차단기'가 아니라 '보완기'다. 기준이 아무리 높아도 결과물은 반드시 나온다.
+  //   미달이면 보완을 시도하되, 보완본이 오히려 나빠지면 버리고 '가장 좋았던 판'을 채택한다.
+  //   (보완 반복이 결과를 망치는 걸 막는다 — 기준을 높였을 때 품질이 되레 떨어지는 함정)
+  let cur = content, rv = null;
+  let best = { content: content, review: null, score: -1 };
+  let tries = 0;
+  let _firstScore = null;                 // 보완 없이 처음 받은 점수
+  const _injectedIds = (LAST_INJECTED_LESSONS||[]).slice();   // 이 결과물을 만들 때 주입됐던 규칙들
+
+  for(let i=0;i<3;i++){                                  // 초심사 1 + 보완 최대 2
+    _step("👑 오세라 최종 검수 중"+(i?(" (보완 "+i+"차)"):""));
+    try{ rv = await oseraReview(kindLabel, cur, topic, specCtx); }
+    catch(e){ break; }                                    // 심사 실패가 발행을 막지 않는다
+    if(!rv) break;
+
+    if(_firstScore === null) _firstScore = rv.score;                                 // 첫판 점수 = 학습 효과를 재는 진짜 지표
+    if(rv.score > best.score) best = { content: cur, review: rv, score: rv.score };  // 최고 기록 갱신
+    if(rv.score >= rv.min) break;                         // 통과
+    if(!regen || i===2) break;                            // 보완 횟수 소진
+
+    _step("👑 미충족 요구 "+((rv.totalCount||0)-(rv.passedCount||0))+"건 보완 중 (이행률 "+rv.score+"% → 기준 "+rv.min+"%)");
+    let next;
+    try{ next = await regen(rv.fix, rv.issues, rv.score); }catch(e){ break; }
+    if(!next || String(next).trim().length <= 20) break;
+    cur = String(next).trim(); tries++;
+  }
+
+  // 심사 자체가 안 됐으면(예: API 오류) 원본을 그대로 내보낸다 — 절대 막지 않는다
+  if(best.score < 0) return { content, review:null, passed:true, note:"검수 불가 — 원본 그대로 내보냄" };
+
+  const passed = best.score >= (best.review.min || oseraMin());
+  const finalRv = Object.assign({}, best.review, {
+    tries: tries,                                        // 보완 시도 횟수
+    heldBelow: !passed,                                  // 기준 미달로 마감됐는가
+    bestOf: tries>0 ? (tries+1) : 1                      // 몇 판 중 최고를 고른 건지
+  });
+  // 📚 v235: 규칙을 여기서 '누적'하지 않는다.
+  //    검수에서 나온 통찰은 '경험'으로 저장하고, 규칙은 나중에 프로젝트 맥락에서 증류해 뽑는다.
+  //    (규칙을 무작정 쌓으면 다른 프로젝트를 오염시키고, 프롬프트도 부푼다)
+  try{
+    recordExperience({
+      type: "review", kind: String(kindLabel||""), topic: String(topic||""),
+      score: best.score,
+      note: (finalRv.rule || finalRv.fix || "").slice(0,300),
+      body: [
+        "점수: "+best.score+"/100 (기준 "+(finalRv.min||oseraMin())+") "+(passed?"통과":"미달"),
+        "첫판: "+(_firstScore==null?"-":_firstScore)+"점 · 보완 "+tries+"회",
+        (finalRv.issues&&finalRv.issues.length) ? ("지적:\n· "+finalRv.issues.join("\n· ")) : "",
+        finalRv.fix ? ("보완 지시: "+finalRv.fix) : "",
+        finalRv.rule ? ("도출된 원칙: "+finalRv.rule) : ""
+      ].filter(Boolean).join("\n")
+    });
+  }catch(_){}
+
+  // 🔁 v234: 이번에 주입됐던 규칙들에 점수를 되먹인다 → 실제로 통하는 규칙이 다음에 우선 주입된다
+  try{ creditLessons(_injectedIds, best.score); }catch(_){}
+
+  // 📈 v233: 검수 이력 기록 — '학습으로 정말 좋아지는가'를 추측이 아니라 측정한다.
+  try{
+    DB.oseraLog = DB.oseraLog || [];
+    DB.oseraLog.push({
+      at: Date.now(),
+      kind: String(kindLabel||"").slice(0,20),
+      first: _firstScore,                  // ★ 보완 없이 처음 받은 점수 = 그 시점의 '맨몸 실력'
+      score: best.score,                   // 최종 채택 점수
+      tries: tries,                        // 보완 횟수
+      passed: passed,
+      min: finalRv.min || oseraMin(),
+      rules: projRules().length,           // 그 시점 이 프로젝트의 규칙 수
+      exp: (DB.experience||[]).length      // 그 시점 축적된 경험 수
+    });
+    if(DB.oseraLog.length > 400) DB.oseraLog = DB.oseraLog.slice(-400);
+    saveDB();
+  }catch(_){}
+
+  return { content: best.content, review: finalRv, passed };   // ★ 항상 결과물을 돌려준다
+}
+
+// 품질 규칙 누적기 — 이미 비슷한 규칙이 있으면 갱신(중복 누적 방지)
+function addQualityRule(guide, source){
+  const g = String(guide||"").trim();
+  if(!g || g.length < 6) return null;
+  const _R2 = projRules();
+  const dup = findSimilarLesson(g);
+  if(dup){ dup.guide = g; dup.at = Date.now(); dup.source = source||"오세라 검수"; saveDB(); return dup; }
+  const item = { id:String(Date.now())+"_o"+Math.floor(Math.random()*1000),
+                 text:g, guide:g, at:Date.now(), source:source||"오세라 검수" };
+  _R2.push(item); saveProjRules(_R2);
+  // v234: 상한 없음
+  saveDB();
+  return item;
+}
+
 // 🔥 v224: 바이럴 점수 게이트 — "규정 위반 없음"만 보지 말고 "이게 실제로 먹힐까"도 채점한다.
 // 발행 전에 점수를 매겨 낮으면 1회 개선. 점수는 결과에 함께 남겨 성과 학습에 쓴다.
 function viralGateOn(){ return !!(DB.state && DB.state.viralGate); }
@@ -4035,7 +5086,20 @@ async function createReviewedContent(baseSys, userMsg, topic, engine){
       }
     }catch(e){ /* 채점 실패는 발행을 막지 않는다 */ }
   }
-  return { content, passed, reviews:history, viral };
+  // 👑 오세라 최종 검수 — 여기를 통과해야 내보낼 수 있다 (100점 만점)
+  let osera = null, oseraPassed = true;
+  try{
+    const g = await oseraGate("콘텐츠", content, topic, async function(fix, issues){
+      const boostSys = baseSys
+        + "\n\n[👑 총괄 오세라의 최종 지적 — 이대로는 못 내보낸다. 반드시 반영해 다시 써라]\n"
+        + (issues && issues.length ? ("· "+issues.join("\n· ")+"\n") : "")
+        + "가장 중요한 수정: " + fix;
+      return await genText(boostSys, userMsg+"\n\n(위 지적을 전부 반영한 완성본만 출력)", 1800, reviseEngine);
+    }, null, { memo: String(userMsg||"").slice(0,1200) });
+    if(g.content) content = g.content;
+    osera = g.review; oseraPassed = g.passed;
+  }catch(e){ /* 게이트 실패가 발행을 막지는 않는다 */ }
+  return { content, passed, reviews:history, viral, osera, oseraPassed };
 }
 
 // ===== 채널별 카피 병렬(순차) 생성: 인스타/블로그·스마트스토어/카카오톡 각각 최적화 =====
@@ -4287,6 +5351,11 @@ async function productPagePipeline(body, setStep){
   // 학습된 품질 공식(벤치마크 학습으로 축적된 것)을 그대로 주입
   const formula = knowledgeText(d);
   const formulaBlock = formula ? ("\n\n[이 부서가 축적한 "+KIND_NM+" 품질 공식 — 반드시 이 기준을 적용해 만들어라]\n"+formula) : "";
+  // 📚 v237: 만들기 전 — 경험 전부 훑기
+  let _expBrief = "";
+  if(!isRevise && expSweepOn()){
+    try{ _expBrief = await experienceBriefing(curProjectId(), KIND_NM+" "+product, info, _step); }catch(e){}
+  }
   // 실제 사진 자리 안내
   let photoBlock = "";
   if (photos.length){
@@ -4305,7 +5374,7 @@ async function productPagePipeline(body, setStep){
       + "(2) 요청한 부분만 정확히 반영하고, 나머지 디자인·구조·톤은 그대로 유지하라(불필요하게 갈아엎지 말 것). "
       + "(3) 기존의 고급스러운 여백·타이포그래피·반응형을 유지하라. (4) 과장광고 금지. "
       + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
-      + formulaBlock + designSystemBlock() + profileContext();
+      + formulaBlock + designSystemBlock() + profileContext(KIND_NM+" "+product);
     user = "[기존 "+KIND_NM+" HTML]\n"+baseHtml+"\n\n[클라이언트 수정·추가 요청]\n"+feedback;
   } else {
     // 🎨 '비주얼 먼저' 원칙: HTML을 짜기 전에 색 팔레트·타이포·핵심 이미지 컨셉·무드를 먼저 확정하고, 그에 정확히 맞춰 페이지를 설계하게 한다.
@@ -4350,7 +5419,7 @@ async function productPagePipeline(body, setStep){
       + "(4) 과장광고·허위표현 금지, 실제 판매에 쓸 수 있는 신뢰감 있는 카피. "
       + "(5) 절대 'AI가 만든 흔한 웹' 티를 내지 마라 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목 + 아이콘 박힌 카드 3개' 같은 평균적 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색(hex)·폰트·레이아웃을 실제 화면에 그대로 구현하라. 특히 '시그니처(한 방 요소)'는 눈에 띄게 살려 이 페이지만의 인상을 만들어라. "
       + "설명·머리말 없이 HTML 코드만 출력하라(```html 같은 마크다운 표시도 금지)."
-      + formulaBlock + photoBlock + visualBlock + designSystemBlock() + profileContext();
+      + formulaBlock + photoBlock + visualBlock + designSystemBlock() + _expBrief + profileContext(KIND_NM+" "+product+" "+info.slice(0,200));
     user = "브랜드: "+brand+"\n"+(isHome?"홈페이지 주제":"상품")+": "+product+(price?("\n가격: "+price):"")+"\n"+(isHome?"참고 정보":"상품 정보")+":\n"+info;
   }
   _step((body.baseHtml?("수정 사항 반영해 "+KIND_NM+" 재작성 중"):("AI가 "+KIND_NM+" 작성 중"))+" (1~3분)");
@@ -4393,7 +5462,22 @@ async function productPagePipeline(body, setStep){
     }catch(_){}
   }
   html = hardenHtml(html);
-  return { ok:true, html, product, kind, dept:d, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, check:checkHtmlOutput(html), by:a.kr };
+  // 👑 오세라 최종 검수
+  let _osera=null, _oseraPassed=true;
+  if(!isRevise){
+    try{
+      const g = await oseraGate(KIND_NM, html, product, async function(fix, issues){
+        const fixSys = sys + "\n\n[👑 총괄 오세라의 최종 지적 — 이대로는 못 내보낸다. 전부 반영해 완전한 단일 HTML을 다시 출력하라]\n"
+          + (issues&&issues.length?("· "+issues.join("\n· ")+"\n"):"") + "가장 중요한 수정: " + fix
+          + "\n구조·디자인 기조는 유지. 설명 없이 HTML만 출력(```html 금지).";
+        const out = await anthropic(fixSys, "[현재 HTML]\n"+html.slice(0,14000), 8000);
+        return String(out).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+      }, _step, { memo: String(body.memo||body.info||"").slice(0,1200), brief: product });
+      if(g.content && g.content.length>300) html = hardenHtml(g.content);
+      _osera=g.review; _oseraPassed=g.passed;
+    }catch(e){}
+  }
+  return { ok:true, html, product, kind, dept:d, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, osera:_osera, oseraPassed:_oseraPassed, check:checkHtmlOutput(html), by:a.kr };
 }
 // v227: 보고서 검수관 — 팔 수 있는 보고서인지 '근거'로 심사한다.
 // 디자인 검수(색·레이아웃)와 완전히 다른 축이다. 지어낸 숫자 하나면 보고서 가치가 0이 된다.
@@ -4467,6 +5551,17 @@ async function reportPipeline(body, setStep){
     if(url){ _step("참고 URL 학습 중"); try{ await learnFromWebUrls(d, [url]); }catch(_){} }
   }
 
+  // 📚 조사자료를 경험으로 영구 보존 (규칙 증류의 원재료)
+  if(research){
+    try{ recordExperience({ type:"research", kind:"리서치 보고서", topic: topic,
+      note: "키워드·경쟁사·트렌드 조사 완료 (자료 "+research.length+"자)",
+      body: research.slice(0,4000) }); }catch(_){}
+  }
+  // 📚 v237: 조사 직후 — 경험 전부 훑기
+  let expBrief = "";
+  if(!isRevise && expSweepOn()){
+    try{ expBrief = await experienceBriefing(curProjectId(), "리서치 보고서 "+topic, research, _step); }catch(e){}
+  }
   const kbS = knowledgeText("strategy");   // 벤치마크로 축적한 후킹·마케팅 지식
   const kbC = knowledgeText("scout");      // 트렌드·소재 가공 지식
   const srcList = sources.slice(0,10).map((x,i)=>"["+(i+1)+"] "+(x.title||x.url||"")+" — "+(x.url||"")).join("\n");
@@ -4501,7 +5596,7 @@ async function reportPipeline(body, setStep){
       + "설명·머리말 없이 HTML만 출력(```html 같은 마크다운 금지)."
       + (kbS?("\n\n[우리가 벤치마크로 배운 마케팅 지식]\n"+kbS.slice(0,800)):"")
       + (kbC?("\n\n[트렌드 가공 지식]\n"+kbC.slice(0,600)):"")
-      + designSystemBlock() + profileContext();
+      + designSystemBlock() + expBrief + profileContext("리서치 보고서 시장조사 키워드 경쟁사 "+topic);
     user = "분석 주제: "+topic
       + (info?("\n추가 정보: "+info):"")
       + (memo?("\n의뢰인 지시: "+memo):"")
@@ -4555,7 +5650,24 @@ async function reportPipeline(body, setStep){
     }catch(_){}
   }
   html = hardenHtml(html);
-  return { ok:true, html, topic, sources:sources.slice(0,10), reviews:_reviews, check:checkHtmlOutput(html), by:a.kr };
+  // 👑 오세라 최종 검수
+  let _osera=null, _oseraPassed=true;
+  if(!isRevise){
+    try{
+      const g = await oseraGate("리서치 보고서", html, topic, async function(fix, issues){
+        const fixSys = "너는 민앤팜의 '"+a.no+" "+a.kr+"' 오세라다. 아래 보고서를 지적대로 고쳐 완전한 단일 HTML로 다시 출력하라. "
+          + "★조사자료에 없는 숫자는 삭제하거나 '자료상 확인 불가'로 바꿔라. 설명 없이 HTML만(```html 금지)." + designSystemBlock();
+        const out = await anthropic(fixSys,
+          "[지적]\n"+(issues&&issues.length?("· "+issues.join("\n· ")+"\n"):"")+"가장 중요한 수정: "+fix
+          + "\n\n[조사자료 — 이 안의 사실만 쓸 수 있다]\n"+String(research||"(없음)").slice(0,5000)
+          + "\n\n[현재 보고서 HTML]\n"+html.slice(0,14000), 8000);
+        return String(out).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+      }, _step, { memo: String(memo||"").slice(0,1200), brief: topic });
+      if(g.content && g.content.length>300) html = hardenHtml(g.content);
+      _osera=g.review; _oseraPassed=g.passed;
+    }catch(e){}
+  }
+  return { ok:true, html, topic, sources:sources.slice(0,10), reviews:_reviews, osera:_osera, oseraPassed:_oseraPassed, check:checkHtmlOutput(html), by:a.kr };
 }
 // ===== 상품페이지 백그라운드 작업 큐 (앱을 나가도 안 끊김) =====
 function trimPageJobs(){
@@ -4579,7 +5691,7 @@ async function runPageJob(id, appUrl){
     const what = (j.kind==="revise") ? "수정 완료" : "완성";
     kakaoNotify("✅ 상품페이지 "+what+" — '"+(j.product||"상품")+"'\n앱 콘텐츠 탭에서 미리보기·다운로드·수정할 수 있어요."+(link?("\n"+link):""), link).catch(()=>{});
   }catch(e){
-    j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now();
+    failJob(j, e, "page-job");
     saveDB();
     kakaoNotify("⚠️ 상품페이지 생성 실패 — '"+(j.product||"상품")+"'\n사유: "+j.error).catch(()=>{});
   } finally { endJobMode(); }
@@ -4628,13 +5740,13 @@ app.get("/api/product-page/status", (req,res)=>{
   const id=String(req.query.id||"");
   const j=(DB.pageJobs||[]).find(x=>String(x.id)===id);
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"", step:j.step||"",
+  res.json({ ok:true, id:j.id, status:j.status, kind:j.kind, product:j.product, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, step:j.step||"",
     appliedFormula:!!j.appliedFormula, visualDirection:(j.status==="done"?(j.visualDirection||null):null), html:(j.status==="done"?(j.html||""):"") });
 });
 app.get("/api/product-page/list", (req,res)=>{
   res.json({ ok:true, jobs:(DB.pageJobs||[]).slice(-12).map(j=>({
     id:j.id, status:j.status, kind:j.kind, product:j.product, at:j.at, doneAt:j.doneAt||0,
-    error:j.error||"", hasHtml:!!j.html, appliedFormula:!!j.appliedFormula })) });
+    error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, hasHtml:!!j.html, appliedFormula:!!j.appliedFormula })) });
 });
 // 완성 페이지를 브라우저에서 바로 열기(카톡 링크 대상으로도 사용 가능)
 app.get("/api/product-page/html", (req,res)=>{
@@ -6372,7 +7484,7 @@ async function runRepurposeJob(id, appUrl){
     j.status="done"; j.doneAt=Date.now(); j.step="완료"; trimRepurposeJobs(); saveDB();
     const done=Object.keys(j.variants).map(p=>REPURPOSE_KR[p]||p).join(", ");
     kakaoNotify("♻️ 멀티플랫폼 변환 완료 — "+done+"\n앱 학습 탭에서 플랫폼별 결과를 확인·복사하세요.", String(appUrl||"")).catch(()=>{});
-  }catch(e){ j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now(); saveDB();
+  }catch(e){ failJob(j, e, "repurpose-job");
     kakaoNotify("⚠️ 멀티플랫폼 변환 실패 — "+j.error).catch(()=>{});
   }finally{ endJobMode(); }
 }
@@ -6392,7 +7504,7 @@ app.post("/api/repurpose/start", (req,res)=>{
 });
 app.get("/api/repurpose/status", (req,res)=>{
   const j=(DB.repurposeJobs||[]).find(x=>String(x.id)===String(req.query.id||"")); if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", platforms:j.platforms||[], variants:(j.status==="done"?(j.variants||{}):null) });
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, platforms:j.platforms||[], variants:(j.status==="done"?(j.variants||{}):null) });
 });
 
 // ===== 🎬 AI 영상 기획 파이프라인: 리서치·콘셉트 → 마스터 시트(장면 프롬프트까지). 영상 생성 자체는 외부 툴(힉스필드 등)에 프롬프트 투입 =====
@@ -6434,7 +7546,7 @@ async function runVideoPlanJob(id, appUrl){
     }
     j.status="done"; j.doneAt=Date.now(); j.step="완료"; trimVideoJobs(); saveDB();
     kakaoNotify("🎬 AI 영상 기획 완료 — '"+String(j.source||"").slice(0,30)+"' ("+platKr+")\n콘셉트 + "+(j.days_plan||[]).length+"일치 콘텐츠 플랜(장면 프롬프트 포함)이 나왔어요.\n앱 학습 탭에서 확인·복사해 영상툴에 넣으세요.", String(appUrl||"")).catch(()=>{});
-  }catch(e){ j.status="error"; j.error=String(e.message||e).slice(0,200); j.doneAt=Date.now(); saveDB();
+  }catch(e){ failJob(j, e, "repurpose-job");
     kakaoNotify("⚠️ AI 영상 기획 실패 — "+j.error).catch(()=>{}); }
   finally{ endJobMode(); }
 }
@@ -6453,7 +7565,7 @@ app.post("/api/video/start", (req,res)=>{
 });
 app.get("/api/video/status", (req,res)=>{
   const j=(DB.videoJobs||[]).find(x=>String(x.id)===String(req.query.id||"")); if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"",
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0,
     platform:j.platform, concept:(j.status==="done"?(j.concept||null):null), days_plan:(j.status==="done"?(j.days_plan||[]):null) });
 });
 
@@ -6900,13 +8012,14 @@ async function cycleGenText(job, fmt, setStep){
   setStep(spec.label+" · 생성 중");
   let sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 부서 AI다. 역할: "+a.role+ADDRESS+STYLE+personaLine(d);
   const kb = knowledgeText(d); if(kb) sys += "\n\n[이 부서가 축적한 전문성(품질 공식·클라이언트 취향)]\n"+kb;
-  sys += brandBlock() + profileContext();
+  sys += brandBlock() + profileContext(spec.label+" "+topic+" "+String(job.memo||"").slice(0,120));
   if(memo) sys += "\n\n[클라이언트의 이번 지시·요구 — 반드시 반영]\n"+memo;
   sys += " 아래 주제로 "+spec.instruct+" 되묻지 말고 완성본만, 한국어로.";
   const userMsg = "주제: "+topic+(url?("\n참고 URL(학습 반영됨): "+url):"")+(info?("\n추가 정보: "+info):"")+(memo?("\n지시: "+memo):"");
   let out = "";
   try{ const g = await createReviewedContent(sys, userMsg, topic, workEngine()); out = g.content||"";
-       if(g.viral){ job._viral = job._viral||{}; job._viral[fmt] = g.viral; } }
+       if(g.viral){ job._viral = job._viral||{}; job._viral[fmt] = g.viral; }
+       if(g.osera){ job._osera = job._osera||{}; job._osera[fmt] = g.osera; } }
   catch(e){ out = await genText(sys, userMsg, 1800, workEngine()); }
   setStep(spec.label+" · 개선 자료 수집 중");
   let research = "";
@@ -6919,7 +8032,8 @@ async function cycleGenText(job, fmt, setStep){
         userMsg+"\n\n(아래 초안을 위 조사자료로 더 완성도 높게 개선한 최종본만 출력)\n\n[초안]\n"+out,
         topic, workEngine());
       if(rev.content && rev.content.length>50){ out = rev.content;
-        if(rev.viral){ job._viral = job._viral||{}; job._viral[fmt] = rev.viral; } }
+        if(rev.viral){ job._viral = job._viral||{}; job._viral[fmt] = rev.viral; }
+        if(rev.osera){ job._osera = job._osera||{}; job._osera[fmt] = rev.osera; } }
     }catch(_){}
   }
   setStep(spec.label+" · 배운 것 누적 중");
@@ -6939,6 +8053,15 @@ async function runCycleJob(id, appUrl){
     const results = {};
     const o = job.outputs || {};
 
+    // 📚 v237: 자료수집 뒤 · 생성 전 — 이 프로젝트의 경험을 전부 훑고 시작한다
+    if(expSweepOn()){
+      try{
+        const wants = Object.keys(o).filter(k=>o[k]).join(" ");
+        const brief = await experienceBriefing(curProjectId(), topic+" "+wants+" "+String(memo||"").slice(0,120), info, setStep);
+        if(brief){ job.expBrief = brief; job.memo = String(job.memo||"") + brief; memo = job.memo; saveDB(); }
+      }catch(e){ job._warn=(job._warn||"")+"경험 훑기 실패(계속 진행); "; }
+    }
+
     if(o.sns)     results.sns     = await cycleGenText(job, "sns", setStep);
     if(o.blog)    results.blog    = await cycleGenText(job, "blog", setStep);
     if(o.cafe)    results.cafe    = await cycleGenText(job, "cafe", setStep);
@@ -6950,6 +8073,7 @@ async function runCycleJob(id, appUrl){
       try{
         const genR = await reportPipeline({ topic: topic, info: info, memo: memo, url: String(job.url||"") },
                                           (s2)=>setStep("리서치 보고서 · "+s2));
+        if(genR.osera){ job._osera = job._osera||{}; job._osera.report = genR.osera; }
         results.report = genR.html || "";
         results.reportTopic = topic;
         results.reportReviews = genR.reviews || [];
@@ -6964,6 +8088,7 @@ async function runCycleJob(id, appUrl){
       let homeHtml = "";
       try{
         const genH = await productPagePipeline({ kind:"home", dept:dh, product: topic, info: info+(memo?("\n[지시] "+memo):""), brand:"민앤팜" }, (s2)=>setStep("홈페이지 · "+s2));
+        if(genH.osera){ job._osera = job._osera||{}; job._osera.home = genH.osera; }
         homeHtml = genH.html || "";
       }catch(e){ job._warn=(job._warn||"")+"홈페이지 생성 실패: "+String(e.message||e).slice(0,60)+"; "; }
       let homeResearch = "";
@@ -6992,6 +8117,7 @@ async function runCycleJob(id, appUrl){
       let pageHtml = "";
       try{
         const gen = await productPagePipeline({ product: topic, info: info+(memo?("\n[지시] "+memo):""), brand: "민앤팜" }, (s)=>setStep("상품페이지 · "+s));
+        if(gen.osera){ job._osera = job._osera||{}; job._osera.page = gen.osera; }
         pageHtml = gen.html || "";
       }catch(e){ job._warn=(job._warn||"")+"페이지 생성 실패: "+String(e.message||e).slice(0,60)+"; "; }
       let pageResearch = "";
@@ -7013,6 +8139,19 @@ async function runCycleJob(id, appUrl){
     }
 
     if(job._viral) results.viral = job._viral;
+    if(job._osera) results.osera = job._osera;
+    // 📚 만든 결과물을 경험으로 기록 (무엇을 어떤 지시로 만들었고 몇 점이었나)
+    try{
+      Object.keys(results).forEach(function(k){
+        if(["viral","osera","pageProduct","homeTopic","reportTopic","reportReviews","pageDropped","homeDropped","reportDropped"].indexOf(k)>=0) return;
+        const v = results[k]; if(!v || typeof v!=="string" || v.length<30) return;
+        const o = (results.osera||{})[k];
+        recordExperience({ type:"result", kind:(CYCLE_FORMATS[k]?CYCLE_FORMATS[k].label:k), topic: topic,
+          score: o ? o.score : null,
+          note: (memo? ("지시: "+memo.slice(0,120)+" / ") : "") + "결과 "+v.length+"자",
+          body: v.slice(0,1500) });
+      });
+    }catch(_){}
     job.results = results;
     job.status = "done"; job.doneAt = Date.now(); job.step = "완료"; trimCycleJobs(); saveDB();
     const parts = []; if(results.sns) parts.push("SNS"); if(results.blog) parts.push("블로그"); if(results.cafe) parts.push("카페글"); if(results.youtube) parts.push("유튜브"); if(results.page) parts.push("상품페이지"); if(results.home) parts.push("홈페이지"); if(results.report) parts.push("리서치 보고서");
@@ -7021,7 +8160,7 @@ async function runCycleJob(id, appUrl){
     if(results.viral){ const vs=Object.keys(results.viral).map(k=>{ const L=(CYCLE_FORMATS[k]?CYCLE_FORMATS[k].label:k); return L+" "+results.viral[k].score+"점"; }); if(vs.length) vsum = "\n🔥 예상 반응: "+vs.join(" · "); }
     try{ kakaoNotify("🔄 선순환 완료 — "+topic+"\n생성: "+(parts.join(" + ")||"(결과 없음)")+vsum+(job._warn?("\n⚠️ "+job._warn):"")+"\n앱 '📚 학습 > 🔄 선순환'에서 결과를 확인하고, 마음에 안 들면 '🔁 고쳐줘'로 수정·학습시키세요.", base); }catch(_){}
   }catch(e){
-    job.status = "error"; job.error = String(e.message||e); job.doneAt = Date.now(); job.step = "실패"; saveDB();
+    failJob(job, e, "cycle-job");
     try{ kakaoNotify("⚠️ 선순환 실패 — "+String(job.topic||"")+"\n"+String(e.message||e).slice(0,140)); }catch(_){}
     logError("runCycleJob", e);
   }finally{ endJobMode(); }
@@ -7040,7 +8179,11 @@ app.post("/api/cycle/start", (req,res)=>{
     // 🎤 사전 인터뷰 답변이 있으면 '맥락'으로 memo에 합쳐 모든 부서 프롬프트에 주입
     let memo = String(b.memo||"").slice(0,800);
     const itv = String(b.interview||"").trim();
-    if(itv) memo = (memo?(memo+"\n\n"):"") + "[사전 인터뷰 — 클라이언트가 직접 답한 방향. 이 맥락에 정확히 맞춰라]\n" + itv.slice(0,1500);
+    if(itv){
+      memo = (memo?(memo+"\n\n"):"") + "[사전 인터뷰 — 클라이언트가 직접 답한 방향. 이 맥락에 정확히 맞춰라]\n" + itv.slice(0,1500);
+      try{ recordExperience({ type:"idea", kind:"사전 인터뷰", topic: topic,
+        note:"클라이언트가 직접 답한 방향", body: itv.slice(0,2000) }); }catch(_){}
+    }
     const job = { id:String(Date.now())+"_c"+Math.floor(Math.random()*1000), url, topic, info:String(b.info||"").slice(0,2000), memo:memo.slice(0,2500),
       outputs:{ sns, blog, youtube, page, home, cafe, report }, status:"queued", at:Date.now(), source:"now", interviewed:!!itv };
     DB.cycleJobs.push(job); trimCycleJobs(); saveDB();
@@ -7052,22 +8195,22 @@ app.post("/api/cycle/start", (req,res)=>{
 app.get("/api/cycle/status", (req,res)=>{
   const j = (DB.cycleJobs||[]).find(x=>x.id===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", warn:j._warn||"",
+  res.json({ ok:true, id:j.id, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, warn:j._warn||"",
     topic:j.topic, outputs:j.outputs, doneAt:j.doneAt||0,
-    results: j.results ? { sns:j.results.sns||"", blog:j.results.blog||"", cafe:j.results.cafe||"", youtube:j.results.youtube||"", page:j.results.page||"", home:j.results.home||"", report:j.results.report||"", pageProduct:j.results.pageProduct||"", homeTopic:j.results.homeTopic||"", pageDropped:!!j.results.pageDropped, homeDropped:!!j.results.homeDropped } : null });
+    results: j.results ? { osera:j.results.osera||null, sns:j.results.sns||"", blog:j.results.blog||"", cafe:j.results.cafe||"", youtube:j.results.youtube||"", page:j.results.page||"", home:j.results.home||"", report:j.results.report||"", pageProduct:j.results.pageProduct||"", homeTopic:j.results.homeTopic||"", pageDropped:!!j.results.pageDropped, homeDropped:!!j.results.homeDropped } : null });
 });
 // 목록(결과 이력)
 app.get("/api/cycle/list", (req,res)=>{
   const jobs = (DB.cycleJobs||[]).slice(-12).reverse().map(j=>({
     id:j.id, status:j.status, step:j.step||"", topic:j.topic, outputs:j.outputs, at:j.at, doneAt:j.doneAt||0, source:j.source||"now",
-    hasSns: !!(j.results&&j.results.sns), hasBlog: !!(j.results&&j.results.blog), hasCafe: !!(j.results&&j.results.cafe), hasYoutube: !!(j.results&&j.results.youtube), hasPage: !!(j.results&&j.results.page), hasHome: !!(j.results&&j.results.home), hasReport: !!(j.results&&j.results.report), viral:(j.results&&j.results.viral)||null, pageDropped: !!(j.results&&j.results.pageDropped), homeDropped: !!(j.results&&j.results.homeDropped), error:j.error||"" }));
+    hasSns: !!(j.results&&j.results.sns), hasBlog: !!(j.results&&j.results.blog), hasCafe: !!(j.results&&j.results.cafe), hasYoutube: !!(j.results&&j.results.youtube), hasPage: !!(j.results&&j.results.page), hasHome: !!(j.results&&j.results.home), hasReport: !!(j.results&&j.results.report), viral:(j.results&&j.results.viral)||null, osera:(j.results&&j.results.osera)||null, pageDropped: !!(j.results&&j.results.pageDropped), homeDropped: !!(j.results&&j.results.homeDropped), error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0 }));
   res.json({ ok:true, jobs });
 });
 // 결과 하나 상세(SNS 본문 / 페이지 HTML)
 app.get("/api/cycle/result", (req,res)=>{
   const j = (DB.cycleJobs||[]).find(x=>x.id===String(req.query.id||""));
   if(!j || !j.results) return res.status(404).json({ error:"결과가 없어요" });
-  res.json({ ok:true, id:j.id, topic:j.topic, viral:j.results.viral||null, sns:j.results.sns||"", blog:j.results.blog||"", cafe:j.results.cafe||"", youtube:j.results.youtube||"", page:j.results.page||"", home:j.results.home||"", report:j.results.report||"", reportTopic:j.results.reportTopic||"", pageProduct:j.results.pageProduct||"", homeTopic:j.results.homeTopic||"", pageDropped:!!j.results.pageDropped, homeDropped:!!j.results.homeDropped });
+  res.json({ ok:true, id:j.id, topic:j.topic, viral:j.results.viral||null, osera:j.results.osera||null, sns:j.results.sns||"", blog:j.results.blog||"", cafe:j.results.cafe||"", youtube:j.results.youtube||"", page:j.results.page||"", home:j.results.home||"", report:j.results.report||"", reportTopic:j.results.reportTopic||"", pageProduct:j.results.pageProduct||"", homeTopic:j.results.homeTopic||"", pageDropped:!!j.results.pageDropped, homeDropped:!!j.results.homeDropped });
 });
 // 예약 등록/목록/삭제 (1회/매일/매주)
 app.post("/api/cycle/reserve", (req,res)=>{
@@ -7254,6 +8397,11 @@ async function runDesignJob(id, appUrl){
     if(url){ setStep("참고 URL 학습 중"); try{ await learnFromWebUrls(d, [url]); }catch(_){ job._warn="참고 URL 학습 일부 실패; "; } }
     const kb = knowledgeText(d);
     const isRevise = !!(job.baseOutput && job.feedback);
+    // 📚 v237: 만들기 전 — 경험 전부 훑기
+    let dExpBrief = "";
+    if(!isRevise && expSweepOn()){
+      try{ dExpBrief = await experienceBriefing(curProjectId(), spec.label+" "+brief.slice(0,150), "", setStep); }catch(e){}
+    }
     let sys, user;
     if(spec.html){
       if(isRevise){
@@ -7276,13 +8424,17 @@ async function runDesignJob(id, appUrl){
               +"무드: "+(vj.mood||"")+"\n"+(pal?("팔레트:\n"+pal+"\n"):"")
               +(vj.typography?("타이포: 제목 "+(vj.typography.heading||"")+" / 본문 "+(vj.typography.body||"")+"\n"):"")
               +(vj.layout?("레이아웃: "+vj.layout+"\n"):"")+(vj.signature?("시그니처: "+vj.signature):"");
-            job.visualDirection = vj; }
+            job.visualDirection = vj;
+            try{ recordExperience({ type:"idea", kind:spec.label, topic: brief.slice(0,80),
+              note: "비주얼 디렉션: "+(vj.aesthetic||"")+" / "+(vj.reference||""),
+              body: JSON.stringify(vj).slice(0,2000) }); }catch(_){}
+          }
         }catch(_){}
         setStep("디자인 코딩 중");
         sys = "너는 민앤팜(전남 고흥 특산물)의 '"+a.no+" "+a.kr+"' 수석 웹디자이너다. "+ADDRESS
           + " 아래 요청으로 '실제로 바로 열리는 완성형 단일 HTML 문서'를 만들어라. "+spec.hint
           + " ★필수: 콘텐츠는 자바스크립트 없이도 즉시 보여야 한다. opacity:0 / visibility:hidden 상태로 시작해서 JS(IntersectionObserver 등)로 나타나게 하는 스크롤 리빌은 금지 — JS가 한 줄이라도 실패하면 페이지 전체가 백지가 된다. 애니메이션은 CSS @keyframes로만, 끝난 상태가 아니라 처음부터 보이는 상태에서 시작하라(animation-fill-mode 의존 금지). localStorage·sessionStorage·쿠키는 절대 쓰지 마라(샌드박스에서 예외를 던져 스크립트가 죽는다). 반드시: (1) <!DOCTYPE html>~</html> 완전한 문서, CSS는 <style>에 인라인. (2) 고급스러운 여백·타이포·색감, 모바일 반응형. (3) 사진 자리는 <div class=\"img-ph\">[이미지: 묘사]</div> 플레이스홀더. (4) 과장광고 금지. (5) 'AI가 만든 흔한 웹' 티 금지 — 보라→인디고 그라디언트, Inter류 기본 폰트, '가운데 정렬 큰 제목+아이콘 카드 3개' 같은 클리셰(분포 수렴)를 피하고, 위 비주얼 디렉션의 미학·레퍼런스·색·폰트·레이아웃을 실제로 구현하며 시그니처 요소를 눈에 띄게 살려라. 설명·마크다운 없이 HTML만."
-          + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + designSystemBlock() + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext();
+          + (kb?("\n\n[축적 웹디자인 노하우·취향]\n"+kb):"") + visualBlock + designSystemBlock() + dExpBrief + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext(spec.label+" "+brief.slice(0,200));
         user = "요청: "+spec.label+"\n브리프: "+brief+(url?("\n참고(학습됨): "+url):"");
       }
       setStep("마무리 중");
@@ -7305,6 +8457,19 @@ async function runDesignJob(id, appUrl){
           }catch(e){ break; }
         }
       }
+      // 👑 오세라 최종 검수
+      if(!isRevise){
+        try{
+          const g = await oseraGate(spec.label, html, brief, async function(fx, iss){
+            const fs2 = sys + "\n\n[👑 총괄 오세라의 최종 지적 — 전부 반영해 완전한 단일 HTML을 다시 출력하라]\n"
+              + (iss&&iss.length?("· "+iss.join("\n· ")+"\n"):"") + "가장 중요한 수정: " + fx;
+            const o = await anthropic(fs2, "[현재 HTML]\n"+html.slice(0,14000), 8000);
+            return String(o).replace(/^```html\s*/i,"").replace(/^```\s*/,"").replace(/```\s*$/,"").trim();
+          }, setStep, { memo: String(memo||"").slice(0,1200), brief: brief });
+          if(g.content && g.content.length>300) html = g.content;
+          job.osera = g.review; job.oseraPassed = g.passed;
+        }catch(e){}
+      }
       job.output = html; job.isHtml = true;
     } else {
       setStep("구성안 작성 중");
@@ -7313,7 +8478,19 @@ async function runDesignJob(id, appUrl){
         + (kb?("\n\n[축적 노하우]\n"+kb):"") + (memo?("\n\n[클라이언트 지시 — 반드시 반영]\n"+memo):"") + profileContext();
       user = "요청: "+spec.label+"\n브리프: "+brief+(url?("\n참고(학습됨): "+url):"")+(isRevise?("\n\n[기존안]\n"+job.baseOutput+"\n\n[수정 요청]\n"+job.feedback):"");
       const txt = await anthropic(sys, user, 2500);
-      job.output = String(txt).trim(); job.isHtml = false;
+      let _t = String(txt).trim();
+      if(!isRevise){
+        try{
+          const g = await oseraGate(spec.label, _t, brief, async function(fx, iss){
+            const fs2 = sys + "\n\n[👑 총괄 오세라의 최종 지적 — 전부 반영해 다시 써라]\n"
+              + (iss&&iss.length?("· "+iss.join("\n· ")+"\n"):"") + "가장 중요한 수정: " + fx;
+            return await anthropic(fs2, "[현재 결과물]\n"+_t.slice(0,8000), 4000);
+          }, setStep, { memo: String(memo||"").slice(0,1200), brief: brief });
+          if(g.content && g.content.trim().length>20) _t = g.content.trim();
+          job.osera = g.review; job.oseraPassed = g.passed;
+        }catch(e){}
+      }
+      job.output = _t; job.isHtml = false;
     }
     // 결과에서 배운 것 누적(웹디자인 부서 성장)
     try{ await accumulateFromResult(d, spec.label+" · "+String(job.brief||"").slice(0,30), String(job.output||"").slice(0,1500), ""); }catch(_){}
@@ -7321,11 +8498,24 @@ async function runDesignJob(id, appUrl){
     const base=String(appUrl||(DB.state&&DB.state.appBase)||"").replace(/\/$/,"");
     try{ kakaoNotify("🎨 디자인 완료 — "+spec.label+"\n"+String(job.brief||"").slice(0,40)+"\n앱 '✍️ 만들기 > 🎨 디자인'에서 확인하세요.", base); }catch(_){}
   }catch(e){
-    job.status="error"; job.error=String(e.message||e); job.doneAt=Date.now(); job.step="실패"; saveDB();
+    failJob(job, e, "design-job");
     try{ kakaoNotify("⚠️ 디자인 생성 실패\n"+String(e.message||e).slice(0,140)); }catch(_){}
     logError("runDesignJob", e);
   }finally{ endJobMode(); }
 }
+// v228: 실패한 작업을 원본 입력 그대로 다시 실행 (목록 응답은 brief가 잘려 있어 프론트가 재구성하면 안 된다)
+app.post("/api/design/retry", (req,res)=>{
+  const id = String((req.body&&req.body.id)||"");
+  const old = (DB.designJobs||[]).find(x=>x.id===id);
+  if(!old) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
+  DB.designJobs = DB.designJobs || [];
+  const job = { id:String(Date.now())+"_d"+Math.floor(Math.random()*1000),
+    kind:old.kind, brief:old.brief, memo:old.memo||"", url:old.url||"",
+    status:"queued", at:Date.now(), retryOf:old.id };
+  DB.designJobs.push(job); trimDesignJobs(); saveDB();
+  res.json({ ok:true, jobId:job.id, status:"queued" });
+  setImmediate(()=>{ runDesignJob(job.id, String((req.body&&req.body.appUrl)||"")).catch(e=>logError("design-retry", e)); });
+});
 app.post("/api/design/start", (req,res)=>{
   try{
     const b = req.body || {};
@@ -7346,18 +8536,18 @@ app.post("/api/design/start", (req,res)=>{
 app.get("/api/design/status", (req,res)=>{
   const j = (DB.designJobs||[]).find(x=>x.id===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"작업을 찾을 수 없어요" });
-  res.json({ ok:true, id:j.id, kind:j.kind, status:j.status, step:j.step||"", error:j.error||"", warn:j._warn||"", isHtml:!!j.isHtml, doneAt:j.doneAt||0 });
+  res.json({ ok:true, id:j.id, kind:j.kind, status:j.status, step:j.step||"", error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0, warn:j._warn||"", isHtml:!!j.isHtml, doneAt:j.doneAt||0 });
 });
 app.get("/api/design/list", (req,res)=>{
   const jobs = (DB.designJobs||[]).slice(-14).reverse().map(j=>({
     id:j.id, kind:j.kind, kindLabel:(DESIGN_KINDS[j.kind]?DESIGN_KINDS[j.kind].label:j.kind), brief:String(j.brief||"").slice(0,60),
-    status:j.status, step:j.step||"", isHtml:!!j.isHtml, at:j.at, doneAt:j.doneAt||0, outputDropped:!!j.outputDropped, error:j.error||"" }));
+    status:j.status, step:j.step||"", isHtml:!!j.isHtml, at:j.at, doneAt:j.doneAt||0, outputDropped:!!j.outputDropped, error:j.error||"", failStep:j.failStep||"", errorKo:j.errorKo||"", errorFix:j.errorFix||"", errorRaw:j.errorRaw||"", errorKind:j.errorKind||"", failedAt:j.failedAt||0 , osera:j.osera||null, oseraPassed:j.oseraPassed!==false }));
   res.json({ ok:true, jobs });
 });
 app.get("/api/design/get", (req,res)=>{
   const j = (DB.designJobs||[]).find(x=>x.id===String(req.query.id||""));
   if(!j) return res.status(404).json({ error:"결과가 없어요" });
-  res.json({ ok:true, id:j.id, kind:j.kind, kindLabel:(DESIGN_KINDS[j.kind]?DESIGN_KINDS[j.kind].label:j.kind), brief:j.brief||"", isHtml:!!j.isHtml, output:j.output||"", outputDropped:!!j.outputDropped });
+  res.json({ ok:true, osera:j.osera||null, oseraPassed:j.oseraPassed!==false, id:j.id, kind:j.kind, kindLabel:(DESIGN_KINDS[j.kind]?DESIGN_KINDS[j.kind].label:j.kind), brief:j.brief||"", isHtml:!!j.isHtml, output:j.output||"", outputDropped:!!j.outputDropped });
 });
 app.post("/api/design/feedback", (req,res)=>{
   const b = req.body || {};
@@ -7875,7 +9065,7 @@ async function runProjectMeeting(opts){
     try{ kakaoNotify("🏢 프로젝트 회의 완료: "+topic+"\n"+tag+"\n샘플 "+pm.samples.length+"건 · "+depts.map(d=>AGENTS[d].kr).join(", ")+"\n앱 '🚀 프로젝트'에서 결과물을 확인하세요.", String(opts.appUrl||(DB.state&&DB.state.appBase)||"")).catch(()=>{}); }catch(_){}
     return pm;
   }catch(e){
-    pm.status="error"; pm.error=String(e.message||e).slice(0,200); pm.doneAt=Date.now(); saveDB();
+    failJob(pm, e, "project-meeting");
     logError("runProjectMeeting", e); throw e;
   }
 }
