@@ -6821,9 +6821,12 @@ function buildLeaderReport(){
   reviewedDepts.forEach(d=>{ const g=rev[d].grade; if(grades[g]!=null) grades[g]++; });
   const researchedToday = depts.filter(d=> nr[d] && nr[d].day===today);
   const websearched = researchedToday.filter(d=> nr[d].searched).length;
+  const al = DB.autoLearn || { day:"", steps:{}, lastAt:0, lastErr:"" };
   return {
     day: today,
     leaderAutoOn,
+    dailyLearnOn: ((DB.state||{}).dailyLearnOn !== false),
+    autoLearn: { day: al.day||"", steps: al.steps||{}, lastAt: al.lastAt||0, lastErr: al.lastErr||"" },
     directed: directedToday,
     reviewed: reviewedDepts.length,
     grades,
@@ -9250,6 +9253,12 @@ setInterval(async ()=>{
   const hm = kstHHMM(), day = kstDay(), dow = kstDow(), nowMs = Date.now();
   const autoOK = geminiAutoAllowed(); // Gemini 월 예산(₩) 안에서만 자동 지능작업 수행(초과 시 잠시 멈춤·다음날/다음달 재개)
   const leaderAuto = autoOK && ((DB.state||{}).leaderAutoOn === true); // 기본 OFF: 자동 백그라운드 지능작업(토큰 소모)은 사용자가 명시적으로 켤 때만 실행. 수동 URL 학습은 이 스위치와 무관하게 항상 동작.
+  // v249: 【매일 자동학습】 — 비싼 자동작업(리뷰·분석·개선제안·에버그린)과 분리한 저비용 학습 라인.
+  //   leaderAutoOn(전체 자동)이 꺼져 있어도, dailyLearnOn(기본 ON)이면 하루 1회 '연구 → 팀장 지시 → 부서 학습'은 반드시 돈다.
+  const dailyLearn = autoOK && ((DB.state||{}).dailyLearnOn !== false);
+  DB.autoLearn = DB.autoLearn || { day:"", steps:{}, lastAt:0, lastErr:"" };
+  function markLearn(step, ok, err){ try{ const d=kstDay(); if(DB.autoLearn.day!==d){ DB.autoLearn.day=d; DB.autoLearn.steps={}; DB.autoLearn.lastErr=""; }
+    DB.autoLearn.steps[step]= ok?"ok":"fail"; DB.autoLearn.lastAt=Date.now(); if(!ok&&err) DB.autoLearn.lastErr=step+": "+String(err&&err.message||err).slice(0,160); saveDB(); }catch(_){} }
   // (0-b) 팀장 브리핑: 아침(오늘 할 일)·저녁(오늘 한 일)·주간(한 주 종합) — 자동이므로 무료(Gemini)
   try {
     const st = DB.state || {};
@@ -9296,19 +9305,19 @@ setInterval(async ()=>{
     }
   } catch(e){ /* 성과 수집 실패 무시 */ }
   try {
-    if (leaderAuto && DB.lastNightResearchDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
-      const kh = kstNow().getUTCHours();
-      if (kh < 6) { // 자정~새벽 5시대 (아침 지시 배정 전)
-        DB.lastNightResearchDay = day; saveDB(); // 선점
-        runNightResearch().then(()=>console.log("야간 연구 완료")).catch(e=>logError("night-research", e));
-      }
+    if ((leaderAuto || dailyLearn) && DB.lastNightResearchDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+      // v249: 시간대 제한 제거 — 무료 서버는 새벽에 잠들어 있어 "새벽에만" 조건이면 영원히 실행되지 않았다.
+      //       서버가 깨어 있는 아무 시각에나 하루 1회 실행하고, 실패하면 그날 안에 다시 시도한다.
+      DB.lastNightResearchDay = day; saveDB(); // 선점
+      runNightResearch().then(()=>{ markLearn("research", true); console.log("일일 연구 완료"); })
+        .catch(e=>{ logError("night-research", e); DB.lastNightResearchDay=""; markLearn("research", false, e); });
     }
   } catch(e){ /* 야간 연구 실패 무시 */ }
   // (0-b4) 자동 벤치마크 학습: 하루 1회, 부서를 하나씩 돌아가며 웹·유튜브에서 고품질 사례를 조사·학습(품질 공식 축적)
   //   ※ 시간대를 제한하지 않음 — 무료 서버는 새벽에 잠들어 있어(cron 활성시간이 낮이면) 새벽 조건이면 영원히 안 돌기 때문
   try {
     const st7 = DB.state || {};
-    if (leaderAuto && st7.benchmarkLearnOn !== false && DB.lastBenchmarkDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+    if ((leaderAuto || dailyLearn) && st7.benchmarkLearnOn !== false && DB.lastBenchmarkDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
       DB.lastBenchmarkDay = day;
       const order = Object.keys(DEPT_BENCHMARK);
       DB.benchmarkTurn = ((DB.benchmarkTurn||0)) % order.length;
@@ -9321,9 +9330,9 @@ setInterval(async ()=>{
             const src=(r.sources&&r.sources.length)?("\n\n출처: "+r.sources.map(s=>s.title||s.uri).slice(0,2).join(" · ")):"";
             kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 '"+r.benchmark+"'를 학습해 품질 공식을 갱신했어요"+(learned?("\n\n📌 배운 것:\n"+learned):"")+src);
           }catch(_){}
-          console.log("벤치마크 학습 완료: "+dept); }
-        else { console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note)); DB.lastBenchmarkDay=""; saveDB(); } // 실패 시 오늘 재시도 허용
-      }).catch(e=>{ logError("benchmark-learn", e); DB.lastBenchmarkDay=""; try{saveDB();}catch(_){} });
+          markLearn("benchmark", true); console.log("벤치마크 학습 완료: "+dept); }
+        else { console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note)); DB.lastBenchmarkDay=""; markLearn("benchmark", false, (r&&r.note)||"보류"); } // 실패 시 오늘 재시도 허용
+      }).catch(e=>{ logError("benchmark-learn", e); DB.lastBenchmarkDay=""; markLearn("benchmark", false, e); });
     }
   } catch(e){ /* 벤치마크 학습 실패 무시 */ }
   // (0-b5) 팀장 자가진단: 시키지 않아도 주 1회 스스로 플랫폼을 살펴보고 개선 가이드라인을 제안
@@ -9367,11 +9376,12 @@ setInterval(async ()=>{
   } catch(e){ /* 매일 성장 실패 무시 */ }
   // (0-f2) 팀장의 매일 자율수행 지시 배정 — 자동성장이 꺼져 있어도 독립적으로 매일 보장
   try {
-    if (leaderAuto && DB.lastLeaderDirectDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+    if ((leaderAuto || dailyLearn) && DB.lastLeaderDirectDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
       const kstHour2 = kstNow().getUTCHours();
       if (kstHour2 >= 6) { // 새벽 6시 이후, 하루 한 번
         DB.lastLeaderDirectDay = day; saveDB(); // 선점
-        assignDailyDirectives().then(()=>console.log("팀장 일일 지시 배정 완료")).catch(e=>logError("daily-directives", e));
+        assignDailyDirectives().then(()=>{ markLearn("directives", true); console.log("팀장 일일 지시 배정 완료"); })
+          .catch(e=>{ logError("daily-directives", e); DB.lastLeaderDirectDay=""; markLearn("directives", false, e); }); // v249: 실패하면 그날 다시 시도(하루를 통째로 잃지 않게)
       }
     }
   } catch(e){ /* 일일 지시 실패 무시 */ }
@@ -9382,7 +9392,7 @@ setInterval(async ()=>{
       const everyH = Number.isFinite(+st3.trainEveryH) ? Math.max(2, +st3.trainEveryH) : 12;
       if (Date.now() - (DB.lastTrainRoundAt||0) >= everyH*3600000) {
         DB.lastTrainRoundAt = Date.now(); saveDB(); // 선점
-        runTrainingRound(2).then(done=>{ if(done&&done.length){ try{ kakaoNotify("🏋️ 지식 훈련 — 부서가 스스로 실력을 단련했어요\n\n"+done.map(x=>"· "+x.name+": "+x.what).join("\n")); }catch(_){} } console.log("자기 훈련 라운드 완료"); }).catch(e=>logError("auto-train", e));
+        runTrainingRound(2).then(done=>{ markLearn("train", true); if(done&&done.length){ try{ kakaoNotify("🏋️ 지식 훈련 — 부서가 스스로 실력을 단련했어요\n\n"+done.map(x=>"· "+x.name+": "+x.what).join("\n")); }catch(_){} } console.log("자기 훈련 라운드 완료"); }).catch(e=>{ logError("auto-train", e); DB.lastTrainRoundAt=0; markLearn("train", false, e); });
       }
     }
   } catch(e){ /* 훈련 실패 무시 */ }
