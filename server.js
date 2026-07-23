@@ -170,6 +170,79 @@ setInterval(()=>{ runPublishScheduler().catch(e=>console.error("스케줄러 예
 setTimeout(()=>{ runPublishScheduler().catch(()=>{}); }, 30000);  // 부팅 30초 뒤 1회
 
 // ─────────────────────────────────────────────────────────────
+// v254: 통합 인증
+//   관제탑(Streamlit)과 v249 앱이 각각 따로 로그인하던 것을 백엔드로 일원화한다.
+//   토큰은 상태를 저장하지 않는 서명 방식이라 서버가 재시작해도 유효하다.
+//   (무료 인스턴스는 자주 재시작되므로 메모리 저장은 부적합)
+// ─────────────────────────────────────────────────────────────
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "";
+const REQUIRE_AUTH   = /^(1|true|yes|on)$/i.test(process.env.REQUIRE_AUTH || "");
+const TOKEN_TTL_MS   = 7 * 24 * 60 * 60 * 1000;   // 7일
+
+function signToken(expMs){
+  const h = crypto.createHmac("sha256", ADMIN_PASSWORD || "no-password")
+                  .update(String(expMs)).digest("hex").slice(0, 32);
+  return Buffer.from(String(expMs)).toString("base64url") + "." + h;
+}
+function issueToken(){
+  const exp = Date.now() + TOKEN_TTL_MS;
+  return { token: signToken(exp), expires: exp };
+}
+function verifyToken(tok){
+  if (!ADMIN_PASSWORD) return true;              // 비밀번호 미설정이면 통과
+  if (!tok || typeof tok !== "string") return false;
+  const [b64, sig] = tok.split(".");
+  if (!b64 || !sig) return false;
+  let exp;
+  try { exp = Number(Buffer.from(b64, "base64url").toString()); } catch { return false; }
+  if (!exp || Date.now() > exp) return false;
+  const expected = signToken(exp).split(".")[1];
+  // 타이밍 공격 방지
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  } catch { return false; }
+}
+function tokenFromReq(req){
+  const h = req.headers["authorization"] || "";
+  if (h.startsWith("Bearer ")) return h.slice(7).trim();
+  return req.headers["x-auth-token"] || (req.query && req.query.token) || "";
+}
+
+// 인증 없이도 열려 있어야 하는 경로
+const AUTH_FREE = new Set(["/api/ping", "/api/login", "/api/auth-check", "/api/health"]);
+
+app.use((req, res, next)=>{
+  if (!REQUIRE_AUTH) return next();
+  if (!req.path.startsWith("/api/")) return next();
+  if (AUTH_FREE.has(req.path)) return next();
+  if (verifyToken(tokenFromReq(req))) return next();
+  return res.status(401).json({ ok:false, error:"인증이 필요합니다", code:"AUTH_REQUIRED" });
+});
+
+app.post("/api/login", (req, res)=>{
+  const pw = String((req.body && req.body.password) || "");
+  if (!ADMIN_PASSWORD){
+    // 비밀번호가 설정되지 않은 상태 — 잠기지 않도록 통과시키되 경고를 준다
+    return res.json({ ok:true, ...issueToken(), warning:"ADMIN_PASSWORD 미설정: 누구나 접속 가능합니다" });
+  }
+  let ok = false;
+  try {
+    const a = Buffer.from(pw), b = Buffer.from(ADMIN_PASSWORD);
+    ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch { ok = false; }
+  if (!ok) return res.status(401).json({ ok:false, error:"비밀번호가 올바르지 않습니다" });
+  res.json({ ok:true, ...issueToken() });
+});
+
+app.get("/api/auth-check", (req, res)=>{
+  res.json({
+    ok: verifyToken(tokenFromReq(req)),
+    required: REQUIRE_AUTH,
+    passwordSet: !!ADMIN_PASSWORD
+  });
+});
+
+// ─────────────────────────────────────────────────────────────
 // v253: Threads 발행 · 자동 답글
 //   Streamlit 관제탑은 유휴 시 잠들어 예약 발행과 댓글 감시를 못 한다.
 //   토큰도 한 군데서만 관리해야 갱신 시 빠뜨리지 않는다. 그래서 여기에 둔다.
