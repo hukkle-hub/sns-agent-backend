@@ -94,6 +94,235 @@ async function supaLoadBackup(){
   const rows = await r.json();
   return (Array.isArray(rows) && rows[0] && rows[0].data) ? rows[0].data : null;
 }
+// ─────────────────────────────────────────────────────────────
+// v252: 예약 발행 스케줄러
+//   Streamlit(관제탑)은 무료 인스턴스라 유휴 시 잠들어 예약 발사를 못 한다.
+//   이 백엔드는 13분 자기-핑으로 항상 깨어 있으므로 여기서 발사한다.
+// ─────────────────────────────────────────────────────────────
+const PUBLISH_TABLE = "content_generations";
+const SCHED_INTERVAL_MS = 5 * 60 * 1000;   // 5분마다 점검
+
+async function fetchDuePublishes(){
+  const now = new Date().toISOString();
+  const url = SUPA_URL + "/rest/v1/" + PUBLISH_TABLE
+    + "?publish_status=eq.scheduled&scheduled_at=lte." + encodeURIComponent(now)
+    + "&select=generation_id,topic,ai_raw_output,human_modified_output,channel_outputs,target_channel,threads_chain"
+    + "&limit=10";
+  const r = await fetch(url, { headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY } });
+  if (!r.ok) throw new Error("fetchDue HTTP "+r.status);
+  return await r.json();
+}
+
+async function markPublish(id, patch){
+  await fetch(SUPA_URL+"/rest/v1/"+PUBLISH_TABLE+"?generation_id=eq."+id, {
+    method:"PATCH",
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY, "Content-Type":"application/json" },
+    body: JSON.stringify(patch)
+  });
+}
+
+async function runPublishScheduler(){
+  if (!useSupabase) return;
+  const hook = process.env.N8N_WEBHOOK_URL || "";
+  let due = [];
+  try { due = await fetchDuePublishes(); }
+  catch(e){ console.error("예약 조회 실패:", String(e&&e.message||e)); return; }
+  if (!Array.isArray(due) || !due.length) return;
+
+  for (const row of due){
+    const id = row.generation_id;
+    const text = row.human_modified_output || row.ai_raw_output || "";
+    const ch = String(row.target_channel||"");
+    try {
+      // v253: 스레드 채널이면 웹훅이 아니라 Threads API 로 직접 발행
+      if (ch.includes("스레드") || ch.toLowerCase().includes("threads")){
+        const chain = Array.isArray(row.threads_chain) ? row.threads_chain : [];
+        if (!chain.length) throw new Error("threads_chain 이 비어 있습니다");
+        const ids = await threadsPublishChain(chain, id);
+        await markPublish(id, { publish_status:"published", published_at:new Date().toISOString(), publish_error:null });
+        console.log("스레드 예약 발행 완료:", id, ids.length+"건");
+        continue;
+      }
+      if (!hook) throw new Error("N8N_WEBHOOK_URL 미설정");
+      const res = await fetch(hook, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({
+          content_id: id,
+          topic: row.topic || "",
+          final_text: text,
+          channels: row.channel_outputs || null,
+          target_channel: row.target_channel || ""
+        })
+      });
+      if (!res.ok) throw new Error("웹훅 HTTP "+res.status);
+      await markPublish(id, { publish_status:"published", published_at:new Date().toISOString(), publish_error:null });
+      console.log("예약 발행 완료:", id, row.topic||"");
+    } catch(e){
+      const msg = String(e&&e.message||e).slice(0,300);
+      await markPublish(id, { publish_status:"failed", publish_error:msg }).catch(()=>{});
+      console.error("예약 발행 실패:", id, msg);
+    }
+  }
+}
+
+setInterval(()=>{ runPublishScheduler().catch(e=>console.error("스케줄러 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
+setTimeout(()=>{ runPublishScheduler().catch(()=>{}); }, 30000);  // 부팅 30초 뒤 1회
+
+// ─────────────────────────────────────────────────────────────
+// v253: Threads 발행 · 자동 답글
+//   Streamlit 관제탑은 유휴 시 잠들어 예약 발행과 댓글 감시를 못 한다.
+//   토큰도 한 군데서만 관리해야 갱신 시 빠뜨리지 않는다. 그래서 여기에 둔다.
+// ─────────────────────────────────────────────────────────────
+const TH_BASE = "https://graph.threads.net/v1.0";
+const TH_TEXT_LIMIT = 500;
+const TH_POLL_MS = 10 * 60 * 1000;   // 댓글 감시 주기
+
+async function supaSelect(table, query){
+  const r = await fetch(SUPA_URL+"/rest/v1/"+table+"?"+query, {
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY }
+  });
+  if (!r.ok) throw new Error(table+" select HTTP "+r.status);
+  return await r.json();
+}
+async function supaInsert(table, row){
+  const r = await fetch(SUPA_URL+"/rest/v1/"+table, {
+    method:"POST",
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
+              "Content-Type":"application/json", Prefer:"return=minimal" },
+    body: JSON.stringify([row])
+  });
+  return r.ok;
+}
+
+// 토큰은 registered_services 에 등록된 것을 우선 쓰고, 없으면 환경변수
+async function threadsCreds(){
+  if (useSupabase){
+    try {
+      const rows = await supaSelect("registered_services",
+        "service_type=eq.Threads%20API&is_active=eq.true&select=api_key,endpoint_url&limit=1");
+      if (rows && rows[0] && rows[0].api_key && rows[0].endpoint_url){
+        return { token: rows[0].api_key, userId: rows[0].endpoint_url };
+      }
+    } catch(e){ /* 환경변수로 폴백 */ }
+  }
+  return {
+    token: process.env.THREADS_ACCESS_TOKEN || "",
+    userId: process.env.THREADS_USER_ID || ""
+  };
+}
+
+async function thPost(userId, token, path, body){
+  const form = new URLSearchParams({ ...body, access_token: token });
+  const r = await fetch(`${TH_BASE}/${path}`, {
+    method:"POST",
+    headers:{ "Content-Type":"application/x-www-form-urlencoded" },
+    body: form
+  });
+  const j = await r.json().catch(()=>({}));
+  if (j.error) throw new Error((j.error.code||"")+" "+(j.error.message||""));
+  if (!r.ok) throw new Error("HTTP "+r.status+": "+JSON.stringify(j).slice(0,200));
+  return j;
+}
+
+// 글 하나 발행 (컨테이너 생성 -> publish 2단계)
+async function threadsCreatePost(userId, token, text, replyToId){
+  const t = String(text||"").trim();
+  if (!t) throw new Error("본문이 비어 있습니다");
+  if (t.length > TH_TEXT_LIMIT) throw new Error(`본문 ${t.length}자, 최대 ${TH_TEXT_LIMIT}자`);
+  const payload = { media_type:"TEXT", text:t };
+  if (replyToId) payload.reply_to_id = String(replyToId);
+  const c = await thPost(userId, token, `${userId}/threads`, payload);
+  if (!c.id) throw new Error("컨테이너 생성 실패");
+  const p = await thPost(userId, token, `${userId}/threads_publish`, { creation_id: c.id });
+  if (!p.id) throw new Error("발행 실패");
+  return p.id;
+}
+
+// 체인 발행: 배치 API가 없어 앞 글 id 를 받아가며 순차로 올린다
+async function threadsPublishChain(parts, generationId){
+  const { token, userId } = await threadsCreds();
+  if (!token || !userId) throw new Error("Threads 인증정보가 없습니다");
+
+  const ids = [];
+  let parent = null;
+  for (let i=0; i<parts.length; i++){
+    try {
+      const id = await threadsCreatePost(userId, token, parts[i], parent);
+      ids.push(id); parent = id;
+      if (useSupabase){
+        await supaInsert("threads_posts", {
+          media_id:id, generation_id:generationId||null,
+          text_preview:String(parts[i]).slice(0,200), is_chain_head:(i===0)
+        }).catch(()=>{});
+      }
+    } catch(e){
+      // 이미 올라간 글은 되돌릴 수 없다. 어디까지 갔는지 알려야 한다.
+      throw new Error(`${i+1}번째 실패(${e.message}). 이미 발행됨 ${ids.length}건: ${ids.join(",")}`);
+    }
+    if (i < parts.length-1) await new Promise(r=>setTimeout(r, 2000));
+  }
+  return ids;
+}
+
+async function threadsLimit(){
+  const { token, userId } = await threadsCreds();
+  if (!token || !userId) return { error:"인증정보 없음" };
+  const r = await fetch(`${TH_BASE}/${userId}/threads_publishing_limit?fields=quota_usage,config&access_token=${encodeURIComponent(token)}`);
+  const j = await r.json().catch(()=>({}));
+  if (j.error) return { error:(j.error.message||"조회 실패") };
+  const row = (j.data||[{}])[0] || {};
+  const used = Number(row.quota_usage||0);
+  const total = Number((row.config||{}).quota_total||250);
+  return { used, total, remaining: Math.max(0, total-used) };
+}
+
+// 댓글 감시 → 키워드 자동 답글 (중복 방지 필수)
+async function threadsPollReplies(){
+  if (!useSupabase) return { skipped:"supabase off" };
+  const { token, userId } = await threadsCreds();
+  if (!token || !userId) return { skipped:"인증정보 없음" };
+
+  let rules = [], posts = [], repliedSet = new Set();
+  try {
+    rules = await supaSelect("threads_auto_replies", "is_active=eq.true&select=trigger_keyword,reply_content");
+    if (!rules.length) return { skipped:"활성 규칙 없음" };
+    posts = await supaSelect("threads_posts",
+      "watch_replies=eq.true&is_chain_head=eq.true&select=media_id&order=posted_at.desc&limit=20");
+    const done = await supaSelect("threads_replied", "select=reply_to_id");
+    repliedSet = new Set((done||[]).map(d=>d.reply_to_id));
+  } catch(e){ return { error:e.message }; }
+
+  let count = 0;
+  for (const p of posts){
+    let replies = [];
+    try {
+      const r = await fetch(`${TH_BASE}/${p.media_id}/replies?fields=id,text&access_token=${encodeURIComponent(token)}`);
+      const j = await r.json().catch(()=>({}));
+      replies = j.data || [];
+    } catch(e){ continue; }
+
+    for (const rep of replies){
+      if (!rep.id || repliedSet.has(rep.id)) continue;
+      const body = rep.text || "";
+      const hit = rules.find(ru => ru.trigger_keyword && body.includes(ru.trigger_keyword));
+      if (!hit) continue;
+      try {
+        await threadsCreatePost(userId, token, hit.reply_content, rep.id);
+        repliedSet.add(rep.id);
+        await supaInsert("threads_replied", {
+          reply_to_id:rep.id, media_id:p.media_id, keyword:hit.trigger_keyword
+        });
+        count++;
+        await new Promise(r=>setTimeout(r, 1500));
+      } catch(e){ console.error("자동 답글 실패:", e.message); }
+    }
+  }
+  return { replied: count };
+}
+
+setInterval(()=>{ threadsPollReplies().catch(e=>console.error("댓글 감시 예외:", e.message)); }, TH_POLL_MS);
+
 // 영구저장 라이브 점검: 실제로 테이블을 읽어 연결·권한·테이블 존재를 확인
 async function supaProbe(){
   if(!useSupabase) return { ok:false, note:"미설정 — 재배포 시 데이터 유실 가능" };
@@ -6564,6 +6793,33 @@ app.post("/api/cloud-backup", (req,res)=>{
     res.json({ ok:true, at:DB.cloudBackup.at, score:si, replacedScore:sp });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
+// ── Threads 엔드포인트 (관제탑이 호출) ────────────────────────
+app.get("/api/threads/limit", async (req,res)=>{
+  try { res.json(await threadsLimit()); }
+  catch(e){ res.status(500).json({ error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/threads/publish", async (req,res)=>{
+  try {
+    const chain = Array.isArray(req.body?.chain) ? req.body.chain : [];
+    if (!chain.length) return res.status(400).json({ ok:false, error:"chain 이 비어 있습니다" });
+
+    const lim = await threadsLimit();
+    if (!lim.error && lim.remaining < chain.length){
+      return res.status(429).json({ ok:false, error:`24시간 한도 부족 (남은 ${lim.remaining}건, 필요 ${chain.length}건)` });
+    }
+    const ids = await threadsPublishChain(chain, req.body?.generation_id || null);
+    res.json({ ok:true, ids, count:ids.length });
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e&&e.message||e) });
+  }
+});
+
+app.post("/api/threads/poll", async (req,res)=>{
+  try { res.json(await threadsPollReplies()); }
+  catch(e){ res.status(500).json({ error:String(e&&e.message||e) }); }
+});
+
 app.get("/api/cloud-backup", async (req,res)=>{
   let b = DB.cloudBackup||null;
   // v251: 재시작 후 메모리에 없으면 백업 전용 행에서 불러온다
