@@ -75,6 +75,25 @@ async function supaSave(data){
   if (!r.ok) throw new Error("supaSave HTTP "+r.status+": "+(await r.text().catch(()=>"")).slice(0,120));
   return true;
 }
+// v251: cloudBackup 은 본체 행에서 분리해 id='backup' 행에 따로 저장한다.
+//   기존에는 2.9MB짜리 백업 스냅샷이 매 저장마다 함께 전송되어 아웃바운드 대역폭의 64%를 먹었다.
+async function supaSaveBackup(b){
+  const r = await fetch(SUPA_URL+"/rest/v1/"+SUPA_TABLE+"?on_conflict=id", {
+    method:"POST",
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY, "Content-Type":"application/json", Prefer:"resolution=merge-duplicates" },
+    body: JSON.stringify([{ id:"backup", data:b, updated_at:Date.now() }])
+  });
+  if (!r.ok) throw new Error("supaSaveBackup HTTP "+r.status+": "+(await r.text().catch(()=>"")).slice(0,120));
+  return true;
+}
+async function supaLoadBackup(){
+  const r = await fetch(SUPA_URL+"/rest/v1/"+SUPA_TABLE+"?id=eq.backup&select=data", {
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY }
+  });
+  if (!r.ok) throw new Error("supaLoadBackup HTTP "+r.status);
+  const rows = await r.json();
+  return (Array.isArray(rows) && rows[0] && rows[0].data) ? rows[0].data : null;
+}
 // 영구저장 라이브 점검: 실제로 테이블을 읽어 연결·권한·테이블 존재를 확인
 async function supaProbe(){
   if(!useSupabase) return { ok:false, note:"미설정 — 재배포 시 데이터 유실 가능" };
@@ -172,6 +191,31 @@ function noteSaveFail(e){
   }
 }
 let _saveTimer = null;
+let _firstDirtyAt = 0;        // 디바운스가 계속 밀릴 때 강제 저장 기준
+let _lastSavedHash = "";      // 직전에 실제로 올린 페이로드 해시
+const SAVE_DEBOUNCE_MS = 20000;   // 잦은 변경을 20초로 모음
+const SAVE_MAX_WAIT_MS = 120000;  // 계속 바뀌어도 최대 2분 안에는 한 번 올림
+
+// v251: 본체 저장에서 cloudBackup 을 제외한다(별도 행에 저장).
+function mainPayload(){
+  const out = {};
+  for (const k in DB){ if (k !== "cloudBackup") out[k] = DB[k]; }
+  return out;
+}
+
+function flushSave(){
+  _saveTimer = null; _firstDirtyAt = 0;
+  let payload, body;
+  try {
+    payload = mainPayload();
+    body = JSON.stringify(payload);
+  } catch(e){ noteSaveFail(e); return; }
+  // v251: 내용이 직전 저장과 같으면 올리지 않는다(불필요한 업로드 제거)
+  const h = crypto.createHash("sha1").update(body).digest("hex");
+  if (h === _lastSavedHash){ _lastSaveOkAt = Date.now(); return; }
+  supaSave(payload).then(()=>{ _lastSavedHash = h; noteSaveOk(); }).catch(noteSaveFail);
+}
+
 function saveDB(){
   DB.updatedAt = Date.now();
   // 항상 로컬 파일에도 저장(Supabase 실패 대비 2차 백업)
@@ -189,9 +233,15 @@ function saveDB(){
       return;
     }
     if (dbHasContent(DB)) _lastGoodSavedContent = true;
-    // 잦은 호출을 모아 1.5초 디바운스로 업서트
+    // v251: 20초 디바운스 + 최대 2분 강제 저장 + 내용 동일 시 생략
+    if (!_firstDirtyAt) _firstDirtyAt = Date.now();
+    if (Date.now() - _firstDirtyAt >= SAVE_MAX_WAIT_MS){
+      if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
+      flushSave();
+      return;
+    }
     if (_saveTimer) clearTimeout(_saveTimer);
-    _saveTimer = setTimeout(()=>{ supaSave(DB).then(noteSaveOk).catch(noteSaveFail); }, 1500);
+    _saveTimer = setTimeout(flushSave, SAVE_DEBOUNCE_MS);
   }
 }
 let DB = emptyDB();
@@ -6507,12 +6557,20 @@ app.post("/api/cloud-backup", (req,res)=>{
       });
     }
     DB.cloudBackup = { at:Date.now(), data:incoming, score:si };
-    saveDB();
+    // v251: 본체가 아니라 백업 전용 행에 저장한다(본체 저장 페이로드에서 제외됨)
+    if (useSupabase){
+      supaSaveBackup(DB.cloudBackup).catch(e=>{ console.error("백업 행 저장 실패:", String(e&&e.message||e)); });
+    }
     res.json({ ok:true, at:DB.cloudBackup.at, score:si, replacedScore:sp });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
-app.get("/api/cloud-backup", (req,res)=>{
-  const b=DB.cloudBackup||null;
+app.get("/api/cloud-backup", async (req,res)=>{
+  let b = DB.cloudBackup||null;
+  // v251: 재시작 후 메모리에 없으면 백업 전용 행에서 불러온다
+  if ((!b || !b.data) && useSupabase){
+    try { b = await supaLoadBackup(); if (b) DB.cloudBackup = b; }
+    catch(e){ console.error("백업 행 읽기 실패:", String(e&&e.message||e)); }
+  }
   res.json({ ok:!!(b&&b.data), at:b?b.at:0, score:(b&&b.score)||0, data:b?b.data:null });
 });
 
