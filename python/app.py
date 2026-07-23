@@ -14,6 +14,13 @@ MAIN_WEB_APP_URL = "https://hukkle-hub.github.io/sns-agent-app/index.html"
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 N8N_WEBHOOK_URL = os.environ.get("N8N_WEBHOOK_URL", "")
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", "15"))
+# 스레드 발행·댓글 감시는 항상 깨어 있는 Node 백엔드가 담당한다.
+BACKEND_URL = os.environ.get("BACKEND_URL", "https://sns-agent-backend.onrender.com").rstrip("/")
+
+
+def auth_headers() -> dict:
+    t = st.session_state.get("auth_token", "")
+    return {"Authorization": f"Bearer {t}"} if t else {}
 SFT_GOAL = int(os.environ.get("SFT_GOAL", "300"))
 
 st.set_page_config(
@@ -78,13 +85,11 @@ st.markdown(
 # 🔐 보안 로그인
 # ---------------------------------------------------------------------------
 def check_password() -> bool:
-    if not ADMIN_PASSWORD:
-        st.error(
-            "⚠️ ADMIN_PASSWORD 가 설정되지 않았습니다. "
-            "이 주소를 아는 누구나 접속할 수 있습니다. Render 환경변수에 추가하세요."
-        )
-        return True
+    """백엔드(/api/login)에 물어본다. 비밀번호는 백엔드 환경변수 한 곳에만 둔다.
 
+    백엔드가 잠들어 있거나 응답이 없으면 로컬 ADMIN_PASSWORD 로 폴백한다.
+    (백엔드 장애로 관제탑까지 못 들어가는 상황을 막기 위함)
+    """
     if st.session_state.get("authenticated"):
         return True
 
@@ -94,11 +99,32 @@ def check_password() -> bool:
         st.info("태블릿 접근 권한 확인이 필요합니다.")
         pwd = st.text_input("🔑 관리자 비밀번호", type="password")
         if st.button("관제탑 접속", type="primary"):
-            if hmac.compare_digest(pwd, ADMIN_PASSWORD):
+            ok, token, msg = False, "", ""
+            try:
+                r = requests.post(
+                    f"{BACKEND_URL}/api/login", json={"password": pwd}, timeout=90
+                )
+                data = r.json()
+                ok = bool(data.get("ok"))
+                token = data.get("token", "")
+                msg = data.get("warning") or data.get("error") or ""
+            except Exception as e:
+                # 백엔드 미응답 → 로컬 폴백
+                if ADMIN_PASSWORD:
+                    ok = hmac.compare_digest(pwd, ADMIN_PASSWORD)
+                    msg = "백엔드 응답 없음 · 로컬 비밀번호로 확인했습니다"
+                else:
+                    st.error(f"백엔드에 연결할 수 없고 로컬 비밀번호도 없습니다: {e}")
+                    return False
+
+            if ok:
                 st.session_state["authenticated"] = True
+                st.session_state["auth_token"] = token
+                if msg:
+                    st.warning(msg)
                 st.rerun()
             else:
-                st.error("비밀번호가 올바르지 않습니다.")
+                st.error(msg or "비밀번호가 올바르지 않습니다.")
     return False
 
 
@@ -261,7 +287,11 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
 # --------------------------------------------------- TAB 1: 웹 앱 연동
 with tab1:
     st.caption(f"연동 주소: {MAIN_WEB_APP_URL} · [🔗 새 창 열기]({MAIN_WEB_APP_URL})")
-    components.iframe(MAIN_WEB_APP_URL, height=750, scrolling=True)
+    # 관제탑에서 이미 인증했으므로 토큰을 넘겨 앱이 다시 묻지 않게 한다.
+    # 해시(#) 뒤는 서버로 전송되지 않아 서버 로그에 토큰이 남지 않는다.
+    _tok = st.session_state.get("auth_token", "")
+    _url = f"{MAIN_WEB_APP_URL}#token={_tok}" if _tok else MAIN_WEB_APP_URL
+    components.iframe(_url, height=750, scrolling=True)
 
 
 # --------------------------------------------------- TAB 2: 작업 가동
@@ -458,27 +488,23 @@ def render_approval_control_center():
                     st.caption(f"🧵 스레드 체인 {len(chain)}개")
                     if st.button("🧵 스레드 발행", key=f"th_{content_id}", use_container_width=True):
                         try:
-                            tok, uid = db_manager.get_threads_credentials()
-                            if not (tok and uid):
-                                st.error("⚙️ 탭에서 Threads API 를 먼저 등록하세요.")
-                            elif db_manager.threads_posts_today() + len(chain) > 250:
-                                st.error("24시간 발행 한도(250건)에 걸립니다.")
-                            else:
-                                from threads_publisher import ThreadsAPI
-
-                                api = ThreadsAPI(tok, uid)
-                                ids = api.publish_chain(chain)
-                                for i, mid in enumerate(ids):
-                                    db_manager.record_threads_post(
-                                        mid, content_id, chain[i], i == 0
-                                    )
+                            r = requests.post(
+                                f"{BACKEND_URL}/api/threads/publish",
+                                json={"chain": chain, "generation_id": content_id},
+                                headers=auth_headers(),
+                                timeout=120,
+                            )
+                            out = r.json()
+                            if out.get("ok"):
                                 update_human_approval(
                                     content_id, edited_draft, "approved", original=ai_draft
                                 )
-                                st.success(f"스레드 {len(ids)}개 발행 완료")
+                                st.success(f"스레드 {out.get('count',0)}개 발행 완료")
                                 st.rerun(scope="app")
+                            else:
+                                st.error(f"발행 실패: {out.get('error','알 수 없음')}")
                         except Exception as e:
-                            st.error(f"스레드 발행 실패: {e}")
+                            st.error(f"백엔드 호출 실패: {e}")
 
                 if st.button("🚫 반려", key=f"rej_{content_id}"):
                     update_human_approval(content_id, edited_draft, "rejected", original=ai_draft)
@@ -594,21 +620,22 @@ with tab5:
         if not (tok and uid):
             st.info("위에서 Threads API 를 먼저 등록하세요.")
         else:
-            lim = None
+            st.caption(
+                f"발행과 댓글 감시는 백엔드(`{BACKEND_URL}`)가 처리합니다. "
+                "이 앱이 잠들어 있어도 예약 발행과 자동 답글은 계속 동작합니다."
+            )
             try:
-                from threads_publisher import ThreadsAPI, run_auto_reply
-
-                api = ThreadsAPI(tok, uid)
-                lim = api.publishing_limit()
+                lim = requests.get(f"{BACKEND_URL}/api/threads/limit", headers=auth_headers(), timeout=60).json()
+                if lim.get("error"):
+                    st.warning(f"한도 조회 실패: {lim['error']}")
+                else:
+                    st.metric(
+                        "24시간 발행 한도",
+                        f"{lim['used']} / {lim['total']}",
+                        delta=f"남은 {lim['remaining']}건",
+                    )
             except Exception as e:
-                st.warning(f"Threads 연결 확인 실패: {e}")
-
-            if lim and not lim.get("error"):
-                st.metric(
-                    "24시간 발행 한도",
-                    f"{lim['used']} / {lim['total']}",
-                    delta=f"남은 {lim['remaining']}건",
-                )
+                st.warning(f"백엔드 응답 없음: {e} (무료 인스턴스는 첫 호출이 느립니다)")
 
             with st.form("ar_form"):
                 k = st.text_input("트리거 키워드", placeholder="예: 자료")
@@ -644,25 +671,18 @@ with tab5:
                     db_manager.delete_auto_reply(r["reply_id"])
                     st.rerun()
 
-            watched = db_manager.watched_threads()
-            if watched and st.button(f"🔄 지금 댓글 확인 ({len(watched)}개 글)"):
-                rules = db_manager.list_auto_replies(active_only=True)
-                if not rules:
-                    st.warning("활성 규칙이 없습니다.")
-                else:
-                    already = db_manager.already_replied_ids()
-                    total = 0
-                    for w in watched:
-                        try:
-                            done = run_auto_reply(api, w["media_id"], rules, already)
-                            for d in done:
-                                db_manager.record_replied(
-                                    d["reply_to_id"], w["media_id"], d["keyword"]
-                                )
-                            total += len(done)
-                        except Exception as e:
-                            st.caption(f"{w['media_id'][:12]}… 확인 실패: {e}")
-                    st.success(f"자동 답글 {total}건 작성")
+            st.caption("백엔드가 10분마다 자동으로 확인합니다. 즉시 확인하려면 아래 버튼.")
+            if st.button("🔄 지금 댓글 확인"):
+                try:
+                    out = requests.post(f"{BACKEND_URL}/api/threads/poll", headers=auth_headers(), timeout=120).json()
+                    if out.get("skipped"):
+                        st.info(f"건너뜀: {out['skipped']}")
+                    elif out.get("error"):
+                        st.error(out["error"])
+                    else:
+                        st.success(f"자동 답글 {out.get('replied',0)}건 작성")
+                except Exception as e:
+                    st.error(f"백엔드 호출 실패: {e}")
 
         st.divider()
         try:
