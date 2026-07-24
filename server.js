@@ -4060,8 +4060,23 @@ async function work(dept, instruction, context, images, teamLog){
   if (_kb) sys += "\n\n[이 부서가 축적한 전문성·노하우(지식 베이스) — 모든 판단·작성의 기반으로 반드시 적용하라]\n" + _kb;
   const _rel = await relevantSmart(dept, instruction, 2);
   if (_rel) sys += "\n\n[이번 지시와 비슷한 과거 작업·수집 자료 — 처음부터 다시 조사하지 말고 이걸 재활용·갱신해 더 빠르고 정확하게 처리하라]\n" + _rel;
+  /* v269: 최근 결과물을 '참고'로 주면 자기 문체를 그대로 베끼게 된다.
+     저장되는 note 는 그 부서가 직접 쓴 답변 원문(500자)이라 강한 스타일 앵커가 된다.
+     그래서 작성자에게는 '이미 쓴 것 = 반복 금지' 로 용도를 뒤집어 준다.
+     사실·자료의 재활용은 위쪽 _rel(유사 과거 작업)이 이미 담당한다. */
   const mem = DB.deptMemory[dept] || [];
-  if (mem.length) sys += "\n\n[최근 작업·학습(단기 기억)]\n" + mem.slice(-4).map(x=>"· "+x.note).join("\n");
+  if (mem.length){
+    const recent = mem.slice(-4)
+      .map(x => String(x.note||"").replace(/\s+/g," ").trim().slice(0,150))
+      .filter(t => t.length > 20);
+    if (recent.length){
+      sys += "\n\n[이미 최근에 쓴 도입부·표현 — 반복하지 마라]\n"
+           + recent.map(t=>"· "+t+"…").join("\n")
+           + "\n같은 도입 방식, 같은 문장 구조, 같은 마무리를 다시 쓰지 마라."
+           + " 이번 건은 위와 뚜렷하게 다른 방식으로 시작하라."
+           + " (사실·자료는 재활용해도 되지만 표현은 새로 만들어라)";
+    }
+  }
   const crossMem = crossDeptMemory(dept);
   // 트렌드 소재화(10 탐색·발상): 팀장이 조사해온 최신 트렌드를 직접 이어받아 소재로 가공
   if (dept === "scout"){
@@ -5597,7 +5612,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v268";
+const SERVER_VERSION = "v269";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
