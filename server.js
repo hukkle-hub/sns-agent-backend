@@ -550,6 +550,86 @@ function specBlock(sp){
     + "성공 기준:\n"   + L("success_criteria") + "\n=== 끝 ===\n";
 }
 
+// v262: 작업이 죽었는지 알 방법이 없으면 원인도 알 수 없다.
+//   각 단계마다 신호를 남기고, 신호가 끊긴 작업은 감시견이 실패로 정리한다.
+//   (무료 인스턴스는 수시로 재시작되며 그때 백그라운드 작업은 흔적 없이 사라진다)
+const PIPE_STALL_MS  = 8 * 60 * 1000;    // 8분간 신호 없으면 죽은 것으로 본다
+const PIPE_WATCH_MS  = 4 * 60 * 1000;    // 감시 주기
+
+async function pipeBeat(genId, stage, note){
+  const patch = { heartbeat_at: new Date().toISOString(), stage: stage };
+  if (note) patch.ai_raw_output = note;
+  await supaPatch(CG_TABLE, "generation_id=eq."+genId, patch).catch(()=>{});
+}
+
+async function pipeWatchdog(){
+  if (!useSupabase) return;
+  try {
+    const cutoff = new Date(Date.now() - PIPE_STALL_MS).toISOString();
+    const rows = await supaSelect(CG_TABLE,
+      "approval_status=eq.processing&or=(heartbeat_at.lt."+cutoff+",heartbeat_at.is.null)"
+      + "&created_at.lt."+cutoff+"&select=generation_id,stage,topic&limit=20");
+    for (const r of (rows||[])){
+      await supaPatch(CG_TABLE, "generation_id=eq."+r.generation_id, {
+        approval_status: "failed",
+        blocked_reason: "작업이 중단되었습니다 (단계: " + (r.stage||"시작 전")
+          + "). 서버 재시작이나 응답 지연으로 진행 신호가 끊겼습니다. 다시 시도해 주세요.",
+        ai_raw_output: "❌ 중단됨 — " + (r.stage||"시작 전") + " 단계에서 신호가 끊겼습니다."
+      });
+      console.log("감시견: 중단 작업 정리", r.generation_id, r.stage||"-");
+    }
+  } catch(e){ console.error("감시견 예외:", String(e&&e.message||e)); }
+}
+
+setInterval(()=>{ pipeWatchdog().catch(()=>{}); }, PIPE_WATCH_MS);
+setTimeout(()=>{ pipeWatchdog().catch(()=>{}); }, 20000);   // 부팅 직후 1회 — 재시작으로 죽은 작업 정리
+
+/* v268: 판단의 보편성 검증.
+   우리 검수자가 74점을 매겼을 때, 그 74점이 옳은지 확인할 방법이 없었다.
+   같은 원고를 완전히 독립된 다른 모델에게도 채점시켜 두 판단을 대조한다.
+   두 판단이 갈리면 그 기준은 '우리 안에서만 통하는 것'일 가능성이 높다.
+   중요: 첫 번째 판단 결과를 알려주지 않는다. 알려주면 따라가 버린다. */
+const JUDGE_GAP_OK = 12;   // 이 이상 벌어지면 기준을 의심한다
+
+const CROSS_JUDGE_SYS = `아래 원고를 평가하고 JSON만 출력한다. 다른 사람의 평가는 참고하지 마라(주어지지도 않는다).
+
+[score 0~100] 결함: 과장광고, 사실오류, 채널 규칙 위반, CTA 부재를 감점.
+[creativity 0~100] 수준: 기본 50에서 시작한다.
+  - 첫 문장이 같은 주제의 흔한 글과 구별되는가
+  - 이 브랜드가 아니면 할 수 없는 말이 있는가
+  - 구성에 의도가 보이는가
+  - 읽고 나서 남는 것이 있는가
+  무난하고 매끄럽기만 하면 50점. 흔한 표현으로 채워졌으면 40점 이하.
+  '전문가가 썼다면 이 정도는 넘었을 것'을 기준선으로 삼아라.
+
+critique 에는 점수의 근거를 두 문장으로 적는다.
+{"score":0,"creativity":0,"critique":""}`;
+
+async function crossJudge(draft, channel){
+  try {
+    const raw = await geminiText(
+      CROSS_JUDGE_SYS + "\n\n작성 대상 채널: " + (channel||"미지정") +
+      "\n\n원고:\n" + String(draft||"").slice(0, 6000), 800);
+    const j = pipeJson(raw);
+    if (typeof j.creativity === "undefined") return null;
+    return {
+      score: Number(j.score||0),
+      creativity: Number(j.creativity||0),
+      critique: String(j.critique||"")
+    };
+  } catch(e){
+    console.error("교차 판단 실패:", String(e&&e.message||e));
+    return null;   // 실패해도 본 흐름은 계속된다
+  }
+}
+
+function judgmentNote(gap, ours, theirs){
+  if (gap === null) return "교차 판단 없음 — 보편성 미확인";
+  if (gap <= 5)  return "두 판단이 거의 일치 — 기준이 보편적으로 통함";
+  if (gap <= JUDGE_GAP_OK) return "판단 차이 보통 — 허용 범위";
+  return "판단이 크게 갈림(" + ours + " vs " + theirs + ") — 우리 기준이 밖에서 통하지 않을 수 있음. 사람 확인 필요";
+}
+
 async function pipeRun(genId, opts){
   const topic     = String(opts.topic||"").trim();
   const channels  = Array.isArray(opts.channels) ? opts.channels : [];
@@ -558,6 +638,7 @@ async function pipeRun(genId, opts){
 
   try {
     // ── 1. 디렉터
+    await pipeBeat(genId, "director", "⏳ 기준을 세우는 중...");
     const spec = pipeJson(await anthropic(
       DIRECTOR_SYS,
       "주제: "+topic+"\n대상 채널: "+(channels.join(", ")||"미지정")+
@@ -585,10 +666,11 @@ async function pipeRun(genId, opts){
           "\n위 기준에 맞춰 원고를 작성하라. 과장광고 표현과 근거 없는 수치는 쓰지 마라."
         : "이전 원고:\n"+draft+"\n\n고쳐야 할 것:\n"+critique+specBlock(spec)+answerBlock+ctx+
           "\n지적된 부분만 고쳐라. 지적되지 않은 부분은 그대로 두어라.";
+      await pipeBeat(genId, "write", "⏳ "+(rev+1)+"차 원고 작성 중...");
       draft = await anthropic("너는 전문 콘텐츠 작가다. 지시받은 기준을 그대로 지킨다.", wp, 4000);
       rev++;
-      await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
-        ai_raw_output: "⏳ "+rev+"차 원고 작성 완료 — 검수 중...", revision_count: rev });
+      await pipeBeat(genId, "critic", "⏳ "+rev+"차 원고 검수 중...");
+      await supaPatch(CG_TABLE, "generation_id=eq."+genId, { revision_count: rev });
 
       const c = pipeJson(await anthropic(
         CRITIC_SYS,
@@ -651,9 +733,29 @@ async function pipeRun(genId, opts){
       return;
     }
 
+    // ── 2.5 판단의 보편성 검증 (독립된 두 번째 판단자)
+    await pipeBeat(genId, "crossjudge", "⏳ 판단 검증 중...");
+    const cj = await crossJudge(draft, channels[0]);
+    let gap = null;
+    if (cj){
+      gap = Math.abs(creativity - cj.creativity);
+      await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+        cross_score: cj.score,
+        cross_creativity: cj.creativity,
+        cross_critique: cj.critique.slice(0, 1000),
+        judgment_gap: gap,
+        judgment_note: judgmentNote(gap, creativity, cj.creativity)
+      });
+      console.log("교차 판단:", genId, "우리"+creativity, "vs 상대"+cj.creativity, "차이"+gap);
+    } else {
+      await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+        judgment_note: judgmentNote(null) });
+    }
+
     // ── 3. 채널별 재가공
     let channelOutputs = null;
     if (channels.length){
+      await pipeBeat(genId, "adapt", "⏳ 채널별로 다시 쓰는 중...");
       const a = pipeJson(await anthropic(
         ADAPTER_SYS, "대상 채널: "+channels.join(", ")+"\n\n원고:\n"+draft+ctx, 4000));
       if (a && a.channels && typeof a.channels === "object") channelOutputs = a.channels;
@@ -662,6 +764,7 @@ async function pipeRun(genId, opts){
     // ── 4. 카드뉴스 (인스타 선택 시)
     let cards = null;
     if (channels.some(p=>/인스타|instagram/i.test(p))){
+      await pipeBeat(genId, "cards", "⏳ 카드뉴스 구성 중...");
       const k = pipeJson(await anthropic(CARD_SYS, draft, 3000));
       if (Array.isArray(k.cards)) cards = k.cards.slice(0,6);
     }
@@ -669,6 +772,7 @@ async function pipeRun(genId, opts){
     // ── 5. 스레드 체인 (스레드 선택 시)
     let chain = null;
     if (channels.some(p=>/스레드|threads/i.test(p))){
+      await pipeBeat(genId, "threads", "⏳ 스레드 체인 구성 중...");
       const t = pipeJson(await anthropic(THREADS_SYS, draft+ctx, 3000));
       if (Array.isArray(t.chain)){
         chain = t.chain.map(x=>String(x||"").trim()).filter(Boolean)
@@ -683,6 +787,8 @@ async function pipeRun(genId, opts){
       would_pay: wouldPay,
       revision_count: rev,
       approval_status: "pending",
+      stage: "done",
+      heartbeat_at: new Date().toISOString(),
       channel_outputs: channelOutputs,
       cards: cards,
       threads_chain: chain,
@@ -694,7 +800,8 @@ async function pipeRun(genId, opts){
     const msg = String(e && e.message || e).slice(0, 500);
     console.error("파이프라인 실패:", genId, msg);
     await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
-      ai_raw_output: "❌ 생성 오류: "+msg, approval_status: "failed" }).catch(()=>{});
+      ai_raw_output: "❌ 생성 오류: "+msg, approval_status: "failed",
+      blocked_reason: msg, heartbeat_at: new Date().toISOString() }).catch(()=>{});
   }
 }
 
@@ -709,7 +816,9 @@ app.post("/api/pipeline/run", async (req, res)=>{
       ai_raw_output: "⏳ 작업을 시작합니다...",
       ai_self_score: 0,
       revision_count: 0,
-      approval_status: "processing"
+      approval_status: "processing",
+      stage: "queued",
+      heartbeat_at: new Date().toISOString()
     });
     if (!row || !row.generation_id) throw new Error("행 생성 실패");
 
@@ -760,6 +869,80 @@ app.post("/api/pipeline/answer", async (req, res)=>{
       answers: merged
     }).catch(e=>console.error("pipeRun(재개) 예외:", String(e&&e.message||e)));
 
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e&&e.message||e) });
+  }
+});
+
+// 보관된 원문 조회 — 화면 로그를 지워도 여기서 다시 볼 수 있다
+// 검토 대기 목록
+app.get("/api/learning/pending", async (req, res)=>{
+  try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const st = String(req.query.status||"pending");
+    const q = "status=eq."+encodeURIComponent(st)
+            + "&select=review_id,created_at,dept,dept_name,source,trigger,ai_learned,human_edited,status"
+            + "&order=created_at.desc&limit="+Math.min(100, Number(req.query.limit||30));
+    res.json({ ok:true, rows: await supaSelect(LR_TABLE, q) });
+  } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// 검토 결과 반영 — 사람이 고친 내용이 실제 부서 지식이 된다
+app.post("/api/learning/review", async (req, res)=>{
+  try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id     = String(req.body?.review_id||"");
+    const action = String(req.body?.action||"approve");   // approve | reject
+    const edited = String(req.body?.edited||"").trim();
+    if (!id) return res.status(400).json({ ok:false, error:"review_id 가 필요합니다" });
+
+    const rows = await supaSelect(LR_TABLE,
+      "review_id=eq."+encodeURIComponent(id)+"&select=dept,ai_learned,source,trigger");
+    const row = rows && rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:"항목을 찾을 수 없습니다" });
+
+    if (action === "reject"){
+      await supaPatch(LR_TABLE, "review_id=eq."+id, {
+        status:"rejected", reviewed_at:new Date().toISOString() });
+      return res.json({ ok:true, applied:false });
+    }
+
+    // 사람이 고쳤으면 고친 것이, 안 고쳤으면 원문이 기억이 된다
+    const finalText = edited || row.ai_learned;
+    const wasEdited = !!edited && edited !== row.ai_learned;
+
+    const d = row.dept;
+    DB.deptKnowledge = DB.deptKnowledge || {};
+    DB.deptKnowledge[d] = DB.deptKnowledge[d] || [];
+    DB.deptKnowledge[d].push({
+      at: Date.now(),
+      source: "사람 검토" + (wasEdited ? " (수정됨)" : ""),
+      text: finalText.slice(0, 1200)
+    });
+    if (DB.deptKnowledge[d].length > 60)
+      DB.deptKnowledge[d] = trimArchive(DB.deptKnowledge[d], 60, "deptKnowledge", d);
+    saveDB();
+
+    await supaPatch(LR_TABLE, "review_id=eq."+id, {
+      status: wasEdited ? "edited" : "approved",
+      human_edited: wasEdited ? finalText : null,
+      applied: true,
+      reviewed_at: new Date().toISOString()
+    });
+    res.json({ ok:true, applied:true, edited:wasEdited });
+  } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.get("/api/exchanges", async (req, res)=>{
+  try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const dept  = String(req.query.dept||"");
+    const limit = Math.min(200, Number(req.query.limit||50));
+    let q = "select=exchange_id,created_at,dept,dept_name,instruction,response,elapsed_ms"
+          + "&order=created_at.desc&limit="+limit;
+    if (dept) q += "&dept=eq."+encodeURIComponent(dept);
+    if (req.query.since) q += "&created_at=gte."+encodeURIComponent(String(req.query.since));
+    res.json({ ok:true, rows: await supaSelect("agent_exchanges", q) });
   } catch(e){
     res.status(500).json({ ok:false, error:String(e&&e.message||e) });
   }
@@ -1177,13 +1360,13 @@ function logError(where, e){
   if(/무료한도|무료 한도|rate-limited|exceeded your current quota|RESOURCE_EXHAUSTED|429/i.test(msg)){
     DB.rateWaits = DB.rateWaits || [];
     DB.rateWaits.push({ at:Date.now(), where });
-    if (DB.rateWaits.length > 100) DB.rateWaits = DB.rateWaits.slice(-100);
+    if (DB.rateWaits.length > 100) DB.rateWaits = trimArchive(DB.rateWaits, 100, "rateWaits", null);
     saveDB();
     return;
   }
   DB.errors = DB.errors || [];
   DB.errors.push({ at:Date.now(), where, msg });
-  if (DB.errors.length > 200) DB.errors = DB.errors.slice(-200);
+  if (DB.errors.length > 200) DB.errors = trimArchive(DB.errors, 200, "errors", null);
   saveDB();
   console.error("["+where+"]", msg);
   if (process.env.SENTRY_DSN) {
@@ -1391,7 +1574,7 @@ function recordClient(text){
   if(t.length<4) return;
   DB.clientLog=DB.clientLog||[];
   DB.clientLog.push({ at:Date.now(), text:t.slice(0,400) });
-  if(DB.clientLog.length>40) DB.clientLog=DB.clientLog.slice(-40);
+  if(DB.clientLog.length>40) DB.clientLog = trimArchive(DB.clientLog, 40, "clientLog", null);
   DB.clientCount=(DB.clientCount||0)+1;
   if(DB.clientCount%6===0){ distillClient(); } // 6발화마다 백그라운드 갱신
   saveDB();
@@ -1454,7 +1637,7 @@ function recordLearnLog(entry){
   try{
     DB.learnLog = DB.learnLog || [];
     DB.learnLog.push(Object.assign({ at: Date.now() }, entry||{}));
-    if(DB.learnLog.length > 60) DB.learnLog = DB.learnLog.slice(-60);
+    if(DB.learnLog.length > 60) DB.learnLog = trimArchive(DB.learnLog, 60, "learnLog", null);
   }catch(_){}
 }
 async function learnFromBenchmark(dept, setStep){
@@ -1516,7 +1699,7 @@ async function learnFromBenchmark(dept, setStep){
     // 학습 기록 남기기(성장 체감) + 경험치
     DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
     DB.deptMemory[dept].push({ at:Date.now(), instruction:"[벤치마크 학습] "+bm.what, note:"조사("+(researchVia||"?")+"): "+query+" → 품질 공식 갱신" });
-    if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+    if(DB.deptMemory[dept].length>40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
     DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3; // 벤치마크 학습은 실무보다 큰 성장(+3)
     saveDB();
     await absorbToLeader([dept], "웹 벤치마크");   // 팀장이 이 부서 학습을 흡수
@@ -2469,7 +2652,7 @@ async function learnFromYouTubeUrls(dept, urls, setStep){
   const cr = commitKnowledge(dept, formula, "유튜브 영상 직접 학습("+okCount+"편)");
   DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:"[유튜브 영상 학습]", note:okCount+"편 분석: "+okVids.map(v=>v.keyPoint||v.url).join(" / ").slice(0,180) });
-  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3;
   // 정확한 학습 이력: 언제 · 어떤 영상 · 어느 구간에서 무슨 요점→추론→비전 · 지식 갱신량 · 새 공식
   recordLearnLog({ dept, deptKr:a.kr, kind:"youtube", ok:(cr.saved!==false), kept:(cr.kept===true),
@@ -2482,7 +2665,7 @@ async function learnFromYouTubeUrls(dept, urls, setStep){
 // 학습 작업 큐(영상 분석은 몇 분 걸림 → 앱을 닫아도 계속 진행, 완료 시 카톡)
 function trimLearnJobs(){
   DB.learnJobs = DB.learnJobs || [];
-  if(DB.learnJobs.length>15) DB.learnJobs = DB.learnJobs.slice(-15);
+  if(DB.learnJobs.length>15) DB.learnJobs = trimArchive(DB.learnJobs, 15, "learnJobs", null);
 }
 async function runLearnJob(id, appUrl){
   const j = (DB.learnJobs||[]).find(x=>String(x.id)===String(id));
@@ -2863,7 +3046,7 @@ async function learnFromWebUrls(dept, urls, setStep){
   commitKnowledge(dept, formula, "웹페이지 직접 학습("+notes.length+"개)");
   DB.deptMemory = DB.deptMemory || {}; DB.deptMemory[dept] = DB.deptMemory[dept]||[];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:"[웹페이지 학습]", note:notes.length+"개 분석 → 품질 공식 갱신" });
-  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3;
   saveDB();
   await absorbToLeader([dept], "웹페이지");   // 팀장이 이 부서 학습을 흡수
@@ -3080,7 +3263,7 @@ async function deepLearnPipeline(job){
       exp:(DB.exp&&DB.exp[d])||0, benchmark:"협업 심화학습("+mat.kind+", "+round+"라운드, "+score+"점)", learned:true };
     DB.deptMemory = DB.deptMemory||{}; DB.deptMemory[d] = DB.deptMemory[d]||[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[협업 심화학습]", note:goal.slice(0,80)+" → "+score+"점" });
-    if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+    if(DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
     DB.exp = DB.exp||{}; DB.exp[d] = (DB.exp[d]||0) + 4;   // 협업 심화학습은 +4
     updated.push(d);
   }
@@ -3231,7 +3414,7 @@ async function proposePlatformChange(ctx, opts){
       status:"pending", at: Date.now(), source: String(opts.label||"").slice(0,60)
     };
     DB.patchProposals.push(proposal);
-    if (DB.patchProposals.length>15) DB.patchProposals = DB.patchProposals.slice(-15);
+    if (DB.patchProposals.length>15) DB.patchProposals = trimArchive(DB.patchProposals, 15, "patchProposals", null);
     DB.deptMemory = DB.deptMemory||{}; DB.deptMemory.ops = DB.deptMemory.ops||[];
     DB.deptMemory.ops.push({ at:Date.now(), instruction:"[플랫폼 변경 제안]", note:proposal.title+" ("+kind+") — 승인 대기" });
     DB.exp = DB.exp||{}; DB.exp.ops = (DB.exp.ops||0)+1;
@@ -3360,7 +3543,7 @@ function createCostApproval(kind, payload, est){
     kind, payload, estKrw:est.estKrw, paid:est.paid, rows:est.rows,
     status:"pending", at:Date.now() };
   DB.costApprovals.push(ap);
-  if(DB.costApprovals.length>15) DB.costApprovals = DB.costApprovals.slice(-15);
+  if(DB.costApprovals.length>15) DB.costApprovals = trimArchive(DB.costApprovals, 15, "costApprovals", null);
   saveDB();
   const base = String(process.env.SELF_URL || process.env.RENDER_EXTERNAL_URL || "").replace(/\/+$/,"");
   const links = base ? ("\n\n승인(유료 진행): "+base+"/api/cost/approve?id="+ap.id+"&code="+ap.code
@@ -3529,7 +3712,7 @@ function pushGuidelineLog(pr){
   DB.guidelineLog = DB.guidelineLog || [];
   DB.guidelineLog.push({ id:pr.id, at:Date.now(), kind:pr.kind, title:pr.title,
     target:(pr.guideline&&pr.guideline.target)||"", impact:pr.impact||"", source:pr.source||"", decided:null });
-  if(DB.guidelineLog.length>20) DB.guidelineLog = DB.guidelineLog.slice(-20);
+  if(DB.guidelineLog.length>20) DB.guidelineLog = trimArchive(DB.guidelineLog, 20, "guidelineLog", null);
 }
 function markGuidelineDecided(id, decided){
   const g = (DB.guidelineLog||[]).find(x=>String(x.id)===String(id));
@@ -3640,7 +3823,7 @@ async function autoRouteLearn(urls, srcKind, onStep){
     commitKnowledge(p.dept, formula, "자동배정 학습("+mat.kind+")");
     DB.deptMemory = DB.deptMemory||{}; DB.deptMemory[p.dept] = DB.deptMemory[p.dept]||[];
     DB.deptMemory[p.dept].push({ at:Date.now(), instruction:"[자동배정 학습]", note:(p.focus||"").slice(0,80) });
-    if(DB.deptMemory[p.dept].length>40) DB.deptMemory[p.dept]=DB.deptMemory[p.dept].slice(-40);
+    if(DB.deptMemory[p.dept].length>40) DB.deptMemory[p.dept] = trimArchive(DB.deptMemory[p.dept], 40, "deptMemory", p.dept);
     DB.exp = DB.exp||{}; DB.exp[p.dept] = (DB.exp[p.dept]||0)+3;
     learned.push({ dept:p.dept, kr:a.kr, focus:p.focus||"", knowledge:formula });
     saveDB();
@@ -3669,7 +3852,7 @@ function logKnowledgeApplied(dept, what, note){
       source: k.benchmark || "학습",                 // 어떤 학습에서 온 공식인지
       learnedAt: k.at || 0                          // 그 공식이 언제 갱신됐는지
     });
-    if(DB.appliedLog.length>200) DB.appliedLog = DB.appliedLog.slice(-200);
+    if(DB.appliedLog.length>200) DB.appliedLog = trimArchive(DB.appliedLog, 200, "appliedLog", null);
   }catch(e){}
 }
 app.get("/api/learn/applied", (req,res)=>{
@@ -3729,7 +3912,131 @@ function crossDeptMemory(exceptDept){
   return out;
 }
 
+/* v265: 지시·응답 원문을 별도 표에 영구 보관한다.
+   기존에는 화면 로그(STATE.messages)가 유일한 원본이라 대화를 지우면 자료가 사라졌다.
+   deptMemory 는 부서당 40건만 남기고 잘리므로 학습 원천으로 쓸 수 없다. */
+async function logExchange(rec){
+  if (!useSupabase) return;
+  try {
+    await fetch(SUPA_URL+"/rest/v1/agent_exchanges", {
+      method:"POST",
+      headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
+                "Content-Type":"application/json", Prefer:"return=minimal" },
+      body: JSON.stringify([rec])
+    });
+  } catch(e){ /* 기록 실패가 작업을 막아서는 안 된다 */ }
+}
+
+/* v266: 잘려나가는 데이터를 버리지 않고 보관한다.
+   작업 상태(agent_state)는 계속 최근 것만 유지해야 한다 —
+   전체를 담으면 매 저장마다 수 MB 를 올리게 되어 대역폭이 터진다(v251 참조).
+   그래서 '작업용은 최근 것, 보관은 전부' 로 나눈다. */
+const ARCH_QUEUE = [];
+let _archTimer = null;
+
+function trimArchive(arr, keep, kind, scope){
+  if (!Array.isArray(arr) || arr.length <= keep) return arr;
+  const dropped = arr.slice(0, arr.length - keep);
+  for (const it of dropped){
+    ARCH_QUEUE.push({
+      kind: kind,
+      scope: scope || null,
+      item_at: (it && typeof it.at === "number") ? it.at : null,
+      payload: it
+    });
+  }
+  if (!_archTimer) _archTimer = setTimeout(flushArchive, 3000);   // 모아서 한 번에
+  return arr.slice(-keep);
+}
+
+async function flushArchive(){
+  _archTimer = null;
+  if (!useSupabase || !ARCH_QUEUE.length) return;
+  const batch = ARCH_QUEUE.splice(0, 200);
+  try {
+    const r = await fetch(SUPA_URL+"/rest/v1/archive", {
+      method:"POST",
+      headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
+                "Content-Type":"application/json", Prefer:"return=minimal" },
+      body: JSON.stringify(batch)
+    });
+    if (!r.ok) throw new Error("HTTP "+r.status);
+  } catch(e){
+    // 실패분은 되돌려 다음 기회에 (단, 무한 적재 방지)
+    if (ARCH_QUEUE.length < 2000) ARCH_QUEUE.unshift(...batch);
+    console.error("보관 실패:", String(e&&e.message||e));
+  }
+  if (ARCH_QUEUE.length && !_archTimer) _archTimer = setTimeout(flushArchive, 15000);
+}
+
+/* v267: 배운 것을 사람이 검토·수정하는 관문.
+   지금까지 부서 기억의 94.5%가 스스로 만든 것이었고 외부 신호는 5.5%뿐이었다.
+   자율 활동을 줄이는 대신, 배운 결과를 사람이 고칠 수 있게 해서
+   활동량이 곧 학습 기회가 되도록 만든다. */
+const LR_TABLE = "learning_review";
+const LR_MIN_LEN = 25;              // 너무 짧은 건 배울 게 없다
+const LR_SAMPLE  = { auto: 3, training: 3, meeting: 4, instruct: 1, benchmark: 1 };
+const _lrCount = {};
+
+function lrShouldQueue(source){
+  // 사람 지시·벤치마크는 매번, 자율 활동은 N회에 1번만 올린다(검토 폭주 방지)
+  const every = LR_SAMPLE[source] || 2;
+  _lrCount[source] = (_lrCount[source] || 0) + 1;
+  return _lrCount[source] % every === 0;
+}
+
+async function queueLearning(dept, source, trigger, resultText){
+  if (!useSupabase) return;
+  const body = String(resultText||"").trim();
+  if (body.length < LR_MIN_LEN) return;                 // 빈 껍데기 제외
+  if (/^https?:\/\//.test(String(trigger||"").trim())) return;  // URL 만 있는 지시 제외
+  if (/^fetch\(|^\{|^</.test(String(trigger||"").trim())) return; // 코드 조각 제외
+  if (!lrShouldQueue(source)) return;
+
+  let learned = "";
+  try {
+    learned = await anthropic(
+      "너는 이 부서가 방금 한 작업에서 '다음에도 쓸 수 있는 배움'만 뽑아내는 정리자다.\n"
+      + "규칙:\n"
+      + "- 결과물을 요약하지 마라. '다음에 무엇을 다르게 할지'를 적어라.\n"
+      + "- 이번 건에만 해당하는 내용은 버려라.\n"
+      + "- 배울 게 없으면 정확히 '없음' 이라고만 답하라. 억지로 만들지 마라.\n"
+      + "- 2~3문장, 한국어.",
+      "부서: "+(AGENTS[dept] ? AGENTS[dept].kr : dept)
+      + "\n한 일: "+String(trigger||"").slice(0,300)
+      + "\n\n결과:\n"+body.slice(0,2500), 500);
+  } catch(e){ return; }
+
+  learned = String(learned||"").trim();
+  if (!learned || /^없음/.test(learned)) return;        // 배울 게 없으면 안 올린다
+
+  await fetch(SUPA_URL+"/rest/v1/"+LR_TABLE, {
+    method:"POST",
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
+              "Content-Type":"application/json", Prefer:"return=minimal" },
+    body: JSON.stringify([{
+      dept: dept,
+      dept_name: (AGENTS[dept] ? (AGENTS[dept].no+" "+AGENTS[dept].kr) : dept),
+      source: source,
+      trigger: String(trigger||"").slice(0, 300),
+      ai_learned: learned.slice(0, 2000)
+    }])
+  }).catch(()=>{});
+}
+
+function lrSourceOf(instruction){
+  const t = String(instruction||"");
+  if (t.startsWith("[자기 훈련]"))   return "training";
+  if (t.startsWith("[자율"))         return "auto";
+  if (t.startsWith("[협의 회의]"))   return "meeting";
+  if (t.startsWith("[벤치마크"))     return "benchmark";
+  if (t.startsWith("[유튜브"))       return "benchmark";
+  if (t.startsWith("["))             return "auto";
+  return "instruct";
+}
+
 async function work(dept, instruction, context, images, teamLog){
+  const _wStart = Date.now();
   const a = AGENTS[dept];
   const isQuestion = /[?？]|어때|어떨까|할까요|할까|좋을까|어떤|어떻게|추천|의견|방법|왜|뭐가|무엇|가능|괜찮/.test(instruction||"");
   let sys = "너는 SNS 자동화 회사의 '"+a.no+" "+a.kr+"' 부서 AI 에이전트다. 역할: "+a.role+ADDRESS+STYLE;
@@ -3780,10 +4087,23 @@ async function work(dept, instruction, context, images, teamLog){
   if (_kb) logKnowledgeApplied(dept, "부서 지시 수행", String(instruction||"").slice(0,80));   // 배운 공식이 이 결과물에 적용됨
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction, note: text.length>500 ? text.slice(0,500)+"…" : text });
-  if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
+  if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
   saveDB();
   if (DB.exp[dept] % 3 === 0) { try{ await distillKnowledge(dept); }catch(e){} } // 4회 활동마다 전문성 압축·발전
+  // 배운 것을 검토 관문에 올린다 (응답을 막지 않도록 기다리지 않음)
+  queueLearning(dept, lrSourceOf(instruction), instruction, text).catch(()=>{});
+
+  // 원문 보관 (실패해도 응답은 그대로 반환)
+  logExchange({
+    dept: dept,
+    dept_name: (AGENTS[dept] ? (AGENTS[dept].no+" "+AGENTS[dept].kr) : dept),
+    instruction: String(instruction||"").slice(0, 8000),
+    response: String(text||"").slice(0, 20000),
+    via: "instruct",
+    elapsed_ms: Date.now() - _wStart
+  });
+
   return text;
 }
 
@@ -4720,7 +5040,7 @@ async function runBriefing(kind, engine, force){
   const out = await genText(sys, ctx, 1300, engine||"gemini"); // 자동 = 무료(Gemini)
   const brief = { date:dayKey, kind, text:out, at:Date.now() };
   DB.briefings = DB.briefings||[]; DB.briefings.push(brief);
-  if (DB.briefings.length > 40) DB.briefings = DB.briefings.slice(-40);
+  if (DB.briefings.length > 40) DB.briefings = trimArchive(DB.briefings, 40, "briefings", null);
   DB.briefDone = DB.briefDone || {};
   if (kind==="morning") DB.briefDone.morning = dayKey;
   else if (kind==="weekly") DB.briefDone.weekly = weekKey();
@@ -4778,7 +5098,7 @@ function createMeeting(opts){
   if (agenda.length > 4) agenda = agenda.slice(0,4);
   const meeting = { id:Date.now()+Math.floor(Math.random()*1000), type:"meeting", status:"running", phase:"준비", topic, room:opts.room||"", depts, rounds, mode, chair, agenda, agendaSummaries:[], transcript:[], summary:"", clientNote:opts.clientNote||"", prevSummary:opts.prevSummary||"", state:{ topic, market_insight:"", draft_content:"", critique_feedback:"", revision_count:0, final_output:"" }, at:Date.now(), source:opts.source||"app", engine:(((opts.engine || (DB.state&&DB.state.meetingEngine))==="gemini") ? "gemini" : "claude") };
   DB.meetings.push(meeting);
-  if (DB.meetings.length > 60) DB.meetings = DB.meetings.slice(-60);
+  if (DB.meetings.length > 60) DB.meetings = trimArchive(DB.meetings, 60, "meetings", null);
   saveDB();
   return meeting;
 }
@@ -4896,7 +5216,7 @@ async function processMeeting(meeting){
     for (const d of depts){
       if (!DB.deptMemory[d]) DB.deptMemory[d] = [];
       DB.deptMemory[d].push({ at:Date.now(), instruction:"["+mg.label+" 회의] "+topic, note:"회의 결론: "+(meeting.summary.length>180?meeting.summary.slice(0,180)+"…":meeting.summary) });
-      if (DB.deptMemory[d].length > 40) DB.deptMemory[d] = DB.deptMemory[d].slice(-40);
+      if (DB.deptMemory[d].length > 40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
       DB.exp = DB.exp || {}; DB.exp[d] = (DB.exp[d]||0) + 1;
       if (DB.exp[d] % 3 === 0) { try{ await distillKnowledge(d); }catch(e){} } // 회의도 전문성 압축
     }
@@ -5277,7 +5597,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v261";
+const SERVER_VERSION = "v268";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
@@ -5769,7 +6089,7 @@ async function oseraGate(kindLabel, content, topic, regen, setStep, specCtx){
       rules: projRules().length,           // 그 시점 이 프로젝트의 규칙 수
       exp: (DB.experience||[]).length      // 그 시점 축적된 경험 수
     });
-    if(DB.oseraLog.length > 400) DB.oseraLog = DB.oseraLog.slice(-400);
+    if(DB.oseraLog.length > 400) DB.oseraLog = trimArchive(DB.oseraLog, 400, "oseraLog", null);
     saveDB();
   }catch(_){}
 
@@ -5893,7 +6213,7 @@ function archiveBlogPost(item){
   const rec = { title, url, topic:String(item.topic||"").slice(0,120),
     tags: Array.isArray(item.tags)?item.tags.slice(0,8):[], at: Date.now() };
   if (dup) { Object.assign(dup, rec); } else { DB.blogArchive.push(rec); }
-  if (DB.blogArchive.length > 300) DB.blogArchive = DB.blogArchive.slice(-300);
+  if (DB.blogArchive.length > 300) DB.blogArchive = trimArchive(DB.blogArchive, 300, "blogArchive", null);
   saveDB();
   return rec;
 }
@@ -6523,7 +6843,7 @@ async function reportPipeline(body, setStep){
 
   DB.deptMemory=DB.deptMemory||{}; DB.deptMemory[d]=DB.deptMemory[d]||[];
   DB.deptMemory[d].push({ at:Date.now(), instruction:(isRevise?"[리서치 보고서 수정]":"[리서치 보고서 작성]"), note:topic+(isRevise?(" — "+feedback.slice(0,50)):"") });
-  if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+  if(DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
   // 🔁 v227: 근거 검수 루프 — 검수관(정유진)이 '지어낸 숫자·일반론'을 잡아낼 때까지 수정
   const _reviews = [];
   const _maxLoops = Math.max(0, Math.min(3, (DB.state && DB.state.designReviewLoops!=null) ? (+DB.state.designReviewLoops||0) : 1));
@@ -6856,7 +7176,7 @@ async function shortsPipeline(body, setStep){
 // ===== 상품페이지 백그라운드 작업 큐 (앱을 나가도 안 끊김) =====
 function trimPageJobs(){
   DB.pageJobs = DB.pageJobs || [];
-  if(DB.pageJobs.length>20) DB.pageJobs = DB.pageJobs.slice(-20);
+  if(DB.pageJobs.length>20) DB.pageJobs = trimArchive(DB.pageJobs, 20, "pageJobs", null);
   // 용량 보호: 최근 8건만 HTML 보관, 그보다 오래된 건 메타만 남김
   const keep=8, n=DB.pageJobs.length;
   DB.pageJobs.forEach((j,i)=>{ if(i < n-keep && j.html){ delete j.html; delete j.input; j.htmlDropped=true; } });
@@ -6971,7 +7291,7 @@ app.post("/api/characters", (req,res)=>{
       promptEn:String(b.promptEn||"").slice(0,400), at:Date.now() };
     const idx=(DB.characters).findIndex(c=>c.id===rec.id || c.name===rec.name);
     if(idx>=0) DB.characters[idx]=rec; else DB.characters.push(rec);
-    if(DB.characters.length>50) DB.characters=DB.characters.slice(-50);
+    if(DB.characters.length>50) DB.characters = trimArchive(DB.characters, 50, "characters", null);
     saveDB(); res.json({ ok:true, character:rec });
   } catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
@@ -7048,7 +7368,7 @@ app.post("/api/ops/evaluate", async (req,res)=>{
     if(tdept && AGENTS[tdept] && tdept!=="ops"){
       if(!DB.deptMemory[tdept]) DB.deptMemory[tdept]=[];
       DB.deptMemory[tdept].push({ at:Date.now(), instruction:"[팀장 평가] 받은 피드백", note:"오세라 평가: "+String(out).slice(0,260) });
-      if(DB.deptMemory[tdept].length>40) DB.deptMemory[tdept]=DB.deptMemory[tdept].slice(-40);
+      if(DB.deptMemory[tdept].length>40) DB.deptMemory[tdept] = trimArchive(DB.deptMemory[tdept], 40, "deptMemory", tdept);
       distillKnowledge(tdept).catch(()=>{}); // 피드백 즉시 학습 반영
     }
     saveDB();
@@ -7117,7 +7437,7 @@ function addToInbox(item){
     at: Date.now()
   };
   DB.pubInbox.push(it);
-  if (DB.pubInbox.length > 200) DB.pubInbox = DB.pubInbox.slice(-200);
+  if (DB.pubInbox.length > 200) DB.pubInbox = trimArchive(DB.pubInbox, 200, "pubInbox", null);
   // 블로그 채널이면 내부링크 후보로 아카이브(제목 기준, URL은 게시 후 done에서 채움)
   try { if ((COPY_CHANNELS[it.channel]||{}).kind==="blog" && it.title) archiveBlogPost({ title:it.title, url:"", topic:it.topic||it.title, tags:it.tags, inboxId:it.id }); } catch(e){}
   saveDB();
@@ -7323,7 +7643,7 @@ app.post("/api/meeting/rate", (req,res)=>{
     if(!AGENTS[d]) return;
     if(!DB.deptMemory[d]) DB.deptMemory[d]=[];
     DB.deptMemory[d].push({ at:Date.now(), instruction:"[회의 피드백] "+(m.topic||""), note });
-    if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+    if(DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
     distillKnowledge(d).catch(()=>{}); // 평가를 즉시 학습에 반영
   });
   saveDB();
@@ -7386,7 +7706,7 @@ async function runSelfTraining(dept){
   const noteCore = principles.length ? principles.join(" / ") : String(out).slice(0,200);
   if(!DB.deptMemory[dept]) DB.deptMemory[dept]=[];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:"[자기 훈련]", note:"훈련으로 강화된 원칙: "+noteCore });
-  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
   DB.exp=DB.exp||{}; DB.exp[dept]=(DB.exp[dept]||0)+1;
   DB.lastTrainAt=DB.lastTrainAt||{}; DB.lastTrainAt[dept]=Date.now();
   // 뒤처진 부서(팀 평균 미만)는 훈련 결과를 '심화'로 흡수 → 지식·지능 수준을 빠르게 끌어올림
@@ -7555,7 +7875,7 @@ async function runDailyReview(){
     if(improve){
       DB.deptMemory[d]=DB.deptMemory[d]||[];
       DB.deptMemory[d].push({ at:now, instruction:"[팀장 회고]", note:"오늘 회고("+grade+"): "+improve+(tomorrow?(" / 내일: "+tomorrow):"") });
-      if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+      if(DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
       DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
       if(DB.exp[d]%3===0){ try{ await distillKnowledge(d); }catch(e){} }
     }
@@ -7655,7 +7975,7 @@ async function runNightResearch(){
           DB.nightResearch[d]={ text:brief, sources:(res.sources||[]).slice(0,5), searched:true, at:now, day:today };
           DB.deptMemory[d]=DB.deptMemory[d]||[];
           DB.deptMemory[d].push({ at:now, instruction:"[야간 웹연구]", note:"팀장 웹리서치: "+brief+srcTxt });
-          if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+          if(DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
           n++; searched++; searchQuota--;
           continue;
         }
@@ -7682,7 +8002,7 @@ async function runNightResearch(){
         DB.nightResearch[d]={ text:brief, sources:[], searched:false, at:now, day:today };
         DB.deptMemory[d]=DB.deptMemory[d]||[];
         DB.deptMemory[d].push({ at:now, instruction:"[야간 연구]", note:"팀장 리서치: "+brief });
-        if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+        if(DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
         n++;
       }
     }catch(e){ logError("night-research-batch", e); }
@@ -7743,7 +8063,7 @@ async function assignDailyDirectives(){
         DB.leaderDailyDirective[d] = { text:clean, at:now, day };
         DB.leadDirectives = DB.leadDirectives||[];
         DB.leadDirectives.push({ dept:d, directive:clean, reason:"일일 자율수행 지시(오세라)", at:now });
-        if(DB.leadDirectives.length>60) DB.leadDirectives=DB.leadDirectives.slice(-60);
+        if(DB.leadDirectives.length>60) DB.leadDirectives = trimArchive(DB.leadDirectives, 60, "leadDirectives", null);
         assigned.push({ kr:(AGENTS[d]?AGENTS[d].kr:d), task:clean });
         n++;
       }
@@ -7774,11 +8094,11 @@ app.post("/api/ops/directive-feedback", (req,res)=>{
     DB.dirFeedback = DB.dirFeedback || {};
     DB.dirFeedback[dept] = DB.dirFeedback[dept] || [];
     DB.dirFeedback[dept].push({ text:text.slice(0,300), at:Date.now(), day:kstDay(), used:false });
-    if(DB.dirFeedback[dept].length>10) DB.dirFeedback[dept]=DB.dirFeedback[dept].slice(-10);
+    if(DB.dirFeedback[dept].length>10) DB.dirFeedback[dept] = trimArchive(DB.dirFeedback[dept], 10, "dirFeedback", dept);
     // 부서 메모리에도 남겨 다음 학습·distill에 반영
     DB.deptMemory[dept]=DB.deptMemory[dept]||[];
     DB.deptMemory[dept].push({ at:Date.now(), instruction:"[클라이언트 피드백]", note:text.slice(0,300) });
-    if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+    if(DB.deptMemory[dept].length>40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
     saveDB();
     res.json({ ok:true, dirFeedback: DB.dirFeedback });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
@@ -7841,7 +8161,7 @@ async function runLeaderReview(dept){
   // 보완 지식을 부서 메모리에 주입 → distill로 전문성에 흡수 → 실제로 개선됨
   if(!DB.deptMemory[dept]) DB.deptMemory[dept]=[];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:"[팀장 보완]", note:String(out).slice(0,700) });
-  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept]=DB.deptMemory[dept].slice(-40);
+  if(DB.deptMemory[dept].length>40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
   DB.exp=DB.exp||{}; DB.exp[dept]=(DB.exp[dept]||0)+1; // 팀장 보완으로 부서가 한 단계 배움
   try{ await distillKnowledge(dept, true); }catch(e){} // 보완 즉시 전문성에 반영(심화)
   ensureLeaderLead(); saveDB();
@@ -7920,7 +8240,7 @@ async function assessCapability(){
       const per={}; depts.forEach(d=>{ if(DB.capability[d]) per[d]=DB.capability[d].overall; });
       DB.capHistory=DB.capHistory||[];
       DB.capHistory.push({ at:Date.now(), day:kstDay(), avg, per });
-      if(DB.capHistory.length>400) DB.capHistory=DB.capHistory.slice(-400);
+      if(DB.capHistory.length>400) DB.capHistory = trimArchive(DB.capHistory, 400, "capHistory", null);
     }
   }catch(e){}
   saveDB();
@@ -8214,7 +8534,7 @@ app.post("/api/ops/review", async (req,res)=>{
     const report = out.replace(/지시조정:[\s\S]*$/,"").trim();
     DB.collections = DB.collections||[];
     DB.collections.push({ id:Date.now(), topic:"[오세라 팀 평가]", text:out, at:Date.now(), dept:"ops" });
-    if (DB.collections.length>100) DB.collections=DB.collections.slice(-100);
+    if (DB.collections.length>100) DB.collections = trimArchive(DB.collections, 100, "collections", null);
     if (!DB.deptMemory.ops) DB.deptMemory.ops=[];
     DB.deptMemory.ops.push({ at:Date.now(), instruction:"[팀 평가]", note:String(report).slice(0,160) });
     if (DB.deptMemory.ops.length>40) DB.deptMemory.ops=DB.deptMemory.ops.slice(-40);
@@ -8251,7 +8571,7 @@ async function runKnowledgeShare(engine){
       const note = "[지식 공유] "+t.trim();
       if (!DB.deptMemory[d]) DB.deptMemory[d]=[];
       DB.deptMemory[d].push({ at:Date.now(), instruction:"[지식 공유 세션]", note });
-      if (DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+      if (DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
       DB.exp=DB.exp||{}; DB.exp[d]=(DB.exp[d]||0)+1;
       learnings.push({ dept:d, name:AGENTS[d].kr, learn:t.trim() });
     }
@@ -8261,7 +8581,7 @@ async function runKnowledgeShare(engine){
   for (const lg of learnings){ try{ await distillKnowledge(lg.dept); }catch(e){} }
   DB.collections = DB.collections||[];
   DB.collections.push({ id:Date.now(), topic:"[부서 간 지식 공유·성장 세션]", text:out, at:Date.now(), dept:"ops" });
-  if (DB.collections.length>100) DB.collections=DB.collections.slice(-100);
+  if (DB.collections.length>100) DB.collections = trimArchive(DB.collections, 100, "collections", null);
   if (!DB.deptMemory.ops) DB.deptMemory.ops=[];
   DB.deptMemory.ops.push({ at:Date.now(), instruction:"[지식 공유 진행]", note:"부서 간 지식 공유 세션 진행 — "+learnings.length+"개 부서가 상호 학습" });
   DB.exp=DB.exp||{}; DB.exp.ops=(DB.exp.ops||0)+1;
@@ -8459,7 +8779,7 @@ function queueContentApproval(dept, topic, label, content, reviews){
   DB.contentApprovals = DB.contentApprovals || [];
   const item={ id:Date.now()+Math.floor(Math.random()*1000), dept, topic:topic||"", label:label||"", content:String(content||""), reviews:reviews||[], status:"pending", at:Date.now() };
   DB.contentApprovals.push(item);
-  if(DB.contentApprovals.length>50) DB.contentApprovals=DB.contentApprovals.slice(-50);
+  if(DB.contentApprovals.length>50) DB.contentApprovals = trimArchive(DB.contentApprovals, 50, "contentApprovals", null);
   saveDB();
   // 새 콘텐츠가 올라오면 카톡 알림 (설정 contentNotify가 false가 아니면 기본 ON)
   try {
@@ -8689,7 +9009,7 @@ const REPURPOSE_FORMATS = {
   kakao:     "카카오채널 소식 — 짧고 친근한 톤, 핵심 혜택 + 링크 유도."
 };
 const REPURPOSE_KR = { instagram:"인스타 피드", reels:"릴스", shorts:"유튜브 쇼츠", blog:"블로그", youtube:"유튜브 설명란", thread:"스레드/X", kakao:"카카오채널" };
-function trimRepurposeJobs(){ DB.repurposeJobs=DB.repurposeJobs||[]; if(DB.repurposeJobs.length>15) DB.repurposeJobs=DB.repurposeJobs.slice(-15); }
+function trimRepurposeJobs(){ DB.repurposeJobs=DB.repurposeJobs||[]; if(DB.repurposeJobs.length>15) DB.repurposeJobs = trimArchive(DB.repurposeJobs, 15, "repurposeJobs", null); }
 async function runRepurposeJob(id, appUrl){
   const j=(DB.repurposeJobs||[]).find(x=>String(x.id)===String(id)); if(!j) return;
   j.status="running"; j.startedAt=Date.now(); saveDB(); beginJobMode();
@@ -8746,7 +9066,7 @@ app.get("/api/repurpose/status", (req,res)=>{
 // ===== 🎬 AI 영상 기획 파이프라인: 리서치·콘셉트 → 마스터 시트(장면 프롬프트까지). 영상 생성 자체는 외부 툴(힉스필드 등)에 프롬프트 투입 =====
 const VIDEO_HOOKS = "챌린지형, 언박싱형, 솔직 리뷰형, ASMR형, 비포&애프터형, 스토리텔링형";
 const VIDEO_PLAT_KR = { shorts:"유튜브 쇼츠", reels:"인스타 릴스", tiktok:"틱톡" };
-function trimVideoJobs(){ DB.videoJobs=DB.videoJobs||[]; if(DB.videoJobs.length>15) DB.videoJobs=DB.videoJobs.slice(-15); }
+function trimVideoJobs(){ DB.videoJobs=DB.videoJobs||[]; if(DB.videoJobs.length>15) DB.videoJobs = trimArchive(DB.videoJobs, 15, "videoJobs", null); }
 async function runVideoPlanJob(id, appUrl){
   const j=(DB.videoJobs||[]).find(x=>String(x.id)===String(id)); if(!j) return;
   j.status="running"; j.startedAt=Date.now(); saveDB(); beginJobMode();
@@ -8823,7 +9143,7 @@ function improveLogText(){
 function logImproveDecision(pr, approved){
   DB.improveLog = DB.improveLog || [];
   DB.improveLog.push({ id:pr.id, at:Date.now(), dept:pr.dept, title:String(pr.title||"").slice(0,80), decision:approved?"approved":"rejected" });
-  if(DB.improveLog.length>30) DB.improveLog=DB.improveLog.slice(-30);
+  if(DB.improveLog.length>30) DB.improveLog = trimArchive(DB.improveLog, 30, "improveLog", null);
 }
 const IMPROVE_DEPTS = ["strategy","creation","publishing","analytics","monetization","advisory","scout","editing","graphic"];
 async function researchImprovement(focusDept){
@@ -8852,7 +9172,7 @@ async function researchImprovement(focusDept){
       improvement:String(j.improvement||"").slice(0,1200), expect:String(j.expect||"").slice(0,200),
       sourceVia: research.via||"", status:"pending", at:Date.now() };
     DB.improveProposals.push(pr);
-    if(DB.improveProposals.length>20) DB.improveProposals=DB.improveProposals.slice(-20);
+    if(DB.improveProposals.length>20) DB.improveProposals = trimArchive(DB.improveProposals, 20, "improveProposals", null);
     saveDB();
     return { ok:true, proposal:pr };
   } finally { endJobMode(); }
@@ -8911,7 +9231,7 @@ app.post("/api/evergreen/add", (req,res)=>{
   try{ const b=req.body||{}; const text=String(b.text||"").trim(); if(!text) return res.status(400).json({ error:"내용이 필요해요" });
     DB.evergreen=DB.evergreen||[];
     DB.evergreen.push({ id:String(Date.now())+"_"+Math.floor(Math.random()*1000), text:text.slice(0,4000), note:String(b.note||"").slice(0,140), score:Math.max(0,Math.min(100,+b.score||0)), at:Date.now(), lastUsedAt:0 });
-    if(DB.evergreen.length>60) DB.evergreen=DB.evergreen.slice(-60);
+    if(DB.evergreen.length>60) DB.evergreen = trimArchive(DB.evergreen, 60, "evergreen", null);
     saveDB(); res.json({ ok:true, count:DB.evergreen.length });
   }catch(e){ res.status(500).json({ error:String(e.message||e) }); }
 });
@@ -9214,7 +9534,7 @@ function toMin(hhmm){ const p=(hhmm||"0:0").split(":"); return (+p[0])*60+(+p[1]
 // 돌릴수록 부서 지식이 쌓여 다음 사이클이 더 좋아진다. (허공 자동학습과 무관 — 내가 지정한 것만 실행)
 function trimCycleJobs(){
   DB.cycleJobs = DB.cycleJobs || [];
-  if (DB.cycleJobs.length > 30) DB.cycleJobs = DB.cycleJobs.slice(-30);
+  if (DB.cycleJobs.length > 30) DB.cycleJobs = trimArchive(DB.cycleJobs, 30, "cycleJobs", null);
   const n = DB.cycleJobs.length, keep = 8;   // 최근 8개만 상세(HTML 등) 유지, 이전 것은 용량 절약
   DB.cycleJobs.forEach((j,i)=>{ if(i < n-keep && j.results){
     if(j.results.page){ j.results.pageDropped=true; delete j.results.page; }
@@ -9694,7 +10014,7 @@ var DESIGN_KINDS = {
 };
 function trimDesignJobs(){
   DB.designJobs = DB.designJobs || [];
-  if (DB.designJobs.length > 30) DB.designJobs = DB.designJobs.slice(-30);
+  if (DB.designJobs.length > 30) DB.designJobs = trimArchive(DB.designJobs, 30, "designJobs", null);
   const n = DB.designJobs.length, keep = 8;
   DB.designJobs.forEach((j,i)=>{ if(i < n-keep && j.output && j.output.length>400){ j.outputDropped=true; j.output=""; } });
 }
@@ -9811,7 +10131,7 @@ async function runDesignJob(id, appUrl){
 }
 // v228: 실패한 작업을 원본 입력 그대로 다시 실행 (목록 응답은 brief가 잘려 있어 프론트가 재구성하면 안 된다)
 // ═══ 🎬 쇼츠 작업 큐 ═══
-function trimShortsJobs(){ DB.shortsJobs = DB.shortsJobs || []; if(DB.shortsJobs.length > 20) DB.shortsJobs = DB.shortsJobs.slice(-20); }
+function trimShortsJobs(){ DB.shortsJobs = DB.shortsJobs || []; if(DB.shortsJobs.length > 20) DB.shortsJobs = trimArchive(DB.shortsJobs, 20, "shortsJobs", null); }
 async function runShortsJob(id, appUrl){
   const j = (DB.shortsJobs||[]).find(x=>String(x.id)===String(id));
   if(!j) return;
@@ -10396,7 +10716,7 @@ async function runProjectMeeting(opts){
     status:"running", phase:"자료수집", samples:[], meetingId:null, summary:"", deliverable:"", passed:false,
     promote:opts.promote!==false, at:Date.now() };
   DB.projectMeetings.push(pm);
-  if(DB.projectMeetings.length>40) DB.projectMeetings = DB.projectMeetings.slice(-40);
+  if(DB.projectMeetings.length>40) DB.projectMeetings = trimArchive(DB.projectMeetings, 40, "projectMeetings", null);
   saveDB();
   try{
     // 1) 자료수집(공유 브리프) — 실검색 우선, 실패 시 지식 폴백
@@ -10631,12 +10951,12 @@ async function autoRunDept(dept, directive){
   if (!note || !String(note).trim()) { console.warn("[autoRunDept "+dept+"] 빈 응답 — 건너뜀"); return; }
   if (!DB.deptMemory[dept]) DB.deptMemory[dept] = [];
   DB.deptMemory[dept].push({ at:Date.now(), instruction:tag+baseFocus, note });
-  if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = DB.deptMemory[dept].slice(-40);
+  if (DB.deptMemory[dept].length > 40) DB.deptMemory[dept] = trimArchive(DB.deptMemory[dept], 40, "deptMemory", dept);
   DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 1;
   if (dept!=="ops") ensureLeaderLead(); // 부서가 자율수행으로 크면 팀장도 그 위로 유지
   if (DB.exp[dept] % 3 === 0) { try{ await distillKnowledge(dept); }catch(e){} }
   DB.collections.push({ id:Date.now()+Math.floor(Math.random()*1000), topic:"["+a.kr+"] "+baseFocus, text:note, at:Date.now(), dept });
-  if (DB.collections.length > 100) DB.collections = DB.collections.slice(-100);
+  if (DB.collections.length > 100) DB.collections = trimArchive(DB.collections, 100, "collections", null);
   saveDB();
   const didSummary = String(note||"").replace(/\s+/g," ").slice(0,90);
   kakaoNotify("📚 "+a.kr+(directive?" 자율 지시 수행 +1":" 자율 학습 +1")+" (경험치 "+DB.exp[dept]+")"+(baseFocus?("\n주제: "+String(baseFocus).slice(0,60)):"")+(didSummary?("\n한 일: "+didSummary):"")).catch(()=>{});
@@ -10693,10 +11013,10 @@ async function checkStaleDepts(maxHandle, force){
         DB.leaderDailyDirective = DB.leaderDailyDirective || {};
         DB.leaderDailyDirective[d] = { text:dir, at:now, day:kstDay() };
         DB.leadDirectives.push({ dept:d, directive:dir, reason:"24시간+ 자율수행 정체 — 팀장이 학습 기반으로 재지시", at:now, lastActiveAt:lastAt });
-        if(DB.leadDirectives.length>40) DB.leadDirectives=DB.leadDirectives.slice(-40);
+        if(DB.leadDirectives.length>40) DB.leadDirectives = trimArchive(DB.leadDirectives, 40, "leadDirectives", null);
         // 재지시를 '활동'으로 즉시 기록 → 정체(마지막 활동 기준)가 바로 풀림 (autoRun 실패/지연과 무관)
         DB.deptMemory[d].push({ at:Date.now(), instruction:"[팀장 재지시]", note:"팀장 지시 수신: "+dir });
-        if(DB.deptMemory[d].length>40) DB.deptMemory[d]=DB.deptMemory[d].slice(-40);
+        if(DB.deptMemory[d].length>40) DB.deptMemory[d] = trimArchive(DB.deptMemory[d], 40, "deptMemory", d);
         DB.staleHandled[d]=now; saveDB();
         kakaoNotify("🧭 팀장 재지시 — "+AGENTS[d].kr+": "+dir).catch(()=>{});
         autoRunDept(d, dir).catch(()=>{}); // 실제 수행은 백그라운드(정체는 위 활동 기록으로 이미 해소)
