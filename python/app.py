@@ -270,7 +270,7 @@ def _plan_worker(topic: str, channels: list, when_iso: str) -> None:
 # ---------------------------------------------------------------------------
 # 🗂️ 탭
 # ---------------------------------------------------------------------------
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
     [
         "🌐 SNS 에이전트 앱",
         "🚀 신규 에이전트 가동",
@@ -281,6 +281,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
         "🗓️ 주간 플랜",
         "🧠 학습 현황",
         "⚔️ 대결 평가",
+        "🌐 홈페이지 스튜디오",
     ]
 )
 
@@ -364,7 +365,21 @@ with tab2:
 
 
 # --------------------------------------------------- TAB 3: 승인 관제탑
-@st.fragment(run_every=REFRESH_SECONDS)
+def _mark_editing():
+    """입력이 생기면 자동 갱신을 멈춘다.
+
+    앱의 서비스워커 자동 새로고침과 같은 문제다 —
+    타이머가 사람 입력 도중에 끼어들면 쓰던 내용이 튄다.
+    """
+    st.session_state["editing_now"] = True
+
+
+_auto_on = st.session_state.get("auto_refresh", True) and not st.session_state.get(
+    "editing_now", False
+)
+
+
+@st.fragment(run_every=(REFRESH_SECONDS if _auto_on else None))
 def render_approval_control_center():
     if not db_manager.is_configured():
         st.info("Supabase 설정이 필요합니다.")
@@ -374,7 +389,7 @@ def render_approval_control_center():
         items = (
             supabase.table("content_generations")
             .select("*")
-            .in_("approval_status", ["pending", "processing", "failed"])
+            .in_("approval_status", ["pending", "processing", "failed", "needs_input"])
             .order("created_at", desc=True)
             .execute()
             .data
@@ -411,8 +426,19 @@ def render_approval_control_center():
         status = item.get("approval_status")
 
         if status == "processing":
-            st.warning(f"⏳ [AI 실시간 생성 중...] {topic}")
+            stg = item.get("stage") or ""
+            step = {
+                "queued": "대기 중", "research": "참고 자료 읽는 중", "director": "기준 세우는 중",
+                "write": "원고 쓰는 중", "critic": "검수 중", "crossjudge": "판단 검증 중",
+                "adapt": "채널별 재가공 중", "cards": "카드뉴스 구성 중",
+                "page": "페이지 구성안 작성 중", "design": "디자인 방향 정하는 중",
+                "build": "페이지 만드는 중", "threads": "스레드 체인 구성 중",
+            }.get(stg, stg or "진행 중")
+            st.warning(f"⏳ [{step}] {topic}")
             continue
+
+        if status == "needs_input":
+            st.info(f"🙋 [답변 대기] {topic}")
 
         if status == "failed":
             st.error(f"❌ [생성 실패] {topic}")
@@ -442,9 +468,71 @@ def render_approval_control_center():
 
             oq = item.get("open_questions") or []
             if oq:
-                st.warning("**디렉터가 확인을 요청했습니다**")
-                for q in oq:
-                    st.markdown(f"- {q}")
+                st.warning("**디렉터가 확인을 요청했습니다** — 답하면 그 내용을 확정 사실로 두고 다시 만듭니다.")
+                answers = []
+                for qi, q in enumerate(oq):
+                    st.markdown(f"**{qi+1}. {q}**")
+                    ans = st.text_input(
+                        "답변",
+                        key=f"ans_{content_id}_{qi}",
+                        placeholder="모르면 비워두세요 — 비운 항목은 다시 물어봅니다",
+                        label_visibility="collapsed",
+                        on_change=_mark_editing,
+                    )
+                    answers.append(f"{q} → {ans.strip()}" if ans.strip() else "")
+
+                filled = [a for a in answers if a]
+                ca1, ca2 = st.columns([3, 1])
+                with ca1:
+                    st.caption(
+                        f"{len(filled)}/{len(oq)}개 답변됨"
+                        + ("  · 답한 것만 반영하고 나머지는 다시 물어봅니다" if filled and len(filled) < len(oq) else "")
+                    )
+                with ca2:
+                    if st.button(
+                        "↩ 답하고 다시 만들기",
+                        key=f"ansbtn_{content_id}",
+                        type="primary",
+                        disabled=not filled,
+                        use_container_width=True,
+                    ):
+                        try:
+                            r = requests.post(
+                                f"{BACKEND_URL}/api/pipeline/answer",
+                                json={"generation_id": content_id, "answers": filled},
+                                headers=auth_headers(),
+                                timeout=120,
+                            )
+                            out = r.json()
+                            if out.get("ok"):
+                                st.session_state["editing_now"] = False
+                                st.success(f"답변 {len(filled)}건 반영 · 다시 만드는 중입니다")
+                                st.rerun()
+                            else:
+                                st.error(f"실패: {out.get('error','알 수 없음')}")
+                        except Exception as e:
+                            st.error(f"백엔드 호출 실패: {e}")
+
+                if item.get("blocked_reason"):
+                    st.caption(f"멈춘 이유 · {item['blocked_reason']}")
+
+            iss = item.get("issues") or []
+            if iss:
+                with st.expander(f"🔍 검수 지적 {len(iss)}건"):
+                    for it2 in iss:
+                        who = it2.get("owner")
+                        icon = "🤖 AI가 고칠 것" if who == "ai" else "🙋 내가 답할 것"
+                        st.markdown(f"**{it2.get('what','')}** · {icon}")
+                        if it2.get("cause"):
+                            st.caption(f"원인 · {it2['cause']}")
+                        if it2.get("fix"):
+                            st.caption(f"조치 · {it2['fix']}")
+                        if it2.get("ask"):
+                            st.caption(f"질문 · {it2['ask']}")
+
+            if item.get("last_critique"):
+                with st.expander("📝 마지막 검수 피드백"):
+                    st.write(item["last_critique"])
 
             sp = item.get("spec") or {}
             if sp:
@@ -455,6 +543,46 @@ def render_approval_control_center():
                         st.markdown("**성공 기준**")
                         for c in sp["success_criteria"]:
                             st.markdown(f"- {c}")
+
+            tokens = item.get("design_tokens") or {}
+            phtml  = item.get("page_html") or ""
+            if tokens or phtml:
+                st.markdown("**🎨 홈페이지 디자인**")
+                if tokens.get("color"):
+                    cols = st.columns(len(tokens["color"][:6]))
+                    for ci, c in enumerate(tokens["color"][:6]):
+                        with cols[ci]:
+                            st.markdown(
+                                f'<div style="height:46px;border-radius:8px;background:{c.get("hex","#eee")};'
+                                f'border:1px solid #e6eaf1"></div>'
+                                f'<div style="font-size:11px;margin-top:4px">{c.get("name","")}</div>'
+                                f'<div style="font-size:10px;color:#8b93a3">{c.get("hex","")}</div>',
+                                unsafe_allow_html=True,
+                            )
+                    st.caption(" · ".join(f'{c.get("name","")}: {c.get("why","")}' for c in tokens["color"][:6]))
+                t = tokens.get("type") or {}
+                if t:
+                    st.caption(
+                        f'서체 — 디스플레이 {t.get("display","-")} / 본문 {t.get("body","-")}'
+                        + (f' / 보조 {t.get("utility")}' if t.get("utility") else "")
+                    )
+                if tokens.get("signature"):
+                    st.info(f'✦ 시그니처 · {tokens["signature"]}')
+                if tokens.get("risk"):
+                    st.caption(f'감행한 모험 · {tokens["risk"]}')
+
+                if phtml:
+                    st.components.v1.html(phtml, height=560, scrolling=True)
+                    st.download_button(
+                        "⬇️ HTML 내려받기",
+                        data=phtml,
+                        file_name=f"page_{content_id[:8]}.html",
+                        mime="text/html",
+                        key=f"dl_{content_id}",
+                    )
+                    st.caption(
+                        "data-photo 표시된 자리에 사진을, data-need 표시된 자리에 확정 정보를 채우면 됩니다."
+                    )
 
             page = item.get("page_spec") or {}
             if page.get("sections"):
@@ -501,6 +629,7 @@ def render_approval_control_center():
                     value=ai_draft,
                     height=280,
                     key=f"edit_{content_id}",
+                    on_change=_mark_editing,
                 )
             with col2:
                 st.markdown("### 🎛️ 발행 조종석")
@@ -520,6 +649,7 @@ def render_approval_control_center():
                     "내 채점 (수준)", 0, 100, int(ai_cre or 50), 5,
                     key=f"hs_{content_id}",
                     help="AI 채점이 맞는지 대조합니다. 편차가 크면 검수자가 스스로 보정합니다.",
+                    on_change=_mark_editing,
                 )
                 if st.button("💾 채점만 저장", key=f"sc_{content_id}", use_container_width=True):
                     try:
@@ -586,6 +716,27 @@ def render_approval_control_center():
 
 
 with tab3:
+    c_a, c_b = st.columns([3, 1])
+    with c_a:
+        if st.session_state.get("editing_now"):
+            st.warning(
+                f"✏️ 편집 중이라 자동 갱신을 멈췄습니다. "
+                f"(원래 {REFRESH_SECONDS}초마다 갱신)"
+            )
+        elif st.session_state.get("auto_refresh", True):
+            st.caption(f"🔄 {REFRESH_SECONDS}초마다 자동 갱신 중")
+        else:
+            st.caption("⏸ 자동 갱신 꺼짐")
+    with c_b:
+        if st.session_state.get("editing_now"):
+            if st.button("갱신 재개", use_container_width=True):
+                st.session_state["editing_now"] = False
+                st.rerun()
+        else:
+            st.session_state["auto_refresh"] = st.toggle(
+                "자동 갱신", value=st.session_state.get("auto_refresh", True)
+            )
+
     render_approval_control_center()
 
 
@@ -964,7 +1115,7 @@ with tab6:
     if draft:
         st.divider()
         st.markdown("### 📄 brand_voice.md")
-        edited = st.text_area("검토 후 수정하세요", value=draft, height=420, key="voice_edit")
+        edited = st.text_area("검토 후 수정하세요", value=draft, height=420, key="voice_edit", on_change=_mark_editing)
         c1, c2 = st.columns(2)
         with c1:
             st.download_button(
@@ -1345,9 +1496,9 @@ with tab9:
             )
             colx, coly = st.columns(2)
             with colx:
-                d_ours = st.text_area("우리 결과물", height=220, key="d_ours")
+                d_ours = st.text_area("우리 결과물", height=220, key="d_ours", on_change=_mark_editing)
             with coly:
-                d_ref = st.text_area("전문가 결과물", height=220, key="d_ref")
+                d_ref = st.text_area("전문가 결과물", height=220, key="d_ref", on_change=_mark_editing)
             d_src = st.text_input("전문가 결과물 출처 (URL 등)", key="d_src")
 
             if st.button("대결 등록", type="primary", disabled=not (d_ours.strip() and d_ref.strip())):
@@ -1443,3 +1594,182 @@ with tab9:
                 if b2.button("B 선택 ▶", key=f"wb_{d['duel_id']}", use_container_width=True):
                     _decide(not ours_a)
                     st.rerun()
+
+
+# --------------------------------------------------- TAB 10: 홈페이지 스튜디오
+
+def _ds_call(path, payload=None, method="post"):
+    url = f"{BACKEND_URL}/api/design/{path}"
+    if method == "get":
+        return requests.get(url, params=payload or {}, headers=auth_headers(), timeout=120).json()
+    return requests.post(url, json=payload or {}, headers=auth_headers(), timeout=180).json()
+
+
+with tab10:
+    st.subheader("🌐 홈페이지 스튜디오")
+    st.caption(
+        "한 번에 만들지 않습니다. 참고 사이트 구조를 확인하고, 방향을 골라 합의한 뒤에 제작합니다. "
+        "만든 뒤에도 말로 고칠 수 있습니다."
+    )
+
+    if not db_manager.is_configured():
+        st.info("Supabase 설정이 필요합니다.")
+    else:
+        try:
+            lst = _ds_call("get", method="get").get("rows") or []
+        except Exception:
+            lst = []
+
+        opts = {"➕ 새로 시작": None}
+        for r in lst:
+            label = f"{r['topic'][:28]} · {r.get('status','')} · {str(r.get('updated_at',''))[:10]}"
+            opts[label] = r["session_id"]
+        pick = st.selectbox("세션", list(opts.keys()), key="ds_pick")
+        sid = opts[pick]
+
+        # ── 새 세션
+        if sid is None:
+            with st.form("ds_new"):
+                t = st.text_input("무엇을 만들까요", placeholder="예: 고흥 유자 농장 홈페이지")
+                u = st.text_area(
+                    "벤치마킹할 URL (한 줄에 하나, 최대 3개)",
+                    height=90,
+                    placeholder="https://참고할사이트.com",
+                    help="구성을 뜯어서 보여드립니다. 틀린 부분은 직접 고칠 수 있습니다.",
+                )
+                if st.form_submit_button("분석 시작", type="primary") and t.strip():
+                    refs = [x.strip() for x in u.splitlines() if x.strip().startswith("http")][:3]
+                    try:
+                        out = _ds_call("start", {"topic": t.strip(), "refUrls": refs})
+                        if out.get("ok"):
+                            st.success("분석을 시작했습니다. 1~2분 뒤 목록에서 선택하세요.")
+                        else:
+                            st.error(out.get("error", "실패"))
+                    except Exception as e:
+                        st.error(f"백엔드 호출 실패: {e}")
+
+        # ── 기존 세션
+        else:
+            if st.button("새로고침", key="ds_refresh"):
+                st.rerun()
+            try:
+                row = _ds_call("get", {"id": sid}, method="get").get("row") or {}
+            except Exception as e:
+                st.error(f"불러오기 실패: {e}")
+                row = {}
+
+            status = row.get("status", "")
+            st.caption(f"상태 · {status}")
+
+            # 참고 구조 (사람이 고칠 수 있음)
+            rs = row.get("ref_structure") or {}
+            if rs:
+                with st.expander("🔎 참고 사이트 구조 — 틀린 곳은 고쳐주세요", expanded=(status=="proposing")):
+                    if rs.get("hero_claim"):
+                        st.markdown(f"**첫 화면 주장** · {rs['hero_claim']}")
+                    if rs.get("final_action"):
+                        st.markdown(f"**보내려는 곳** · {rs['final_action']}")
+                    if rs.get("nav"):
+                        st.caption("네비 · " + " / ".join(map(str, rs["nav"])))
+                    for sec in rs.get("sections", []):
+                        st.markdown(
+                            f"{sec.get('no','')}. **{sec.get('role','')}** "
+                            f"— {', '.join(map(str, sec.get('elements', [])))}"
+                        )
+                        if sec.get("why"):
+                            st.caption(f"   {sec['why']}")
+                    if rs.get("why_it_works"):
+                        st.info(rs["why_it_works"])
+
+                    fixed = st.text_area(
+                        "고칠 내용 (JSON)", value=json.dumps(rs, ensure_ascii=False, indent=2),
+                        height=200, key=f"rsfix_{sid}", on_change=_mark_editing,
+                    )
+                    if st.button("구조 수정 반영", key=f"rsbtn_{sid}"):
+                        try:
+                            _ds_call("fix-structure",
+                                     {"session_id": sid, "structure": json.loads(fixed)})
+                            st.success("반영했습니다")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"실패: {e}")
+
+            # 제안된 방향들
+            props = row.get("proposals") or []
+            if props and not row.get("chosen"):
+                st.markdown("### 방향 제안")
+                cols = st.columns(len(props[:3]))
+                for i, p in enumerate(props[:3]):
+                    with cols[i]:
+                        st.markdown(f"**{p.get('name','')}**")
+                        st.caption(p.get("one_line", ""))
+                        swat = "".join(
+                            f'<span style="display:inline-block;width:22px;height:22px;'
+                            f'border-radius:5px;margin-right:3px;background:{c.get("hex","#eee")};'
+                            f'border:1px solid #e6eaf1"></span>'
+                            for c in (p.get("color") or [])[:5]
+                        )
+                        st.markdown(swat, unsafe_allow_html=True)
+                        t2 = p.get("type") or {}
+                        st.caption(f"{t2.get('display','')} / {t2.get('body','')}")
+                        if p.get("signature"):
+                            st.caption(f"✦ {p['signature']}")
+                        if p.get("fits_when"):
+                            st.caption(f"맞을 때 · {p['fits_when']}")
+                        if p.get("risk"):
+                            st.caption(f"약점 · {p['risk']}")
+
+            # 확정된 방향
+            ch = row.get("chosen") or {}
+            if ch:
+                st.success(f"확정된 방향 · {ch.get('name','')}")
+                sw = "".join(
+                    f'<span style="display:inline-block;width:30px;height:30px;border-radius:6px;'
+                    f'margin-right:4px;background:{c.get("hex","#eee")};border:1px solid #e6eaf1"></span>'
+                    for c in (ch.get("color") or [])[:6]
+                )
+                st.markdown(sw, unsafe_allow_html=True)
+                if ch.get("signature"):
+                    st.caption(f"✦ 시그니처 · {ch['signature']}")
+
+            # 대화
+            st.divider()
+            for m in (row.get("messages") or [])[-10:]:
+                with st.chat_message("user" if m.get("role") == "user" else "assistant"):
+                    st.write(m.get("text", ""))
+
+            said = st.chat_input(
+                "어느 방향이 좋은지, 무엇을 바꾸고 싶은지 말씀해 주세요"
+            )
+            if said:
+                try:
+                    if row.get("html"):
+                        _ds_call("revise", {"session_id": sid, "message": said})
+                        st.info("고치는 중입니다. 잠시 뒤 새로고침하세요.")
+                    else:
+                        out = _ds_call("reply", {"session_id": sid, "message": said})
+                        if not out.get("ok"):
+                            st.error(out.get("error", "실패"))
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"실패: {e}")
+
+            # 제작
+            if ch and not row.get("html"):
+                if st.button("🛠 이 방향으로 만들기", type="primary", key=f"build_{sid}"):
+                    try:
+                        _ds_call("build", {"session_id": sid})
+                        st.info("만드는 중입니다. 2~3분 뒤 새로고침하세요.")
+                    except Exception as e:
+                        st.error(f"실패: {e}")
+
+            # 결과
+            if row.get("html"):
+                st.divider()
+                st.markdown("### 결과")
+                st.components.v1.html(row["html"], height=600, scrolling=True)
+                st.download_button(
+                    "⬇️ HTML 내려받기", data=row["html"],
+                    file_name=f"page_{sid[:8]}.html", mime="text/html", key=f"dsdl_{sid}",
+                )
+                st.caption("고칠 점이 있으면 위 대화창에 말씀해 주세요.")
