@@ -1,71 +1,3 @@
-with tab2:
-    st.subheader("🎯 새로운 벤치마킹 & 원고 생성 지시")
-    st.caption(
-        "생성은 백엔드 파이프라인이 담당합니다 — 디렉터가 기준을 세우고, 작성·검수를 반복하고, "
-        "채널별로 재가공합니다. 이 앱이 잠들어도 서버에서 계속 진행됩니다."
-    )
-
-    with st.form("agent_trigger_form"):
-        new_topic = st.text_input(
-            "💡 무엇을 만들까요", placeholder="예: 고흥 특산물 홍보 홈페이지 / 여름 시즌 기획전"
-        )
-        ref_raw = st.text_area(
-            "🔗 참고 URL (선택 · 한 줄에 하나, 최대 3개)",
-            placeholder="https://www.youtube.com/watch?v=...\nhttps://참고할홈페이지.com",
-            height=90,
-            help="유튜브·홈페이지·블로그 무엇이든 됩니다. 원문이 아니라 구조와 패턴만 뽑아 참고합니다.",
-        )
-        manual_src = st.text_area("📝 참고 메모 (선택)", height=80)
-        platforms = st.multiselect(
-            "📣 만들 것 (복수 선택)",
-            [
-                "인스타그램",
-                "네이버 블로그/카페",
-                "유튜브",
-                "상품 상세페이지",
-                "스레드(Threads)",
-                "홈페이지",
-            ],
-            default=["인스타그램"],
-            help=(
-                "인스타그램 → 카드뉴스 6장 + 이미지 프롬프트 / "
-                "스레드 → 500자 체인 / 홈페이지 → 섹션 구성안"
-            ),
-        )
-        submit_btn = st.form_submit_button("🚀 AI 에이전트 그룹 가동하기", type="primary")
-
-    if submit_btn:
-        if not new_topic.strip():
-            st.warning("무엇을 만들지 입력하세요.")
-        elif not platforms:
-            st.warning("만들 것을 하나 이상 고르세요.")
-        else:
-            refs = [u.strip() for u in ref_raw.splitlines() if u.strip().startswith("http")][:3]
-            try:
-                r = requests.post(
-                    f"{BACKEND_URL}/api/pipeline/run",
-                    json={
-                        "topic": new_topic.strip(),
-                        "channels": platforms,
-                        "refUrls": refs,
-                        "source": manual_src.strip(),
-                    },
-                    headers=auth_headers(),
-                    timeout=120,
-                )
-                out = r.json()
-                if out.get("ok"):
-                    st.success(
-                        "🚀 작업이 시작되었습니다. '📥 승인 대기 관제탑' 탭에서 진행 상황이 보입니다."
-                        + (f"  · 참고 URL {len(refs)}건" if refs else "")
-                    )
-                    st.caption(f"작업 번호 {out.get('generation_id','')[:8]}")
-                else:
-                    st.error(f"시작 실패: {out.get('error','알 수 없음')}")
-            except Exception as e:
-                st.error(f"백엔드 호출 실패: {e} (무료 인스턴스는 첫 요청이 느립니다)")
-
-
 import hmac
 import json
 import os
@@ -365,33 +297,70 @@ with tab1:
 # --------------------------------------------------- TAB 2: 작업 가동
 with tab2:
     st.subheader("🎯 새로운 벤치마킹 & 원고 생성 지시")
+    st.caption(
+        "생성은 백엔드 파이프라인이 담당합니다 — 디렉터가 기준을 세우고, 작성·검수를 반복하고, "
+        "채널별로 재가공합니다. 이 앱이 잠들어도 서버에서 계속 진행됩니다."
+    )
+
     with st.form("agent_trigger_form"):
-        youtube_url = st.text_input(
-            "🔗 벤치마킹 유튜브 URL", placeholder="https://www.youtube.com/watch?v=..."
-        )
         new_topic = st.text_input(
-            "💡 적용할 신규 주제", placeholder="예: 신제품 출시 안내 / 여름 시즌 기획전"
+            "💡 무엇을 만들까요", placeholder="예: 고흥 특산물 홍보 홈페이지 / 여름 시즌 기획전"
         )
+        ref_raw = st.text_area(
+            "🔗 참고 URL (선택 · 한 줄에 하나, 최대 3개)",
+            placeholder="https://www.youtube.com/watch?v=...\nhttps://참고할홈페이지.com",
+            height=90,
+            help="유튜브·홈페이지·블로그 무엇이든 됩니다. 원문이 아니라 구조와 패턴만 뽑아 참고합니다.",
+        )
+        manual_src = st.text_area("📝 참고 메모 (선택)", height=80)
         platforms = st.multiselect(
-            "📣 발행 채널 (복수 선택)",
-            ["인스타그램", "네이버 블로그/카페", "유튜브", "상품 상세페이지", "스레드(Threads)"],
+            "📣 만들 것 (복수 선택)",
+            [
+                "인스타그램",
+                "네이버 블로그/카페",
+                "유튜브",
+                "상품 상세페이지",
+                "스레드(Threads)",
+                "홈페이지",
+            ],
             default=["인스타그램"],
-            help="선택한 채널마다 길이·어조·해시태그를 다르게 재가공합니다. 인스타그램을 고르면 카드뉴스 6장도 함께 생성됩니다.",
+            help=(
+                "인스타그램 → 카드뉴스 6장 + 이미지 프롬프트 / "
+                "스레드 → 500자 체인 / 홈페이지 → 섹션 구성안"
+            ),
         )
         submit_btn = st.form_submit_button("🚀 AI 에이전트 그룹 가동하기", type="primary")
 
     if submit_btn:
-        if not (youtube_url and new_topic):
-            st.warning("유튜브 URL과 주제를 모두 입력하세요.")
-        elif not db_manager.is_configured():
-            st.error("Supabase 설정이 없어 작업을 시작할 수 없습니다.")
+        if not new_topic.strip():
+            st.warning("무엇을 만들지 입력하세요.")
+        elif not platforms:
+            st.warning("만들 것을 하나 이상 고르세요.")
         else:
-            threading.Thread(
-                target=run_agent_background,
-                args=(youtube_url, new_topic, platforms),
-                daemon=False,
-            ).start()
-            st.success("🚀 백그라운드 작업이 시작되었습니다! '📥 승인 대기 관제탑' 탭에서 확인하세요.")
+            refs = [u.strip() for u in ref_raw.splitlines() if u.strip().startswith("http")][:3]
+            try:
+                r = requests.post(
+                    f"{BACKEND_URL}/api/pipeline/run",
+                    json={
+                        "topic": new_topic.strip(),
+                        "channels": platforms,
+                        "refUrls": refs,
+                        "source": manual_src.strip(),
+                    },
+                    headers=auth_headers(),
+                    timeout=120,
+                )
+                out = r.json()
+                if out.get("ok"):
+                    st.success(
+                        "🚀 작업이 시작되었습니다. '📥 승인 대기 관제탑' 탭에서 진행 상황이 보입니다."
+                        + (f"  · 참고 URL {len(refs)}건" if refs else "")
+                    )
+                    st.caption(f"작업 번호 {str(out.get('generation_id',''))[:8]}")
+                else:
+                    st.error(f"시작 실패: {out.get('error','알 수 없음')}")
+            except Exception as e:
+                st.error(f"백엔드 호출 실패: {e} (무료 인스턴스는 첫 요청이 느립니다)")
 
 
 # --------------------------------------------------- TAB 3: 승인 관제탑
