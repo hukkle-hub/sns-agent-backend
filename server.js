@@ -555,6 +555,7 @@ function specBlock(sp){
 //   (무료 인스턴스는 수시로 재시작되며 그때 백그라운드 작업은 흔적 없이 사라진다)
 const PIPE_STALL_MS  = 8 * 60 * 1000;    // 8분간 신호 없으면 죽은 것으로 본다
 const PIPE_WATCH_MS  = 4 * 60 * 1000;    // 감시 주기
+const PIPE_MAX_AUTO_RETRY = 1;           // 스스로 다시 해보는 횟수. 넘으면 사람을 부른다
 
 async function pipeBeat(genId, stage, note){
   const patch = { heartbeat_at: new Date().toISOString(), stage: stage };
@@ -568,12 +569,34 @@ async function pipeWatchdog(){
     const cutoff = new Date(Date.now() - PIPE_STALL_MS).toISOString();
     const rows = await supaSelect(CG_TABLE,
       "approval_status=eq.processing&or=(heartbeat_at.lt."+cutoff+",heartbeat_at.is.null)"
-      + "&created_at.lt."+cutoff+"&select=generation_id,stage,topic&limit=20");
+      + "&created_at.lt."+cutoff
+      + "&select=generation_id,stage,topic,target_channel,human_answers,ref_urls,retry_count&limit=20");
     for (const r of (rows||[])){
+      const tried = Number(r.retry_count||0);
+      // 무료 인스턴스는 수시로 재시작된다. 사람을 부르기 전에 한 번은 스스로 다시 해본다.
+      if (tried < PIPE_MAX_AUTO_RETRY){
+        await supaPatch(CG_TABLE, "generation_id=eq."+r.generation_id, {
+          retry_count: tried + 1,
+          stage: "queued",
+          revision_count: 0,
+          blocked_reason: null,
+          ai_raw_output: "⏳ 신호가 끊겨 처음부터 다시 돌립니다 (" + (tried+1) + "번째).",
+          heartbeat_at: new Date().toISOString()
+        });
+        console.log("감시견: 자동 재개", r.generation_id, r.stage||"-", "→", tried+1, "회");
+        pipeRun(r.generation_id, {
+          topic: r.topic || "",
+          channels: String(r.target_channel||"").split(",").map(x=>x.trim()).filter(Boolean),
+          source: "watchdog",
+          answers: Array.isArray(r.human_answers) ? r.human_answers : [],
+          refUrls: Array.isArray(r.ref_urls) ? r.ref_urls : []
+        }).catch(e=>console.error("pipeRun(자동재개) 예외:", String(e&&e.message||e)));
+        continue;
+      }
       await supaPatch(CG_TABLE, "generation_id=eq."+r.generation_id, {
         approval_status: "failed",
         blocked_reason: "작업이 중단되었습니다 (단계: " + (r.stage||"시작 전")
-          + "). 서버 재시작이나 응답 지연으로 진행 신호가 끊겼습니다. 다시 시도해 주세요.",
+          + "). 스스로 " + tried + "번 다시 해봤지만 진행 신호가 또 끊겼습니다. 손이 필요합니다.",
         ai_raw_output: "❌ 중단됨 — " + (r.stage||"시작 전") + " 단계에서 신호가 끊겼습니다."
       });
       console.log("감시견: 중단 작업 정리", r.generation_id, r.stage||"-");
@@ -1319,6 +1342,44 @@ app.post("/api/pipeline/answer", async (req, res)=>{
   } catch(e){
     res.status(500).json({ ok:false, error:String(e&&e.message||e) });
   }
+});
+
+// 중단된 일 다시 — 새 건을 만들지 않고 같은 자리에서 처음부터 다시 돌린다.
+// 사람이 답해둔 것(human_answers)과 참고 자료(ref_urls)는 그대로 들고 간다.
+app.post("/api/pipeline/retry", async (req, res)=>{
+  try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.generation_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"generation_id 가 필요합니다" });
+
+    const rows = await supaSelect(CG_TABLE,
+      "generation_id=eq."+encodeURIComponent(id)
+      + "&select=topic,target_channel,human_answers,ref_urls,approval_status");
+    const row = rows && rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:"해당 작업을 찾을 수 없습니다" });
+    if (row.approval_status === "processing")
+      return res.status(409).json({ ok:false, error:"이미 진행 중입니다" });
+
+    await supaPatch(CG_TABLE, "generation_id=eq."+id, {
+      approval_status: "processing",
+      stage: "queued",
+      blocked_reason: null,
+      revision_count: 0,
+      retry_count: 0,                     // 사람이 다시 시켰으니 자동 재개 몫을 되돌려 준다
+      ai_raw_output: "⏳ 다시 시작합니다...",
+      heartbeat_at: new Date().toISOString()
+    });
+    res.json({ ok:true, generation_id:id });
+
+    pipeRun(id, {
+      topic: row.topic || "",
+      channels: String(row.target_channel||"").split(",").map(x=>x.trim()).filter(Boolean),
+      source: "retry",
+      answers: Array.isArray(row.human_answers) ? row.human_answers : [],
+      refUrls: Array.isArray(row.ref_urls) ? row.ref_urls : []
+    }).catch(e=>console.error("pipeRun(재시도) 예외:", String(e&&e.message||e)));
+
+  } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
 // 보관된 원문 조회 — 화면 로그를 지워도 여기서 다시 볼 수 있다
@@ -6119,7 +6180,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v277";
+const SERVER_VERSION = "v278";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
