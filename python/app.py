@@ -1,3 +1,71 @@
+with tab2:
+    st.subheader("🎯 새로운 벤치마킹 & 원고 생성 지시")
+    st.caption(
+        "생성은 백엔드 파이프라인이 담당합니다 — 디렉터가 기준을 세우고, 작성·검수를 반복하고, "
+        "채널별로 재가공합니다. 이 앱이 잠들어도 서버에서 계속 진행됩니다."
+    )
+
+    with st.form("agent_trigger_form"):
+        new_topic = st.text_input(
+            "💡 무엇을 만들까요", placeholder="예: 고흥 특산물 홍보 홈페이지 / 여름 시즌 기획전"
+        )
+        ref_raw = st.text_area(
+            "🔗 참고 URL (선택 · 한 줄에 하나, 최대 3개)",
+            placeholder="https://www.youtube.com/watch?v=...\nhttps://참고할홈페이지.com",
+            height=90,
+            help="유튜브·홈페이지·블로그 무엇이든 됩니다. 원문이 아니라 구조와 패턴만 뽑아 참고합니다.",
+        )
+        manual_src = st.text_area("📝 참고 메모 (선택)", height=80)
+        platforms = st.multiselect(
+            "📣 만들 것 (복수 선택)",
+            [
+                "인스타그램",
+                "네이버 블로그/카페",
+                "유튜브",
+                "상품 상세페이지",
+                "스레드(Threads)",
+                "홈페이지",
+            ],
+            default=["인스타그램"],
+            help=(
+                "인스타그램 → 카드뉴스 6장 + 이미지 프롬프트 / "
+                "스레드 → 500자 체인 / 홈페이지 → 섹션 구성안"
+            ),
+        )
+        submit_btn = st.form_submit_button("🚀 AI 에이전트 그룹 가동하기", type="primary")
+
+    if submit_btn:
+        if not new_topic.strip():
+            st.warning("무엇을 만들지 입력하세요.")
+        elif not platforms:
+            st.warning("만들 것을 하나 이상 고르세요.")
+        else:
+            refs = [u.strip() for u in ref_raw.splitlines() if u.strip().startswith("http")][:3]
+            try:
+                r = requests.post(
+                    f"{BACKEND_URL}/api/pipeline/run",
+                    json={
+                        "topic": new_topic.strip(),
+                        "channels": platforms,
+                        "refUrls": refs,
+                        "source": manual_src.strip(),
+                    },
+                    headers=auth_headers(),
+                    timeout=120,
+                )
+                out = r.json()
+                if out.get("ok"):
+                    st.success(
+                        "🚀 작업이 시작되었습니다. '📥 승인 대기 관제탑' 탭에서 진행 상황이 보입니다."
+                        + (f"  · 참고 URL {len(refs)}건" if refs else "")
+                    )
+                    st.caption(f"작업 번호 {out.get('generation_id','')[:8]}")
+                else:
+                    st.error(f"시작 실패: {out.get('error','알 수 없음')}")
+            except Exception as e:
+                st.error(f"백엔드 호출 실패: {e} (무료 인스턴스는 첫 요청이 느립니다)")
+
+
 import hmac
 import json
 import os
@@ -419,6 +487,35 @@ def render_approval_control_center():
                         for c in sp["success_criteria"]:
                             st.markdown(f"- {c}")
 
+            page = item.get("page_spec") or {}
+            if page.get("sections"):
+                st.markdown("**🌐 홈페이지 구성안**")
+                if page.get("title"):
+                    st.caption(page["title"])
+                for sec in page["sections"]:
+                    with st.container(border=True):
+                        st.markdown(
+                            f"**{sec.get('id','')}** · {sec.get('purpose','')}"
+                        )
+                        if sec.get("headline"):
+                            st.markdown(f"### {sec['headline']}")
+                        if sec.get("body"):
+                            st.write(sec["body"])
+                if page.get("cta"):
+                    st.info(f"CTA · {page['cta']}")
+                if page.get("needs"):
+                    st.warning("**확정이 필요한 정보**")
+                    for nd in page["needs"]:
+                        st.markdown(f"- {nd}")
+
+            refs = item.get("ref_urls") or []
+            if refs or item.get("ref_summary"):
+                with st.expander(f"🔎 참고 자료 ({len(refs)}건)"):
+                    for u in refs:
+                        st.caption(u)
+                    if item.get("ref_summary"):
+                        st.write(item["ref_summary"])
+
             if cards:
                 st.markdown("**🖼️ 카드뉴스 6장**")
                 for c in cards:
@@ -438,6 +535,14 @@ def render_approval_control_center():
                 )
             with col2:
                 st.markdown("### 🎛️ 발행 조종석")
+                gap = item.get("judgment_gap")
+                if gap is not None:
+                    cx = item.get("cross_creativity")
+                    if float(gap) > 12:
+                        st.warning(f"⚖️ 판단 갈림 · 우리 {item.get('creativity_score')} vs 교차 {cx}")
+                    else:
+                        st.caption(f"⚖️ 교차 판단 일치 (차이 {float(gap):.0f})")
+
                 ai_cre = item.get("creativity_score")
                 st.caption(
                     f"AI 수준 점수: {float(ai_cre):.0f}" if ai_cre is not None else "AI 수준 점수: -"
