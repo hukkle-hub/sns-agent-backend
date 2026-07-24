@@ -654,15 +654,77 @@ async function calibrationNote(){
   } catch(e){ return ""; }
 }
 
+/* v272: 참고 URL 수집.
+   기존에는 참고자료를 텍스트로 직접 넣어야만 했다.
+   유튜브뿐 아니라 홈페이지·블로그 어떤 주소든 읽어서 재료로 쓴다.
+   중요: 원문을 그대로 저장하지 않는다. 구조·패턴만 추출해 남긴다(저작권). */
+const REF_SYS = `너는 참고 자료에서 '다시 쓸 수 있는 구조와 패턴'만 뽑아내는 분석가다.
+
+규칙:
+- 원문 문장을 그대로 옮기지 마라. 표현이 아니라 구조를 적어라.
+- 무엇을 어떤 순서로 배치했는지, 어떤 방식으로 설득했는지를 적어라.
+- 홈페이지·랜딩페이지라면 섹션 구성과 각 섹션의 목적을 적어라.
+- 영상·글이라면 도입 방식, 전개 순서, 마무리 방식을 적어라.
+- 왜 그 방식이 통하는지 한 줄로 덧붙여라.
+- 한국어, 마크다운 없이 간결하게.`;
+
+async function collectRefs(urls){
+  const list = (Array.isArray(urls) ? urls : []).map(u=>String(u||"").trim())
+    .filter(u=>/^https?:\/\//.test(u)).slice(0, 3);   // 최대 3개
+  if (!list.length) return { text:"", used:[] };
+
+  const parts = [], used = [];
+  for (const u of list){
+    try {
+      const raw = await fetchPageText(u);
+      if (raw && raw.length > 200){ parts.push("[출처] "+u+"\n"+raw.slice(0, 6000)); used.push(u); }
+    } catch(e){
+      console.error("참고 수집 실패:", u, String(e&&e.message||e));
+    }
+  }
+  if (!parts.length) return { text:"", used:[] };
+
+  let summary = "";
+  try {
+    summary = await anthropic(REF_SYS, parts.join("\n\n---\n\n"), 1500);
+  } catch(e){ summary = ""; }
+  return { text: String(summary||"").trim(), used: used };
+}
+
+const PAGE_SYS = `너는 랜딩페이지 기획자다. 원고를 웹페이지 구성안으로 바꾼다.
+
+규칙:
+- 섹션 5~7개. 각 섹션마다 목적이 분명해야 한다.
+- 첫 화면(hero)은 3초 안에 '무엇을 파는 곳인지'가 읽혀야 한다.
+- 각 섹션에 실제로 들어갈 문구(headline, body)를 쓴다. 자리표시자를 쓰지 마라.
+- 확정되지 않은 정보(가격·연락처·인증)는 body 에 쓰지 말고 needs 에 적는다.
+- 마지막은 행동 유도 섹션으로 끝낸다.
+- 원고에 없는 사실을 만들지 마라.
+
+JSON만 출력한다.
+{"title":"","sections":[{"id":"hero","purpose":"","headline":"","body":""}],"cta":"","needs":[]}`;
+
 async function pipeRun(genId, opts){
   const topic     = String(opts.topic||"").trim();
   const channels  = Array.isArray(opts.channels) ? opts.channels : [];
-  const source    = String(opts.source||"").slice(0, 6000);
+  let   source    = String(opts.source||"").slice(0, 6000);
+  const refUrls   = Array.isArray(opts.refUrls) ? opts.refUrls : [];
   const ctx       = await pipeContext();
   const calNote   = await calibrationNote();
 
   try {
     // ── 1. 디렉터
+    if (refUrls.length){
+      await pipeBeat(genId, "research", "⏳ 참고 자료를 읽는 중...");
+      const ref = await collectRefs(refUrls);
+      if (ref.text){
+        source = (source ? source + "\n\n" : "")
+               + "=== 참고 자료에서 뽑은 구조·패턴 ===\n" + ref.text;
+        await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+          ref_urls: ref.used, ref_summary: ref.text.slice(0, 4000) });
+      }
+    }
+
     await pipeBeat(genId, "director", "⏳ 기준을 세우는 중...");
     const spec = pipeJson(await anthropic(
       DIRECTOR_SYS,
@@ -794,6 +856,14 @@ async function pipeRun(genId, opts){
       if (Array.isArray(k.cards)) cards = k.cards.slice(0,6);
     }
 
+    // ── 4.5 홈페이지 구성안 (홈페이지 선택 시)
+    let pageSpec = null;
+    if (channels.some(p=>/홈페이지|랜딩|웹사이트/i.test(p))){
+      await pipeBeat(genId, "page", "⏳ 페이지 구성안 작성 중...");
+      const ps = pipeJson(await anthropic(PAGE_SYS, draft + ctx, 4000));
+      if (ps && Array.isArray(ps.sections) && ps.sections.length) pageSpec = ps;
+    }
+
     // ── 5. 스레드 체인 (스레드 선택 시)
     let chain = null;
     if (channels.some(p=>/스레드|threads/i.test(p))){
@@ -817,6 +887,7 @@ async function pipeRun(genId, opts){
       channel_outputs: channelOutputs,
       cards: cards,
       threads_chain: chain,
+      page_spec: pageSpec,
       target_channel: channels.join(", ") || null
     });
     console.log("파이프라인 완료:", genId, "결함"+score, "수준"+creativity, rev+"차");
@@ -853,7 +924,9 @@ app.post("/api/pipeline/run", async (req, res)=>{
       topic: topic,
       channels: Array.isArray(req.body?.channels) ? req.body.channels : [],
       source: req.body?.source || "",
-      answers: Array.isArray(req.body?.answers) ? req.body.answers : []
+      answers: Array.isArray(req.body?.answers) ? req.body.answers : [],
+      refUrls: Array.isArray(req.body?.refUrls) ? req.body.refUrls
+               : (req.body?.refUrl ? [req.body.refUrl] : [])
     }).catch(e=>console.error("pipeRun 예외:", String(e&&e.message||e)));
 
   } catch(e){
@@ -5637,7 +5710,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v270";
+const SERVER_VERSION = "v272";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
