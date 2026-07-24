@@ -630,11 +630,36 @@ function judgmentNote(gap, ours, theirs){
   return "판단이 크게 갈림(" + ours + " vs " + theirs + ") — 우리 기준이 밖에서 통하지 않을 수 있음. 사람 확인 필요";
 }
 
+/* v270: 사람 채점과의 편차를 검수자에게 되먹인다.
+   Python 관제탑에만 있던 것을 Node 파이프라인으로 옮긴다.
+   이게 없으면 검수자는 자기 기준이 사람 기준과 얼마나 어긋나는지 모른 채 계속 매긴다. */
+async function calibrationNote(){
+  if (!useSupabase) return "";
+  try {
+    const rows = await supaSelect(CG_TABLE,
+      "human_score=not.is.null&creativity_score=not.is.null"
+      + "&select=creativity_score,human_score&order=approved_at.desc&limit=10");
+    if (!rows || rows.length < 3) return "";
+    let sum = 0;
+    for (const r of rows) sum += Number(r.creativity_score||0) - Number(r.human_score||0);
+    const gap = sum / rows.length;
+    if (Math.abs(gap) < 5) return "";
+    if (gap > 0){
+      return "\n[채점 보정] 최근 " + rows.length + "건에서 너는 사람 기준보다 평균 "
+        + gap.toFixed(0) + "점 후하게 매겼다. 그만큼 더 엄격하게 보라. "
+        + "특히 '무난하다'고 느껴지면 50점 이하로 내려라.\n";
+    }
+    return "\n[채점 보정] 최근 " + rows.length + "건에서 너는 사람 기준보다 평균 "
+      + Math.abs(gap).toFixed(0) + "점 낮게 매겼다. 잘된 부분을 놓치고 있지 않은지 다시 보라.\n";
+  } catch(e){ return ""; }
+}
+
 async function pipeRun(genId, opts){
   const topic     = String(opts.topic||"").trim();
   const channels  = Array.isArray(opts.channels) ? opts.channels : [];
   const source    = String(opts.source||"").slice(0, 6000);
   const ctx       = await pipeContext();
+  const calNote   = await calibrationNote();
 
   try {
     // ── 1. 디렉터
@@ -674,7 +699,7 @@ async function pipeRun(genId, opts){
 
       const c = pipeJson(await anthropic(
         CRITIC_SYS,
-        specBlock(spec)+unknownBlock(spec)+answerBlock+
+        specBlock(spec)+unknownBlock(spec)+answerBlock+calNote+
         "\n위 성공 기준을 하나씩 따져서 creativity 를 매겨라.\n"
         + ctx + "\n작성 대상 채널: "+(channels[0]||"미지정")+"\n\n원고:\n"+draft, 3000));
 
@@ -5612,7 +5637,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v269";
+const SERVER_VERSION = "v270";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
