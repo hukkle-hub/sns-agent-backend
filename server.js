@@ -396,6 +396,260 @@ async function threadsPollReplies(){
 
 setInterval(()=>{ threadsPollReplies().catch(e=>console.error("댓글 감시 예외:", e.message)); }, TH_POLL_MS);
 
+// ─────────────────────────────────────────────────────────────
+// v257: 콘텐츠 파이프라인 (Streamlit/LangGraph 에서 이식)
+//   디렉터 → 작성 → 검수(재작성 루프) → 채널별 재가공 → 스레드 체인
+//   실행은 수 분이 걸리므로 요청은 즉시 반환하고 백그라운드로 돌린다.
+//   진행 상황은 content_generations 행으로만 주고받는다(관제탑 방식과 동일).
+// ─────────────────────────────────────────────────────────────
+const CG_TABLE = "content_generations";
+const PIPE_PASS_SCORE     = Number(process.env.PASS_SCORE || 85);
+const PIPE_CREATIVITY_MIN = Number(process.env.CREATIVITY_MIN || 70);
+const PIPE_MAX_REVISIONS  = Number(process.env.MAX_REVISIONS || 3);
+
+async function supaPatch(table, query, patch){
+  const r = await fetch(SUPA_URL+"/rest/v1/"+table+"?"+query, {
+    method:"PATCH",
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
+              "Content-Type":"application/json", Prefer:"return=minimal" },
+    body: JSON.stringify(patch)
+  });
+  return r.ok;
+}
+async function supaInsertReturn(table, row){
+  const r = await fetch(SUPA_URL+"/rest/v1/"+table, {
+    method:"POST",
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
+              "Content-Type":"application/json", Prefer:"return=representation" },
+    body: JSON.stringify([row])
+  });
+  if (!r.ok) throw new Error(table+" insert HTTP "+r.status);
+  const j = await r.json();
+  return Array.isArray(j) ? j[0] : null;
+}
+
+function pipeJson(text){
+  const t = String(text||"").replace(/^```(?:json)?/gm,"").replace(/```$/gm,"").trim();
+  try { return JSON.parse(t); } catch(_){}
+  const m = t.match(/\{[\s\S]*\}/);
+  if (m){ try { return JSON.parse(m[0]); } catch(_){} }
+  return {};
+}
+
+// 브랜드 보이스 + 누적 규칙을 프롬프트 블록으로
+async function pipeContext(){
+  let voice = "", rules = [];
+  if (useSupabase){
+    try {
+      const v = await supaSelect("brand_voice", "is_active=eq.true&select=content&limit=1");
+      if (v && v[0]) voice = String(v[0].content||"");
+    } catch(_){}
+    try {
+      const r = await supaSelect("learned_rules",
+        "is_active=eq.true&select=rule_text&order=hit_count.desc&limit=15");
+      rules = (r||[]).map(x=>x.rule_text).filter(Boolean);
+    } catch(_){}
+  }
+  let block = "";
+  if (voice){
+    block += "\n\n=== 브랜드 보이스 ===\n" + voice.trim() +
+             "\n=== 끝 ===\n말투, 금지 표현, 채널별 규칙을 반드시 지켜라.\n";
+  }
+  if (rules.length){
+    block += "\n\n=== 과거 수정에서 학습한 규칙 (최우선) ===\n" +
+             rules.map(r=>"- "+r).join("\n") +
+             "\n=== 끝 ===\n실제로 사람이 반복해서 고친 내용이다. 브랜드 보이스와 충돌하면 이쪽을 따른다.\n";
+  }
+  return block;
+}
+
+const DIRECTOR_SYS = `너는 콘텐츠 디렉터다. 작성자가 쓰기 전에 무엇을 쓸지 정한다.
+너는 나중에 이 기준으로 직접 채점하므로, 스스로 지킬 수 있는 기준만 세워라.
+1. 이번 글의 목표를 정한다.
+2. 흔한 각도를 피해 각도를 정하고 근거를 댄다.
+3. 반드시 넣을 것과 절대 넣지 말 것을 구체적으로 적는다.
+4. 성공 기준 3~5개. 판정 불가능한 문장("자연스러울 것") 금지.
+   좋은 예: "첫 문장에 숫자나 장면이 있어 스크롤을 멈추게 한다"
+5. 임의로 정하면 결과가 크게 달라질 지점은 open_questions 에 적는다.
+자료가 부실하면 그 사실을 명시하고 없는 사실을 지어내지 말라고 못박아라.
+반드시 JSON만 출력한다.
+{"goal":"","angle":"","why_angle":"","must_include":[],"must_avoid":[],"success_criteria":[],"open_questions":[]}`;
+
+const CRITIC_SYS = `원고를 두 축으로 엄격히 평가하고 JSON만 출력한다.
+[축1 score 0~100] 결함 점검. 과장광고·사실오류·채널규칙 위반·CTA 부재를 감점.
+  이 축은 '문제가 없는가'만 본다. 문제가 없다고 좋은 글은 아니다.
+[축2 creativity 0~100] 수준 평가. 기본값 50이며 근거 없이 올리지 마라.
+  - 첫 문장이 같은 주제의 흔한 글과 구별되는가
+  - 이 브랜드가 아니면 할 수 없는 말이 있는가
+  - 구성에 의도가 보이는가(나열이 아니라 설계인가)
+  - 읽고 나서 남는 것이 있는가
+  무난하고 매끄럽기만 하면 50점. 흔한 표현으로 채워졌으면 40점 이하.
+  '전문가가 썼다면 이 정도는 넘었을 것'을 기준선으로 삼아라.
+critique 에는 무엇을 고쳐야 축2가 오르는지 구체적으로 적어라.
+{"score":0,"creativity":0,"would_pay":false,"critique":""}`;
+
+const ADAPTER_SYS = `승인된 원고를 채널별로 다시 쓴다.
+채널마다 길이·어조·해시태그 개수를 다르게 한다. 복사하지 마라.
+브랜드 보이스의 채널별 규칙이 있으면 그대로 따른다.
+원고에 없는 사실·수치·효능을 만들지 마라. JSON만 출력한다.
+{"channels":{"채널명":"완성 원고"}}`;
+
+const CARD_SYS = `원고를 6장 캐러셀로 구성한다.
+1장은 후킹, 6장은 행동 유도. 각 장 body 는 40자 이내.
+visual_prompt 는 이미지 생성기에 넣을 영어 프롬프트다. 글자를 그리라는 지시는 넣지 마라.
+원고에 없는 사실을 만들지 마라. JSON만 출력한다.
+{"cards":[{"no":1,"title":"","body":"","visual_prompt":""}]}`;
+
+const THREADS_SYS = `원고를 스레드 체인으로 바꾼다.
+각 글 500자 이하, 3~6개. 1번 글 첫 두 줄에서 멈추게 하라. 인사말 금지.
+각 글은 그 자체로 읽히되 다음을 궁금하게 끝낸다. 마지막 글에 행동 유도.
+해시태그는 마지막 글에만 3개 이하. 본문에 외부 링크를 넣지 마라(노출이 줄어든다).
+JSON만 출력한다. {"chain":["",""]}`;
+
+function specBlock(sp){
+  if (!sp || !sp.goal) return "";
+  const L = k => Array.isArray(sp[k]) ? sp[k].map(x=>"  - "+x).join("\n") : "";
+  return "\n\n=== 이번 글의 기준 (디렉터 지시) ===\n"
+    + "목표: " + (sp.goal||"") + "\n"
+    + "각도: " + (sp.angle||"") + " (" + (sp.why_angle||"") + ")\n"
+    + "반드시 포함:\n" + L("must_include") + "\n"
+    + "절대 금지:\n"   + L("must_avoid") + "\n"
+    + "성공 기준:\n"   + L("success_criteria") + "\n=== 끝 ===\n";
+}
+
+async function pipeRun(genId, opts){
+  const topic     = String(opts.topic||"").trim();
+  const channels  = Array.isArray(opts.channels) ? opts.channels : [];
+  const source    = String(opts.source||"").slice(0, 6000);
+  const ctx       = await pipeContext();
+
+  try {
+    // ── 1. 디렉터
+    const spec = pipeJson(await anthropic(
+      DIRECTOR_SYS,
+      "주제: "+topic+"\n대상 채널: "+(channels.join(", ")||"미지정")+
+      "\n\n참고 자료:\n"+(source||"(없음)")+ctx, 2000));
+    await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+      spec: spec, open_questions: spec.open_questions || null,
+      ai_raw_output: "⏳ 기준 수립 완료 — 원고 작성 중..."
+    });
+
+    // ── 2. 작성 ↔ 검수 루프
+    let draft = "", critique = "", rev = 0, score = 0, creativity = 0, wouldPay = false;
+    while (rev < PIPE_MAX_REVISIONS){
+      const wp = rev === 0
+        ? "주제: "+topic+"\n\n참고 자료:\n"+(source||"(없음)")+specBlock(spec)+ctx+
+          "\n위 기준에 맞춰 원고를 작성하라. 과장광고 표현과 근거 없는 수치는 쓰지 마라."
+        : "이전 원고:\n"+draft+"\n\n검수 피드백:\n"+critique+specBlock(spec)+ctx+
+          "\n피드백을 반영해 완성본을 다시 작성하라.";
+      draft = await anthropic("너는 전문 콘텐츠 작가다. 지시받은 기준을 그대로 지킨다.", wp, 4000);
+      rev++;
+      await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+        ai_raw_output: "⏳ "+rev+"차 원고 작성 완료 — 검수 중...", revision_count: rev });
+
+      const c = pipeJson(await anthropic(
+        CRITIC_SYS,
+        specBlock(spec)+"\n위 성공 기준을 하나씩 따져서 creativity 를 매겨라.\n"
+        + ctx + "\n작성 대상 채널: "+(channels[0]||"미지정")+"\n\n원고:\n"+draft, 3000));
+      score      = Number(c.score||0);
+      creativity = Number(c.creativity||0);
+      wouldPay   = !!c.would_pay;
+      critique   = String(c.critique||"");
+
+      if (score >= PIPE_PASS_SCORE && creativity >= PIPE_CREATIVITY_MIN) break;
+    }
+
+    // ── 3. 채널별 재가공
+    let channelOutputs = null;
+    if (channels.length){
+      const a = pipeJson(await anthropic(
+        ADAPTER_SYS, "대상 채널: "+channels.join(", ")+"\n\n원고:\n"+draft+ctx, 4000));
+      if (a && a.channels && typeof a.channels === "object") channelOutputs = a.channels;
+    }
+
+    // ── 4. 카드뉴스 (인스타 선택 시)
+    let cards = null;
+    if (channels.some(p=>/인스타|instagram/i.test(p))){
+      const k = pipeJson(await anthropic(CARD_SYS, draft, 3000));
+      if (Array.isArray(k.cards)) cards = k.cards.slice(0,6);
+    }
+
+    // ── 5. 스레드 체인 (스레드 선택 시)
+    let chain = null;
+    if (channels.some(p=>/스레드|threads/i.test(p))){
+      const t = pipeJson(await anthropic(THREADS_SYS, draft+ctx, 3000));
+      if (Array.isArray(t.chain)){
+        chain = t.chain.map(x=>String(x||"").trim()).filter(Boolean)
+                       .map(x=>x.length>500 ? x.slice(0,500) : x).slice(0,8);
+      }
+    }
+
+    await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+      ai_raw_output: draft,
+      ai_self_score: score,
+      creativity_score: creativity,
+      would_pay: wouldPay,
+      revision_count: rev,
+      approval_status: "pending",
+      channel_outputs: channelOutputs,
+      cards: cards,
+      threads_chain: chain,
+      target_channel: channels.join(", ") || null
+    });
+    console.log("파이프라인 완료:", genId, "결함"+score, "수준"+creativity, rev+"차");
+
+  } catch(e){
+    const msg = String(e && e.message || e).slice(0, 500);
+    console.error("파이프라인 실패:", genId, msg);
+    await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+      ai_raw_output: "❌ 생성 오류: "+msg, approval_status: "failed" }).catch(()=>{});
+  }
+}
+
+app.post("/api/pipeline/run", async (req, res)=>{
+  try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const topic = String(req.body?.topic||"").trim();
+    if (!topic) return res.status(400).json({ ok:false, error:"주제가 필요합니다" });
+
+    const row = await supaInsertReturn(CG_TABLE, {
+      topic: topic,
+      ai_raw_output: "⏳ 작업을 시작합니다...",
+      ai_self_score: 0,
+      revision_count: 0,
+      approval_status: "processing"
+    });
+    if (!row || !row.generation_id) throw new Error("행 생성 실패");
+
+    // 응답은 즉시. 실제 작업은 백그라운드.
+    res.json({ ok:true, generation_id: row.generation_id });
+    pipeRun(row.generation_id, {
+      topic: topic,
+      channels: Array.isArray(req.body?.channels) ? req.body.channels : [],
+      source: req.body?.source || ""
+    }).catch(e=>console.error("pipeRun 예외:", String(e&&e.message||e)));
+
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e&&e.message||e) });
+  }
+});
+
+app.get("/api/pipeline/status", async (req, res)=>{
+  try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.query.id||"");
+    const sel = "generation_id,topic,approval_status,ai_raw_output,ai_self_score,"
+              + "creativity_score,would_pay,revision_count,channel_outputs,cards,"
+              + "threads_chain,spec,open_questions,created_at";
+    const q = id
+      ? "generation_id=eq."+encodeURIComponent(id)+"&select="+sel
+      : "approval_status=in.(processing,pending,failed)&select="+sel+"&order=created_at.desc&limit=20";
+    res.json({ ok:true, rows: await supaSelect(CG_TABLE, q) });
+  } catch(e){
+    res.status(500).json({ ok:false, error:String(e&&e.message||e) });
+  }
+});
+
 // 영구저장 라이브 점검: 실제로 테이블을 읽어 연결·권한·테이블 존재를 확인
 async function supaProbe(){
   if(!useSupabase) return { ok:false, note:"미설정 — 재배포 시 데이터 유실 가능" };
@@ -4891,7 +5145,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v248";
+const SERVER_VERSION = "v257";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
