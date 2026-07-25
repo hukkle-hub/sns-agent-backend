@@ -594,8 +594,9 @@ function deptsForChannels(channels, topic){
   const t = (Array.isArray(channels) ? channels.join(" ") : "") + " " + String(topic||"");
   const out = [];
   const add = d => { if (AGENTS[d] && out.indexOf(d) < 0) out.push(d); };
-  if (/홈페이지|랜딩|웹|상세|상품/.test(t))     add("analytics");
-  if (/블로그|카페|네이버|티스토리/.test(t))     add("advisory");
+  if (/홈페이지|랜딩|웹|상세|상품/.test(t)){    add("analytics"); add("editing"); }
+  if (/블로그|카페|네이버|티스토리/.test(t))     add("creation");
+  if (/카카오|카톡|문의|응대|고객|CS|친구/i.test(t)) add("advisory");
   if (/유튜브|영상|쇼츠|릴스/.test(t))          add("publishing");
   if (/인스타|카드뉴스|썸네일|배너/.test(t))     add("monetization");
   if (/스레드|threads/i.test(t))               add("strategy");
@@ -774,7 +775,7 @@ async function pipeWatchdog(){
     const rows = await supaSelect(CG_TABLE,
       "approval_status=eq.processing&or=(heartbeat_at.lt."+cutoff+",heartbeat_at.is.null)"
       + "&created_at.lt."+cutoff
-      + "&select=generation_id,stage,topic,target_channel,human_answers,ref_urls,retry_count&limit=20");
+      + "&select=generation_id,stage,topic,target_channel,human_answers,ref_urls,retry_count,spec,ref_summary,ai_raw_output&limit=20");
     for (const r of (rows||[])){
       const tried = Number(r.retry_count||0);
       // 무료 인스턴스는 수시로 재시작된다. 사람을 부르기 전에 한 번은 스스로 다시 해본다.
@@ -793,7 +794,10 @@ async function pipeWatchdog(){
           channels: String(r.target_channel||"").split(",").map(x=>x.trim()).filter(Boolean),
           source: "watchdog",
           answers: Array.isArray(r.human_answers) ? r.human_answers : [],
-          refUrls: Array.isArray(r.ref_urls) ? r.ref_urls : []
+          refUrls: Array.isArray(r.ref_urls) ? r.ref_urls : [],
+          spec: r.spec || null,
+          refSummary: r.ref_summary || "",
+          draft: r.ai_raw_output || ""
         }).catch(e=>console.error("pipeRun(자동재개) 예외:", String(e&&e.message||e)));
         continue;
       }
@@ -1197,7 +1201,27 @@ app.post("/api/studio/build", async (req, res)=>{
       const k = html.indexOf("<!DOCTYPE");
       if (k > 0) html = html.slice(k);
 
-      await dsPatch(id, { page_spec: spec, html: html, status: "built" });
+      // 퍼블리셔(디3 노아라)가 마지막으로 훑는다 — 깨진 채로 내보내지 않는다
+      await dsPatch(id, { status:"publishing" }).catch(()=>{});
+      const pub = await publisherPass(html, row.chosen);
+      html = pub.html;
+      const note = pub.defects.length
+        ? (AGENTS.editing ? MEMBERS.editing : "퍼블리셔") + " 점검 — "
+          + (pub.fixed ? pub.defects.length+"곳을 고쳤습니다: " : "다음을 발견했습니다(수정 실패): ")
+          + pub.defects.slice(0,6).join(" / ")
+          + ((pub.left && pub.left.length) ? "\n아직 남은 것: "+pub.left.slice(0,3).join(" / ") : "")
+        : (MEMBERS.editing||"퍼블리셔") + " 점검 — 깨진 곳 없습니다.";
+
+      await dsPatch(id, { page_spec: spec, html: html, status: "built",
+        messages: dsPush(row.messages, "assistant", note) });
+
+      // 자주 나오는 결함은 부서가 배워야 한다
+      if (pub.defects.length >= 3){
+        pushLearning("editing", "publish-check",
+          "홈페이지 생성 — " + String(row.topic||"").slice(0,120),
+          "생성된 HTML에서 반복해서 발견되는 결함: " + pub.defects.slice(0,6).join(" / ")
+          + " → 다음부터 생성 단계에서 미리 막을 것.").catch(()=>{});
+      }
     })().catch(async e=>{
       console.error("design build 예외:", e.message);
       await dsPatch(id, { status:"direction_set" }).catch(()=>{});
@@ -1205,6 +1229,58 @@ app.post("/api/studio/build", async (req, res)=>{
 
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
+
+
+/* ═══ 웹 퍼블리셔 점검 (디3 노아라) ═══
+   생성된 HTML을 그대로 내보내면 태그가 안 닫히거나 섹션이 잘린 채로 나간다.
+   실제로 "결과물 자체가 미완성(표 잘림)으로 끝났다"는 기록이 남아 있었다.
+   ① 기계로 셀 수 있는 것은 기계가 센다(토큰 낭비 금지)
+   ② 고칠 게 있을 때만 AI를 부른다 */
+function htmlDefects(html){
+  const h = String(html||"");
+  const out = [];
+  if (h.length < 500) out.push("내용이 너무 짧다 — 생성이 중간에 끊겼다");
+  if (!/<\/html>\s*$/i.test(h.trim())) out.push("</html> 로 끝나지 않는다 — 뒷부분이 잘렸다");
+  if (!/<meta[^>]+viewport/i.test(h)) out.push("viewport 메타태그가 없다 — 모바일에서 깨진다");
+  if (!/<title[^>]*>[^<]+<\/title>/i.test(h)) out.push("title 이 비어 있다");
+  if (/<html(?![^>]*lang=)/i.test(h)) out.push("html 태그에 lang 이 없다");
+  // 태그 짝 맞춤 — 자주 깨지는 것만
+  ["div","section","main","header","footer","ul","table","a","p"].forEach(t=>{
+    const open  = (h.match(new RegExp("<"+t+"(\\\\s|>)","gi"))||[]).length;
+    const close = (h.match(new RegExp("</"+t+">","gi"))||[]).length;
+    if (open - close > 0) out.push("<"+t+"> 가 "+(open-close)+"개 안 닫혔다");
+  });
+  const imgs = h.match(/<img[^>]*>/gi) || [];
+  const noAlt = imgs.filter(x=>!/alt\s*=/i.test(x)).length;
+  if (noAlt) out.push("이미지 "+noAlt+"개에 alt 가 없다");
+  const badSrc = imgs.filter(x=>/src\s*=\s*["'](?:#|about:blank|)["']/i.test(x)).length;
+  if (badSrc) out.push("이미지 "+badSrc+"개의 경로가 비었다");
+  if (/href\s*=\s*["']#["']/i.test(h) && (h.match(/href\s*=\s*["']#["']/gi)||[]).length > 3)
+    out.push("빈 링크(href=\"#\")가 많다");
+  if (/\bfont-size\s*:\s*(?:[0-9]|1[0-2])px/i.test(h)) out.push("12px 이하 글자가 있다 — 모바일에서 안 읽힌다");
+  if (/lorem ipsum|샘플 텍스트|여기에 내용/i.test(h)) out.push("자리표시 문구가 남아 있다");
+  return out;
+}
+
+async function publisherPass(html, tokens){
+  const defects = htmlDefects(html);
+  if (!defects.length) return { html, defects: [], fixed: false };
+  try{
+    let fixed = await anthropic(
+      "너는 웹 퍼블리셔다. 디자인을 바꾸는 사람이 아니라 무너진 것을 세우는 사람이다.\n"
+      + "아래 HTML에서 지적된 결함만 고쳐라. 색·문구·구성은 절대 바꾸지 마라.\n"
+      + "잘려 있으면 같은 톤으로 이어 완성하고, 안 닫힌 태그는 닫고, 빠진 메타태그는 넣어라.\n"
+      + "완성된 HTML 전체만 출력한다. 설명·코드펜스 금지.",
+      "발견된 결함:\n- " + defects.join("\n- ")
+      + "\n\n디자인 토큰(참고, 바꾸지 말 것):\n" + JSON.stringify(tokens||{})
+      + "\n\nHTML:\n" + String(html).slice(0, 40000), 12000);
+    fixed = String(fixed||"").replace(/^```(?:html)?/m,"").replace(/```\s*$/m,"").trim();
+    const k = fixed.indexOf("<!DOCTYPE");
+    if (k > 0) fixed = fixed.slice(k);
+    if (fixed.length < Math.max(500, String(html).length * 0.6)) return { html, defects, fixed:false };
+    return { html: fixed, defects, fixed: true, left: htmlDefects(fixed) };
+  }catch(e){ return { html, defects, fixed:false }; }
+}
 
 // 5) 보정 — 만든 뒤 말로 고친다
 app.post("/api/studio/revise", async (req, res)=>{
@@ -1268,6 +1344,15 @@ async function notifyNeedsHand(kind, topic, detail){
 }
 
 async function pipeRun(genId, opts){
+  // 이 건이 몇 바퀴째인지 남긴다. 재실행이 조용히 쌓이면 비용이 몇 배가 된다.
+  try{
+    if (useSupabase && opts && opts.source && opts.source !== "new"){
+      const _p = await supaSelect(CG_TABLE, "generation_id=eq."+encodeURIComponent(genId)+"&select=run_count");
+      const _n = (_p && _p[0] ? (+_p[0].run_count||0) : 0) + 1;
+      await supaPatch(CG_TABLE, "generation_id=eq."+genId, { run_count: _n }).catch(()=>{});
+      if (_n >= 4) console.warn("⚠ 같은 건이 "+_n+"바퀴째:", genId);
+    }
+  }catch(_){}
   const topic     = String(opts.topic||"").trim();
   const channels  = Array.isArray(opts.channels) ? opts.channels : [];
   let   source    = String(opts.source||"").slice(0, 6000);
@@ -1293,6 +1378,10 @@ async function pipeRun(genId, opts){
     }
 
     // 사람에게 묻기 전에 먼저 스스로 찾아본다. 공개된 사실을 물어보는 것은 일을 떠넘기는 것이다.
+    // 지난번에 모아 둔 자료가 있으면 다시 찾지 않는다
+    if (!String(source||"").trim() && opts.refSummary){
+      source = "=== 지난번에 찾아 둔 자료 ===\n" + String(opts.refSummary).slice(0, 4000);
+    }
     if (!String(source||"").trim()){
       await pipeBeat(genId, "research", "⏳ 자료를 찾아보는 중...");
       try{
@@ -1305,21 +1394,47 @@ async function pipeRun(genId, opts){
       }catch(e){ /* 못 찾으면 없는 대로 진행 */ }
     }
 
-    await pipeBeat(genId, "director", "⏳ 기준을 세우는 중...");
-    const spec = pipeJson(await anthropic(
-      DIRECTOR_SYS,
-      "주제: "+topic+"\n대상 채널: "+(channels.join(", ")||"미지정")+
-      "\n\n참고 자료:\n"+(source||"(없음)")+ctx, 2000));
-    await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
-      spec: spec, open_questions: spec.open_questions || null,
-      ai_raw_output: "⏳ 기준 수립 완료 — 원고 작성 중..."
-    });
+    // 답변·재시도·자동재개는 전부 여기로 다시 들어온다.
+    // 예전에는 그때마다 기준을 처음부터 다시 세웠다 — 한 건에 파이프라인이 몇 바퀴씩 돌았다.
+    // 이미 세워 둔 기준이 있으면 그대로 쓴다. 다시 만들 이유가 없다.
+    let spec = (opts.spec && typeof opts.spec === "object") ? opts.spec : null;
+    if (spec){
+      await pipeBeat(genId, "director", "⏳ 세워둔 기준을 그대로 씁니다...");
+      await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+        ai_raw_output: "⏳ 기준은 그대로 — 원고부터 다시 씁니다..." }).catch(()=>{});
+    } else {
+      await pipeBeat(genId, "director", "⏳ 기준을 세우는 중...");
+      spec = pipeJson(await anthropic(
+        DIRECTOR_SYS,
+        "주제: "+topic+"\n대상 채널: "+(channels.join(", ")||"미지정")+
+        "\n\n참고 자료:\n"+(source||"(없음)")+ctx, 2000));
+      await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+        spec: spec, open_questions: spec.open_questions || null,
+        ai_raw_output: "⏳ 기준 수립 완료 — 원고 작성 중..."
+      });
+    }
 
     // ── 2. 작성 ↔ 검수 루프
     //   원인을 분류해 갈 곳을 정한다.
     //   AI가 고칠 수 있는 것만 되돌리고, 사람만 답할 수 있는 것은 멈추고 묻는다.
     //   같은 지적이 두 번 반복되면 되돌려도 안 고쳐지는 것이므로 역시 사람에게 올린다.
     let draft = "", critique = "", rev = 0, score = 0, creativity = 0, wouldPay = false;
+
+    /* ── 이어서 하기 ──
+       답변·재시도·자동재개는 지난번 원고를 이미 갖고 있다.
+       그런데 예전에는 그것을 버리고 백지에서 3번을 다시 썼다.
+       원고+검수 루프가 한 바퀴 비용의 74%다 — 여기가 진짜 새는 곳이었다.
+       지난 원고가 쓸 만하면 그것을 출발점으로 삼고 한 번만 더 고친다. */
+    const prevDraft = String(opts.draft||"").trim();
+    const usablePrev = prevDraft.length > 200 && !/^[⏳❌]/.test(prevDraft);
+    if (usablePrev){
+      draft = prevDraft;
+      rev = Math.max(0, PIPE_MAX_REVISIONS - 1);   // 남은 기회는 한 번
+      critique = answers.length
+        ? "운영자가 위 질문에 답했다. 그 답을 반영해 고쳐라. 나머지는 그대로 두어라."
+        : "지난 원고를 이어서 다듬어라. 처음부터 다시 쓰지 마라.";
+      console.log("이어서 하기:", genId, "지난 원고", prevDraft.length, "자");
+    }
     let issues = [], askList = [], blocked = "";
     const seenIssues = new Map();   // 지적 요지 → 반복 횟수
     const answers = Array.isArray(opts.answers) ? opts.answers : [];
@@ -1328,7 +1443,7 @@ async function pipeRun(genId, opts){
       : "";
 
     while (rev < PIPE_MAX_REVISIONS){
-      const wp = rev === 0
+      const wp = (rev === 0 && !usablePrev)
         ? "주제: "+topic+"\n\n참고 자료:\n"+(source||"(없음)")+specBlock(spec)+answerBlock+ctx+
           "\n위 기준에 맞춰 원고를 작성하라. 과장광고 표현과 근거 없는 수치는 쓰지 마라."
         : "이전 원고:\n"+draft+"\n\n고쳐야 할 것:\n"+critique+specBlock(spec)+answerBlock+ctx+
@@ -1538,16 +1653,22 @@ app.post("/api/pipeline/run", async (req, res)=>{
 });
 
 // 사람이 답하면 그 답을 확정 사실로 넣고 이어서 돌린다.
+/* 사람이 답을 주지 못했을 때 쓰는 표식.
+   이 표식이 들어오면 부서는 '확인되지 않은 것은 아예 쓰지 않는' 쪽으로 진행한다.
+   묻고 멈추는 것보다, 못 쓴다고 알고 빼는 편이 낫다. */
+const SKIP_ANSWER = "[답 못 받음] 이 질문은 답을 받지 못했다. 다시 묻지 말고, 확인되지 않은 내용은 문장째 빼고 진행하라. 추측해서 지어내지 마라.";
+
 app.post("/api/pipeline/answer", async (req, res)=>{
   try {
     if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const id = String(req.body?.generation_id||"");
     const answers = Array.isArray(req.body?.answers) ? req.body.answers.filter(Boolean) : [];
     if (!id) return res.status(400).json({ ok:false, error:"generation_id 가 필요합니다" });
-    if (!answers.length) return res.status(400).json({ ok:false, error:"답변이 비어 있습니다" });
+    // 답을 못 주는 것도 답이다. 사람이 없다고 일이 멎으면 자율이 아니다.
+    if (!answers.length) answers.push(SKIP_ANSWER);
 
     const rows = await supaSelect(CG_TABLE,
-      "generation_id=eq."+encodeURIComponent(id)+"&select=topic,target_channel,human_answers");
+      "generation_id=eq."+encodeURIComponent(id)+"&select=topic,target_channel,human_answers,spec,ref_summary,ai_raw_output");
     const row = rows && rows[0];
     if (!row) return res.status(404).json({ ok:false, error:"해당 작업을 찾을 수 없습니다" });
 
@@ -1566,14 +1687,808 @@ app.post("/api/pipeline/answer", async (req, res)=>{
     pipeRun(id, {
       topic: row.topic || "",
       channels: String(row.target_channel||"").split(",").map(x=>x.trim()).filter(Boolean),
-      source: req.body?.source || "",
-      answers: merged
+      source: req.body?.source || "answer",
+      answers: merged,
+      spec: row.spec || null,              // 기준은 이미 섰다. 다시 세우지 않는다
+      refSummary: row.ref_summary || "",   // 자료도 이미 모았다
+      draft: row.ai_raw_output || ""       // 지난 원고에서 이어 쓴다
     }).catch(e=>console.error("pipeRun(재개) 예외:", String(e&&e.message||e)));
 
   } catch(e){
     res.status(500).json({ ok:false, error:String(e&&e.message||e) });
   }
 });
+
+// ===================== 노아라 코드 검토 =====================
+/* 바깥(클로드·제미나이)에서 받은 코드와 제안을 그대로 붙이지 않는다.
+   ① 기계가 셀 수 있는 것은 기계가 센다 — 문법·위험 패턴·자리표시
+   ② 그 위에서 판단한다 — 우리 것에 맞나, 되돌릴 수 있나, 무엇부터 할까
+   판단은 취향이 아니라 대조다. 같은 코드면 같은 결과가 나와야 한다. */
+
+function guessKind(code){
+  const c = String(code||"");
+  if (/^\s*[\[{]/.test(c) && /[}\]]\s*$/.test(c)) return "json";
+  if (/<!DOCTYPE|<html[\s>]/i.test(c)) return "html";
+  if (/^\s*(#|##)\s|^\s*[-*]\s.+\n/m.test(c) && !/[;{}]\s*$/m.test(c)) return "제안글";
+  if (/\bfunction\b|=>|\bconst\b|\blet\b|\bapp\.(get|post)\(/.test(c)) return "js";
+  if (/^[.#@a-zA-Z][^{]*\{[^}]*:[^}]*\}/m.test(c)) return "css";
+  return "기타";
+}
+
+/* 실행하지 않는다. 파싱만 해서 문법이 성립하는지 본다. */
+function codeDefects(code, kind){
+  const c = String(code||""); const out = [];
+  if (c.trim().length < 10) return ["내용이 거의 없다"];
+
+  if (kind === "js"){
+    try { new Function(c); }
+    catch(e){ out.push("문법 오류 — " + String(e.message||e).slice(0,120)); }
+  }
+  if (kind === "json"){
+    try { JSON.parse(c); } catch(e){ out.push("JSON 형식이 깨졌다 — " + String(e.message||e).slice(0,100)); }
+  }
+  if (kind === "html") htmlDefects(c).forEach(x=>out.push(x));
+
+  // 괄호 균형 (문자열 안까지는 보지 않는다 — 대략의 신호)
+  const bal = (a,b)=> (c.split(a).length - c.split(b).length);
+  if (Math.abs(bal("{","}")) > 2) out.push("중괄호 짝이 크게 안 맞는다 — 잘렸을 수 있다");
+  // '…생략…' 은 조각을 받았다는 가장 확실한 신호다. 통째로 붙이면 파일이 깨진다.
+  if (/(생략|이하 동일|기존과 동일|나머지는 그대로|여기에 기존|이전과 같음|unchanged|rest of|\.\.\.\s*기존)/i.test(c))
+    out.push("'생략' 표시가 있다 — 조각만 받았다. 통째로 붙이면 안 된다");
+  if (/\bTODO\b|FIXME|자리표시|placeholder/i.test(c)) out.push("TODO·자리표시가 남아 있다");
+
+  // 위험 신호
+  if (/localStorage|sessionStorage/.test(c) && kind==="js") out.push("브라우저 저장소를 쓴다 — 우리 앱 규칙과 충돌하는지 확인 필요");
+  if (/\beval\s*\(|new\s+Function\s*\(/.test(c)) out.push("eval/new Function 을 쓴다 — 남의 코드에서는 위험하다");
+  if (/(sk-[A-Za-z0-9_-]{12,}|AIza[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._-]{20,})/.test(c))
+    out.push("키·토큰처럼 보이는 값이 코드에 박혀 있다 — 절대 그대로 올리지 마라");
+  if (/\b(DROP\s+TABLE|TRUNCATE)\b/i.test(c)) out.push("표를 통째로 지우는 SQL 이 있다 — 되돌릴 수 없다");
+  if (/rm\s+-rf|process\.exit\(/.test(c)) out.push("서버를 지우거나 끄는 명령이 있다");
+  if (/http:\/\/(?!localhost|127\.)/.test(c)) out.push("https 가 아닌 주소가 있다");
+  return out;
+}
+
+const REVIEW_SYS = `너는 웹 퍼블리셔다. 바깥에서 받아 온 코드·제안을 우리 플랫폼에 넣을지 판단한다.
+너는 코드를 예쁘게 다시 쓰는 사람이 아니라, 넣어도 되는지 가려내고 넣는 순서를 정하는 사람이다.
+
+판단 잣대(취향 금지 — 같은 코드면 늘 같은 판정이 나와야 한다):
+1) 통째인가 조각인가 — '생략' 표시가 있으면 그대로 붙일 수 없다
+2) 무엇을 건드리는가 — 파일·함수·표 이름을 짚어라. 못 짚으면 그것부터 물어야 한다
+3) 되돌릴 수 있는가 — 데이터를 지우거나 구조를 바꾸면 되돌리기 어렵다
+4) 우리가 이미 가진 것과 겹치는가 — 겹치면 새로 넣지 말고 기존 것을 고친다
+5) 확인할 방법이 있는가 — 넣고 나서 맞는지 볼 방법이 없으면 넣지 마라
+
+판정은 셋 중 하나다.
+- "적용": 그대로 넣어도 된다
+- "손봐야": 쓸 만하지만 고쳐야 넣을 수 있다
+- "쓰면 안 됨": 위험하거나 조각이거나 우리와 안 맞는다
+
+아래 형식만, 한국어. 설명·서론 금지.
+판정: (적용|손봐야|쓰면 안 됨)
+확신: (0~100 정수)
+무엇인가: (이 코드가 하는 일 한 줄)
+건드리는 곳: (파일·함수·표 이름. 모르면 '알 수 없음 — 물어봐야 함')
+걸리는 점: (넣기 전에 해결해야 할 것 1~3줄. 없으면 '없음')
+넣는 순서: (실제로 할 일 1~4단계, 번호로)
+되돌리기: (잘못됐을 때 어떻게 되돌리나 한 줄)`;
+
+app.post("/api/publisher/review", async (req,res)=>{
+  try{
+    const code = String(req.body?.code||"");
+    if (code.trim().length < 20) return res.status(400).json({ ok:false, error:"검토할 내용이 너무 짧습니다" });
+    const note = String(req.body?.note||"").slice(0,600);
+    const kind = String(req.body?.kind||"") || guessKind(code);
+    const defects = codeDefects(code, kind);
+
+    // 기계가 먼저 본 것을 판단의 재료로 넘긴다.
+    // AI 가 안 되더라도 기계 점검만으로 답한다 — 붙여넣기 전 확인은 끊기면 안 된다.
+    let t = "", aiFailed = "";
+    try{
+      const ctx = await pipeContext(String(note||"코드 검토"), ["홈페이지"]);
+      const txt = await genText(REVIEW_SYS,
+        "종류: " + kind
+        + (note ? "\n받은 맥락: " + note : "")
+        + "\n\n기계 점검 결과:\n" + (defects.length ? "- "+defects.join("\n- ") : "(걸린 것 없음)")
+        + ctx
+        + "\n\n코드:\n" + code.slice(0, 24000),
+        1200, (DB.state && DB.state.workEngine === "gemini") ? "gemini" : undefined);
+      t = String(txt||"").trim();
+    }catch(e){ aiFailed = String(e&&e.message||e).slice(0,120); }
+
+    if (!t){
+      // 기계가 본 것만으로 판정한다. 확실히 위험한 것은 AI 없이도 막을 수 있다.
+      const hard = defects.filter(x=>/문법 오류|생략|키·토큰|통째로 지우는|서버를 지우|JSON 형식이 깨/.test(x));
+      t = "판정: " + (hard.length ? "쓰면 안 됨" : (defects.length ? "손봐야" : "손봐야"))
+        + "\n확신: " + (hard.length ? 90 : 40)
+        + "\n무엇인가: (AI 판단을 받지 못했다 — 기계 점검 결과만 본다)"
+        + "\n건드리는 곳: 알 수 없음 — 물어봐야 함"
+        + "\n걸리는 점: " + (defects.length ? defects.join(" / ") : "기계로는 걸린 것이 없다. 사람이 직접 봐야 한다.")
+        + "\n넣는 순서: 1) 위 지적을 먼저 해결 2) 다시 검토 3) 한 곳만 바꿔 확인"
+        + "\n되돌리기: 바꾸기 전 파일을 그대로 보관했다가 다시 올린다"
+        + (aiFailed ? "\n(AI 실패: " + aiFailed + ")" : "");
+    }
+    const pick = re => { const m = t.match(re); return m ? m[1].trim() : ""; };
+    const verdict = pick(/판정\s*[:：]\s*([^\n]+)/) || "손봐야";
+    const conf = (function(){ const m=t.match(/확신\s*[:：]\s*(\d{1,3})/); return m?Math.min(100,+m[1]):null; })();
+
+    const rec = {
+      id: "cr"+Date.now().toString(36),
+      at: Date.now(),
+      kind, note,
+      head: code.trim().slice(0,120),
+      chars: code.length,
+      defects,
+      verdict, conf,
+      text: t.slice(0,3000),
+      outcome: null                     // 나중에 사람이 맞았는지 알려준다
+    };
+    DB.codeReviews = (DB.codeReviews||[]).concat([rec]).slice(-40);
+    try{ saveDB(); }catch(_){}
+    res.json({ ok:true, review: rec });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.get("/api/publisher/reviews", (req,res)=>{
+  const rows = (DB.codeReviews||[]).slice().reverse();
+  const judged = rows.filter(r=>r.outcome==="right"||r.outcome==="wrong");
+  res.json({ ok:true, rows: rows.slice(0,20),
+    n: rows.length, judged: judged.length,
+    hitRate: judged.length ? judged.filter(r=>r.outcome==="right").length/judged.length : null });
+});
+
+/* 판정이 맞았는지 사람이 알려준다. 이것이 노아라의 수준을 올리는 유일한 신호다.
+   틀렸다고 하면 그 이유가 학습 검토로 올라가 다음 판단 기준이 된다. */
+app.post("/api/publisher/outcome", async (req,res)=>{
+  try{
+    const id = String(req.body?.id||"");
+    const right = req.body?.right === true;
+    const why = String(req.body?.why||"").trim();
+    const rec = (DB.codeReviews||[]).find(x=>x.id===id);
+    if (!rec) return res.status(404).json({ ok:false, error:"검토 기록을 찾을 수 없습니다" });
+    rec.outcome = right ? "right" : "wrong";
+    rec.outcomeWhy = why.slice(0,500);
+    rec.outcomeAt = Date.now();
+    try{ saveDB(); }catch(_){}
+    res.json({ ok:true });
+
+    if (!right && why){
+      pushLearning("editing", "code-review",
+        "코드 판정이 틀림 — " + String(rec.head||"").slice(0,80),
+        "'" + rec.verdict + "' 이라고 판정했지만 실제로는 아니었다. 이유: " + why
+        + " → 다음부터 같은 모양의 코드는 이 점을 먼저 확인할 것.").catch(()=>{});
+    }
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// ===================== 노아라 파일 손보기 =====================
+/* 붙여넣은 글자만 보고는 "우리 파일 어디랑 부딪히는지"를 알 수 없다.
+   그래서 실제 파일을 읽어와 그 자리에서 고친다.
+
+   핵심은 '파일을 다시 쓰게 하지 않는 것'이다.
+   80만 자짜리 파일을 통째로 생성시키면 반드시 어딘가 잘린다.
+   대신 AI 는 '바꿀 자리(find)와 바꿀 내용(replace)'만 내놓고, 붙이는 것은 서버가 한다.
+   find 가 파일에 정확히 한 번 나오지 않으면 그 수정은 버린다 — 엉뚱한 곳을 고치느니 안 고치는 게 낫다. */
+
+const GH_APP  = process.env.GH_APP_RAW  || "https://raw.githubusercontent.com/hukkle-hub/sns-agent-app/main/";
+const GH_BACK = process.env.GH_BACK_RAW || "https://raw.githubusercontent.com/hukkle-hub/sns-agent-backend/main/";
+const REPO_FILES = {
+  "agent-manager.html": GH_APP  + "agent-manager.html",
+  "settings.html":      GH_APP  + "settings.html",
+  "index.html":         GH_APP  + "index.html",
+  "server.js":          GH_BACK + "server.js"
+};
+const PATCH_STORE = new Map();          // id → { file, before, after, at }
+const PATCH_TTL   = 6 * 60 * 60 * 1000; // 6시간이면 충분하다. 서버가 재시작되면 어차피 사라진다.
+function patchGC(){
+  const now = Date.now();
+  for (const [k,v] of PATCH_STORE) if (now - v.at > PATCH_TTL) PATCH_STORE.delete(k);
+}
+
+async function ghRead(file){
+  const url = REPO_FILES[file];
+  if (!url) throw new Error("모르는 파일입니다: " + file);
+  const r = await fetch(url, { headers:{ "Cache-Control":"no-cache" } });
+  if (!r.ok) throw new Error("파일을 읽지 못했습니다 (" + r.status + ")");
+  return await r.text();
+}
+
+/* 고칠 자리를 기계로 먼저 좁힌다. 80만 자를 다 보낼 수는 없다.
+   지시문에서 뽑은 낱말이 나오는 구간의 앞뒤를 잘라 후보로 만든다. */
+function findWindows(text, instruction, maxWin){
+  const words = String(instruction||"")
+    .split(/[^A-Za-z0-9가-힣_./-]+/).filter(w=>w.length>=2)
+    .filter(w=>!/^(그리고|하는|해줘|하게|에서|으로|것을|부분|코드|파일|수정|추가|삭제|바꿔|바꾸|줄여|늘려)$/.test(w));
+  if (!words.length) return [];
+  const lines = text.split("\n");
+  const hit = new Array(lines.length).fill(0);
+  lines.forEach((ln,i)=>{ words.forEach(w=>{ if (ln.includes(w)) hit[i] += (w.length >= 4 ? 3 : 1); }); });
+
+  // 한 줄이 아니라 '구간'으로 센다 — 낱말이 몰려 있는 곳이 진짜 자리다
+  const R = 25, W = 60;
+  const win = new Array(lines.length).fill(0);
+  let run = 0;
+  for (let i = 0; i < lines.length; i++){
+    run += hit[i];
+    if (i >= W) run -= hit[i-W];
+    win[Math.max(0, i-Math.floor(W/2))] = run;
+  }
+  const picks = [], taken = [];
+  for (let n = 0; n < (maxWin||4); n++){
+    let best = 0, bi = -1;
+    for (let i = 0; i < lines.length; i++){
+      if (win[i] <= best) continue;
+      if (taken.some(t => Math.abs(t - i) < W)) continue;
+      best = win[i]; bi = i;
+    }
+    if (bi < 0) break;
+    taken.push(bi);
+    const a = Math.max(0, bi - 5), b = Math.min(lines.length, bi + W);
+    picks.push({ from:a+1, to:b, score:best, text: lines.slice(a,b).join("\n") });
+  }
+  return picks;
+}
+
+/* 이 방식(search/replace)의 알려진 실패 지점은 하나다 — 원문을 옮겨 적을 때
+   들여쓰기·공백이 조금 달라져서 '못 찾음'이 나는 것.
+   그래서 정확히 안 맞으면 공백만 느슨하게 풀어 한 번 더 찾는다.
+   단, '한 곳에서만 걸릴 것'이라는 조건은 절대 풀지 않는다. */
+function applyEdit(text, find, replace){
+  const n = text.split(find).length - 1;
+  if (n === 1) return { text: text.replace(find, replace), how:"정확히 일치" };
+  if (n > 1)  return { fail:"같은 자리가 "+n+"곳이라 어디인지 정할 수 없다" };
+
+  // 공백을 느슨하게: 줄 앞 들여쓰기와 줄 사이 공백 차이를 무시한다
+  const esc = x => x.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const lines = String(find).split("\n").map(l=>l.trim()).filter(l=>l.length);
+  if (!lines.length) return { fail:"find 가 비었다" };
+  const re = new RegExp(lines.map(esc).join("\\s*\\n\\s*"), "g");
+  const hits = text.match(re);
+  if (!hits) return { fail:"그 자리를 파일에서 찾지 못했다 (원문과 다르게 옮겨 적었다)" };
+  if (hits.length > 1) return { fail:"공백을 풀고 찾아도 "+hits.length+"곳이라 정할 수 없다" };
+  return { text: text.replace(re, ()=>replace), how:"공백 차이를 무시하고 일치" };
+}
+
+const PATCH_SYS = `너는 웹 퍼블리셔다. 실제 파일의 일부를 보고, 고칠 자리를 정확히 집어낸다.
+
+절대 규칙:
+- 파일을 다시 쓰지 마라. 바꿀 자리(find)와 바꿀 내용(replace)만 내놓는다.
+- find 는 파일에 **정확히 한 번만** 나오는 문자열이어야 한다. 짧으면 여러 곳에 걸린다 — 앞뒤 줄을 넉넉히 포함시켜라.
+- find 는 보여준 원문을 **한 글자도 바꾸지 말고** 그대로 옮겨라. 공백·들여쓰기까지 같아야 한다.
+- 지우기만 할 때는 replace 를 빈 문자열로 둔다.
+- 보여준 구간 밖은 건드리지 마라. 필요하면 need_more 에 무엇을 더 봐야 하는지 적는다.
+- 확신이 없으면 edits 를 비우고 이유를 적어라. 엉뚱한 곳을 고치는 것보다 안 고치는 게 낫다.
+
+JSON만 출력한다. 코드펜스 금지.
+{"edits":[{"find":"","replace":"","why":""}],"risk":"낮음|보통|높음","note":"","need_more":""}`;
+
+app.get("/api/publisher/files", (req,res)=>{
+  res.json({ ok:true, files: Object.keys(REPO_FILES) });
+});
+
+app.post("/api/publisher/patch", async (req,res)=>{
+  try{
+    patchGC();
+    const file = String(req.body?.file||"");
+    const instruction = String(req.body?.instruction||"").trim();
+    if (!REPO_FILES[file]) return res.status(400).json({ ok:false, error:"파일을 골라 주세요" });
+    if (instruction.length < 5) return res.status(400).json({ ok:false, error:"무엇을 고칠지 적어 주세요" });
+
+    // 1) 읽기
+    const before = await ghRead(file);
+
+    // 2) 자리 좁히기
+    const wins = findWindows(before, instruction + " " + String(req.body?.hint||""), 4);
+    if (!wins.length) return res.json({ ok:true, applied:0, edits:[],
+      note:"지시문의 낱말이 파일에서 하나도 안 보입니다. 함수 이름이나 화면에 뜨는 문구를 그대로 적어 주세요.",
+      file, size: before.length });
+
+    // 3) 어디를 어떻게 바꿀지 받아온다
+    let out = null, aiErr = "";
+    try{
+      const txt = await genText(PATCH_SYS,
+        "파일: " + file + " (전체 " + before.length + "자)\n고칠 것: " + instruction
+        + "\n\n" + wins.map(w=>"=== "+w.from+"~"+w.to+"행 ===\n"+w.text).join("\n\n"),
+        4000, (DB.state && DB.state.workEngine === "gemini") ? "gemini" : undefined);
+      out = pipeJson(txt);
+    }catch(e){ aiErr = String(e&&e.message||e).slice(0,140); }
+    if (!out) return res.json({ ok:false, error: aiErr || "고칠 자리를 정하지 못했습니다",
+      file, windows: wins.map(w=>({from:w.from,to:w.to})) });
+
+    // 4) 붙이는 것은 서버가 한다. 한 번만 나오는 자리만 바꾼다.
+    let after = before;
+    const applied = [], skipped = [];
+    const runEdits = (edits)=>{
+      for (const e of (Array.isArray(edits) ? edits : [])){
+        const find = String(e && e.find || "");
+        if (!find){ skipped.push({ why:"find 가 비었다" }); continue; }
+        const r = applyEdit(after, find, String(e.replace==null ? "" : e.replace));
+        if (r.fail){ skipped.push({ why:r.fail, head:find.slice(0,60) }); continue; }
+        after = r.text;
+        applied.push({ why:String(e.why||"").slice(0,200), head:find.slice(0,60),
+          how:r.how, delta:(String(e.replace||"").length - find.length) });
+      }
+    };
+    runEdits(out.edits);
+
+    // 못 찾은 것이 있으면 무엇이 틀렸는지 알려주고 한 번만 다시 받는다.
+    // (아무 답이나 계속 받아내면 엉뚱한 곳을 고친다 — 한 번으로 끝낸다)
+    if (skipped.length && applied.length < (Array.isArray(out.edits)?out.edits.length:0)){
+      try{
+        const retry = pipeJson(await genText(PATCH_SYS,
+          "파일: " + file + "\n고칠 것: " + instruction
+          + "\n\n방금 낸 수정 중 아래가 실패했다. 원문을 한 글자도 바꾸지 말고 그대로 옮겨 적어라.\n"
+          + skipped.map(x=>"- "+x.why+(x.head?(" / 네가 적은 것: "+x.head+"…"):"")).join("\n")
+          + "\n\n" + wins.map(w=>"=== "+w.from+"~"+w.to+"행 ===\n"+w.text).join("\n\n"),
+          3000, (DB.state && DB.state.workEngine === "gemini") ? "gemini" : undefined));
+        if (retry && Array.isArray(retry.edits) && retry.edits.length){
+          const beforeCount = applied.length;
+          skipped.length = 0;
+          runEdits(retry.edits);
+          if (applied.length > beforeCount) applied[beforeCount].retried = true;
+        }
+      }catch(e){ /* 되묻기 실패는 무시 — 이미 적용된 것만 쓴다 */ }
+    }
+
+    if (!applied.length) return res.json({ ok:true, applied:0, skipped,
+      note: out.note || "고칠 자리를 정확히 짚지 못했습니다.", needMore: out.need_more||"", file });
+
+    // 5) 문법 검사 — 깨진 것을 내보내면 안 된다
+    const kind = /\.js$/.test(file) ? "js" : (/\.html?$/.test(file) ? "html" : "기타");
+    const checkTarget = (kind === "html") ? after : after;
+    let defects = [];
+    if (kind === "js"){ try{ new Function(after); }catch(e){ defects.push("문법 오류 — "+String(e.message||e).slice(0,140)); } }
+    if (kind === "html"){
+      defects = htmlDefects(after);
+      const m = after.match(/<script(?![^>]*src=)[^>]*>([\s\S]*?)<\/script>/);
+      if (m){ try{ new Function(m[1]); }catch(e){ defects.push("화면 스크립트 문법 오류 — "+String(e.message||e).slice(0,140)); } }
+    }
+    const shrink = 1 - (after.length / Math.max(1, before.length));
+    if (shrink > 0.2) defects.push("파일이 "+Math.round(shrink*100)+"% 줄었다 — 실수로 크게 지웠을 수 있다");
+
+    const id = "px"+Date.now().toString(36);
+    PATCH_STORE.set(id, { file, before, after, at: Date.now() });
+
+    res.json({ ok:true, id, file, applied, skipped,
+      risk: out.risk||"보통", note: out.note||"", needMore: out.need_more||"",
+      sizeBefore: before.length, sizeAfter: after.length,
+      defects, safe: defects.length === 0 });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// 고친 파일 받기 / 원래대로 되돌리기 — 되돌릴 수 없으면 맡길 수 없다
+app.get("/api/publisher/patched", (req,res)=>{
+  patchGC();
+  const p = PATCH_STORE.get(String(req.query.id||""));
+  if (!p) return res.status(404).json({ ok:false, error:"만료됐거나 없는 작업입니다" });
+  const which = String(req.query.which||"after");
+  res.type("text/plain; charset=utf-8").send(which === "before" ? p.before : p.after);
+});
+
+// ===================== PC 로컬 작업 큐 =====================
+/* PC를 24시간 켜둘 수는 없다. 그래서 클라우드가 계속 받아 두고,
+   PC가 켜졌을 때 밀린 것을 무제한으로 가져가 처리한다.
+
+   설계에서 중요한 것 셋:
+   ① 당기기(pull) — PC가 서버로 요청한다. 포트포워딩·터널링이 필요 없다.
+   ② 빌려주기(lease) — 가져간 뒤 정해진 시간 안에 안 돌려주면 큐로 되돌린다.
+      (PC가 작업 중에 잠들 수 있다)
+   ③ 되돌아가기(fallback) — 아무도 안 가져가면 클라우드가 대신 한다.
+      로컬에 맡겼다는 이유로 일이 영영 멈추면 안 된다. */
+const LJQ_TABLE   = "local_job_queue";
+const LJQ_LEASE_MS   = 15 * 60 * 1000;   // 15분 안에 안 돌려주면 회수
+const LJQ_FALLBACK_H = 12;               // 12시간 아무도 안 가져가면 클라우드가 처리
+
+async function localEnqueue(kind, payload, priority){
+  if (!useSupabase) return null;
+  try{
+    await supaInsert(LJQ_TABLE, {
+      kind: String(kind||"").slice(0,40),
+      payload: payload || {},
+      priority: Math.max(1, Math.min(9, +priority || 5))
+    });
+    return true;
+  }catch(e){ return null; }
+}
+
+// PC 워커가 일을 가져간다
+app.post("/api/local/claim", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const who = String(req.body?.worker||"pc").slice(0,60);
+    const want = Math.max(1, Math.min(10, +(req.body?.limit) || 3));
+    const kinds = Array.isArray(req.body?.kinds) && req.body.kinds.length
+      ? req.body.kinds.map(x=>String(x).trim()).filter(Boolean) : null;
+
+    DB.localWorker = { at: Date.now(), who };   // 살아 있다는 표시
+
+    // 빌려간 채 돌아오지 않는 것부터 회수한다
+    const dead = new Date(Date.now() - LJQ_LEASE_MS).toISOString();
+    const stuck = await supaSelect(LJQ_TABLE,
+      "status=eq.running&claimed_at.lt."+dead+"&select=job_id,attempts&limit=10");
+    for (const j of (stuck||[])){
+      await supaPatch(LJQ_TABLE, "job_id=eq."+j.job_id,
+        (j.attempts||0) >= 3
+          ? { status:"failed", error:"세 번 가져갔지만 끝내지 못했습니다", finished_at:new Date().toISOString() }
+          : { status:"queued", claimed_at:null, claimed_by:null });
+    }
+
+    let q = "status=eq.queued&order=priority.asc,created_at.asc&limit="+want+"&select=*";
+    if (kinds) q = "status=eq.queued&kind=in.("+kinds.join(",")+")&order=priority.asc,created_at.asc&limit="+want+"&select=*";
+    const rows = await supaSelect(LJQ_TABLE, q);
+
+    const taken = [];
+    for (const r of (rows||[])){
+      // 두 워커가 같은 것을 가져가지 않게, 아직 queued 인 것만 바꾼다
+      const ok = await supaPatch(LJQ_TABLE, "job_id=eq."+r.job_id+"&status=eq.queued", {
+        status:"running", claimed_at:new Date().toISOString(),
+        claimed_by:who, attempts:(r.attempts||0)+1 });
+      if (ok !== false) taken.push({ job_id:r.job_id, kind:r.kind, payload:r.payload });
+    }
+    res.json({ ok:true, jobs: taken, leaseMs: LJQ_LEASE_MS });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// PC 워커가 결과를 돌려준다
+app.post("/api/local/result", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.job_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"job_id 가 필요합니다" });
+    const err = String(req.body?.error||"").trim();
+    const out = String(req.body?.result||"").trim();
+    DB.localWorker = { at: Date.now(), who: String(req.body?.worker||"pc").slice(0,60) };
+
+    await supaPatch(LJQ_TABLE, "job_id=eq."+encodeURIComponent(id), err
+      ? { status:"queued", claimed_at:null, claimed_by:null, error: err.slice(0,400) }
+      : { status:"done", finished_at:new Date().toISOString(), result: out.slice(0,20000), error:null });
+    res.json({ ok:true });
+
+    if (!err && out) applyLocalResult(id, out).catch(()=>{});
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* 로컬이 낸 결과를 실제 자리에 꽂는다. 결과가 큐에만 쌓이면 아무 소용이 없다. */
+async function applyLocalResult(jobId, out){
+  const rows = await supaSelect(LJQ_TABLE, "job_id=eq."+encodeURIComponent(jobId)+"&select=kind,payload");
+  const r = rows && rows[0];
+  if (!r) return;
+  const p = r.payload || {};
+
+  if (r.kind === "benchmark" && p.dept && AGENTS[p.dept]){
+    // 로컬이 조사·정리한 품질 공식을 사람 검토 관문으로 올린다(바로 넣지 않는다)
+    await pushLearning(p.dept, "local-benchmark",
+      "PC 로컬 조사 — " + String(p.what||"").slice(0,150), out);
+  }
+  if (r.kind === "classify" && p.cs_id){
+    await supaPatch(CS_TABLE, "cs_id=eq."+p.cs_id, { product_category: out.slice(0,40) }).catch(()=>{});
+  }
+}
+
+// 상태판 — 큐 깊이와 워커 생사
+app.get("/api/local/status", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(LJQ_TABLE,
+      "select=job_id,kind,status,created_at,claimed_by,priority&order=created_at.desc&limit=200");
+    const all = rows||[];
+    const by = k => all.filter(x=>x.status===k).length;
+    const w = DB.localWorker || null;
+    res.json({ ok:true,
+      queued: by("queued"), running: by("running"), done: by("done"),
+      failed: by("failed"), fellback: by("fellback"),
+      worker: w ? { who:w.who, at:w.at, alive: (Date.now()-w.at) < 10*60*1000 } : null,
+      recent: all.slice(0,10).map(x=>({ kind:x.kind, status:x.status, at:x.created_at })) });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/local/enqueue", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const kind = String(req.body?.kind||"").trim();
+    if (!kind) return res.status(400).json({ ok:false, error:"kind 가 필요합니다" });
+    const ok = await localEnqueue(kind, req.body?.payload||{}, req.body?.priority);
+    res.json({ ok: !!ok });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// ===================== 비용 추적 =====================
+/* 총합만 알면 줄일 수가 없다. 어느 단계가 얼마를 먹는지 나눠 담는다.
+   호출부를 하나도 고치지 않으려고, 시스템 프롬프트 앞머리로 단계를 알아낸다. */
+function costLabel(system){
+  const t = String(system||"").slice(0, 120);
+  const has = (...ws) => ws.some(w => t.includes(w));
+  if (has("디렉터","기준을 세운")) return "기준 세우기";
+  if (has("검수자","심사","PASS","FAIL")) return "검수";
+  if (has("채널",  "재가공","맞게 다시")) return "채널별 재가공";
+  if (has("카드뉴스")) return "카드뉴스";
+  if (has("페이지 구성","구성안")) return "페이지 구성안";
+  if (has("HTML","html")) return "HTML 생성";
+  if (has("퍼블리셔")) return "퍼블리셔 점검";
+  if (has("스레드")) return "스레드 체인";
+  if (has("교차","다른 눈")) return "교차 심사";
+  if (has("고친","비교해")) return "수정 학습";
+  if (has("총괄","오케스트","비서")) return "총괄";
+  if (has("바꿀 자리","find")) return "파일 손보기";
+  if (has("품질 공식","조사자")) return "벤치마크 학습";
+  if (has("작성","원고","써라","쓴다")) return "원고 작성";
+  return "기타";
+}
+function costTag(system, inTok, outTok){
+  const day = todayStr();
+  if (!DB.costByStage || DB.costByStage.date !== day) DB.costByStage = { date: day, rows: {} };
+  const k = costLabel(system);
+  const r = DB.costByStage.rows[k] || { in:0, out:0, calls:0 };
+  r.in += inTok; r.out += outTok; r.calls += 1;
+  DB.costByStage.rows[k] = r;
+}
+
+app.get("/api/cost", (req,res)=>{
+  const st = DB.state || {};
+  const inR  = +(process.env.PRICE_IN_PER_M  || 3);
+  const outR = +(process.env.PRICE_OUT_PER_M || 15);
+  const rate = +(st.usdKrw) || +(process.env.PRICE_USD_KRW || 1540);
+  const won = (i,o) => Math.round(((i/1e6)*inR + (o/1e6)*outR) * rate);
+
+  const src = (DB.costByStage && DB.costByStage.date === todayStr())
+    ? (DB.costByStage.rows || {}) : {};
+  const rows = Object.keys(src).map(k=>({
+    stage:k, calls:src[k].calls, in:src[k].in, out:src[k].out, won: won(src[k].in, src[k].out)
+  })).sort((a,b)=>b.won-a.won);
+
+  const d = DB.usageDaily || { in:0, out:0, calls:0 };
+  const m = DB.usageMonthly || { in:0, out:0, calls:0 };
+  res.json({ ok:true, model: MODEL,
+    today: { calls:d.calls, in:d.in, out:d.out, won: won(d.in, d.out) },
+    month: { calls:m.calls, in:m.in, out:m.out, won: won(m.in, m.out) },
+    byStage: rows,
+    tracked: rows.reduce((a,b)=>a+b.won,0),
+    price: { inPerM:inR, outPerM:outR, usdKrw:rate } });
+});
+
+// ===================== 카톡 CS → 콘텐츠 =====================
+/* 손님이 실제로 물어본 것이 가장 정확한 콘텐츠 수요다.
+   상상한 주제로 만드는 것보다, 이미 물어본 것에 답하는 편이 반드시 읽힌다. */
+const CS_TABLE = "kakao_cs_inquiries";
+
+app.get("/api/cs", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(CS_TABLE,
+      "select=*&order=converted_to_content.asc,frequency_count.desc,created_at.desc&limit=60");
+    const open = (rows||[]).filter(r=>!r.converted_to_content);
+    res.json({ ok:true, rows: rows||[], open: open.length });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/cs", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const q = String(req.body?.question||"").trim();
+    if (q.length < 3) return res.status(400).json({ ok:false, error:"문의 내용을 적어 주세요" });
+
+    // 같은 질문이 또 들어오면 건수를 올린다 — 자주 묻는 것이 곧 우선순위다
+    const same = await supaSelect(CS_TABLE,
+      "converted_to_content=eq.false&customer_question=eq."+encodeURIComponent(q)+"&select=cs_id,frequency_count&limit=1");
+    if (same && same[0]){
+      await supaPatch(CS_TABLE, "cs_id=eq."+same[0].cs_id,
+        { frequency_count: (same[0].frequency_count||1) + 1 });
+      return res.json({ ok:true, merged:true, count:(same[0].frequency_count||1)+1 });
+    }
+    await supaInsert(CS_TABLE, {
+      customer_question: q.slice(0,500),
+      product_category: String(req.body?.category||"").slice(0,40),
+      answer: String(req.body?.answer||"").slice(0,2000)
+    });
+    res.json({ ok:true, created:true });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/cs/delete", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.cs_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"cs_id 가 필요합니다" });
+    const r = await fetch(SUPA_URL+"/rest/v1/"+CS_TABLE+"?cs_id=eq."+encodeURIComponent(id), {
+      method:"DELETE", headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY } });
+    res.json({ ok: r.ok });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// 문의를 그대로 콘텐츠 주제로 넘긴다 — 파이프라인은 이미 있는 것을 쓴다
+app.post("/api/cs/to-content", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.cs_id||"");
+    const rows = await supaSelect(CS_TABLE, "cs_id=eq."+encodeURIComponent(id)+"&select=*");
+    const row = rows && rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:"문의를 찾을 수 없습니다" });
+
+    const channels = Array.isArray(req.body?.channels) && req.body.channels.length
+      ? req.body.channels.map(x=>String(x).trim()).filter(Boolean)
+      : ["인스타그램"];
+    const topic = "자주 묻는 질문 — " + String(row.customer_question).slice(0,80);
+    const genId = "g" + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+
+    await supaInsert(CG_TABLE, {
+      generation_id: genId, topic,
+      target_channel: channels.join(","),
+      approval_status: "processing", stage: "queued",
+      ai_raw_output: "⏳ 실제 문의를 바탕으로 만들고 있습니다..."
+    });
+    await supaPatch(CS_TABLE, "cs_id=eq."+id,
+      { converted_to_content:true, generation_id:genId });
+    res.json({ ok:true, generation_id:genId, topic });
+
+    // 손님이 물은 그대로를 답변 근거로 넘긴다. 지어내지 않게.
+    const answers = [
+      "이것은 상상한 주제가 아니라 손님이 실제로 " + (row.frequency_count||1) + "번 물어본 질문이다.",
+      "질문 원문: " + String(row.customer_question).slice(0,300),
+      row.product_category ? ("품목: " + row.product_category) : "",
+      row.answer ? ("우리가 실제로 답한 내용(이 사실만 쓸 것): " + String(row.answer).slice(0,800))
+                 : "우리 답변이 아직 없다. 확인되지 않은 사실은 쓰지 말고 문의 안내로 마무리하라."
+    ].filter(Boolean);
+
+    pipeRun(genId, { topic, channels, source:"cs", answers })
+      .catch(e=>console.error("pipeRun(CS) 예외:", String(e&&e.message||e)));
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// ===================== 정답지(학습 데이터) =====================
+/* 사람이 고쳐서 승인한 원고 = 우리 문체의 정답지.
+   지금 미세조정을 하려는 게 아니다. 나중에 로컬 모델을 우리 말투로 길들일 때
+   이게 있어야 한다. 안 모으면 영영 못 모은다. */
+app.get("/api/dataset", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(CG_TABLE,
+      "approval_status=eq.approved&select=topic,ai_raw_output,human_modified_output,edit_distance,target_channel,approved_at&order=approved_at.desc&limit=500");
+    const all = rows||[];
+    const edited = all.filter(r=>r.human_modified_output && String(r.human_modified_output).trim());
+    res.json({ ok:true, approved: all.length, edited: edited.length,
+      avgEdit: edited.length ? (edited.reduce((a,b)=>a+(+b.edit_distance||0),0)/edited.length) : null });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.get("/api/dataset/jsonl", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(CG_TABLE,
+      "approval_status=eq.approved&select=topic,human_modified_output,ai_raw_output,target_channel&order=approved_at.desc&limit=1000");
+    const voice = String((DB.brandProfile && DB.brandProfile.text) || "").trim();
+    const sys = "너는 전남 고흥 특산물을 파는 브랜드의 콘텐츠 담당이다."
+      + (voice ? "\n브랜드 보이스:\n" + voice.slice(0,800) : "");
+    const lines = (rows||[])
+      .filter(r=>r.human_modified_output && String(r.human_modified_output).trim().length > 50)
+      .map(r=>JSON.stringify({ messages:[
+        { role:"system",    content: sys },
+        { role:"user",      content: "주제: " + String(r.topic||"")
+                                    + (r.target_channel ? ("\n채널: " + r.target_channel) : "") },
+        { role:"assistant", content: String(r.human_modified_output).trim() }
+      ]}));
+    res.type("application/jsonl; charset=utf-8")
+       .set("Content-Disposition", 'attachment; filename="goheung-dataset.jsonl"')
+       .send(lines.join("\n"));
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* 브랜드 보이스가 비어 있으면 모든 원고가 말투 없이 시작한다.
+   사람이 고친 흔적이 곧 그 사람의 말투다. 그걸로 초안을 뽑아 준다.
+   저장은 하지 않는다 — 사람이 읽고 고쳐서 직접 저장해야 자기 말이 된다. */
+app.post("/api/brand/draft", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(CG_TABLE,
+      "approval_status=eq.approved&select=topic,ai_raw_output,human_modified_output&order=approved_at.desc&limit=8");
+    const pairs = (rows||[]).filter(r=>r.human_modified_output && String(r.human_modified_output).trim().length>50);
+    if (pairs.length < 2) return res.status(400).json({ ok:false,
+      error:"사람이 고쳐서 승인한 원고가 2건은 있어야 말투를 뽑을 수 있습니다 (지금 "+pairs.length+"건)" });
+
+    const body = pairs.slice(0,5).map((r,i)=>
+      "["+(i+1)+"] 주제: "+String(r.topic||"").slice(0,80)
+      + "\n(AI 원고)\n" + String(r.ai_raw_output||"").slice(0,1200)
+      + "\n(사람이 고친 최종본)\n" + String(r.human_modified_output).slice(0,1200)).join("\n\n---\n\n");
+
+    const txt = await genText(
+      "너는 브랜드 보이스를 정리하는 사람이다. 아래는 AI 원고와, 사람이 그것을 고친 최종본 쌍이다.\n"
+      + "고친 방향에서 이 사람의 말투 규칙을 뽑아라. 원고 내용이 아니라 '말하는 방식'만 본다.\n"
+      + "규칙:\n"
+      + "- 근거 없는 추측 금지. 두 건 이상에서 반복된 것만 적어라.\n"
+      + "- '자연스럽게' 같은 모호한 말 금지. 지켰는지 대조할 수 있게 적어라.\n"
+      + "- 한국어, 아래 형식만. 각 항목 3줄 이내.\n\n"
+      + "[말투]\n[자주 쓰는 표현]\n[쓰지 않는 표현]\n[손님을 부르는 방식]\n[글을 여는 방식]",
+      body, 900, (DB.state && DB.state.workEngine === "gemini") ? "gemini" : undefined);
+
+    const draft = String(txt||"").trim();
+    if (!draft) return res.status(502).json({ ok:false, error:"초안을 만들지 못했습니다" });
+    res.json({ ok:true, draft, basedOn: pairs.length });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// ===================== 단일 변수 실험 =====================
+/* "배우면 무조건 좋아진다"는 가정을 깨기 위한 장치.
+   한 번에 한 가지만 바꾸고, 바꾸기 전 평균과 대조해서, 나아졌을 때만 남긴다. */
+const EXP_TABLE = "agent_experiments";
+
+async function baselineScore(){
+  const rows = await supaSelect(CG_TABLE,
+    "approval_status=in.(approved,pending)&creativity_score=not.is.null"
+    + "&select=creativity_score&order=created_at.desc&limit=20");
+  const xs = (rows||[]).map(r=>+r.creativity_score).filter(n=>n>0);
+  return xs.length ? { avg: xs.reduce((a,b)=>a+b,0)/xs.length, n: xs.length } : { avg:null, n:0 };
+}
+
+app.get("/api/experiments", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(EXP_TABLE, "select=*&order=created_at.desc&limit=20");
+    const running = (rows||[]).find(r=>r.status==="running") || null;
+    res.json({ ok:true, rows: rows||[], running, baseline: await baselineScore() });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/experiments", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const cur = await supaSelect(EXP_TABLE, "status=eq.running&select=experiment_id&limit=1");
+    if (cur && cur[0]) return res.status(409).json({ ok:false,
+      error:"이미 진행 중인 실험이 있습니다. 한 번에 하나만 — 두 개를 같이 바꾸면 무엇 때문인지 알 수 없습니다." });
+    const b = req.body||{};
+    const variable = String(b.variable||"").trim(), hypothesis = String(b.hypothesis||"").trim();
+    if (!variable || !hypothesis)
+      return res.status(400).json({ ok:false, error:"무엇을 바꿨는지와 무엇이 좋아질 것인지 둘 다 필요합니다" });
+    const base = await baselineScore();
+    await supaInsert(EXP_TABLE, {
+      target: String(b.target||"전체").slice(0,80),
+      variable: variable.slice(0,300), hypothesis: hypothesis.slice(0,500),
+      baseline_score: base.avg, baseline_n: base.n
+    });
+    res.json({ ok:true, baseline: base });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/experiments/close", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.experiment_id||"");
+    const adopt = req.body?.adopt === true;
+    if (!id) return res.status(400).json({ ok:false, error:"experiment_id 가 필요합니다" });
+    await supaPatch(EXP_TABLE, "experiment_id=eq."+encodeURIComponent(id), {
+      status: adopt ? "adopted" : "discarded",
+      closed_at: new Date().toISOString(),
+      note: String(req.body?.note||"").slice(0,500)
+    });
+    res.json({ ok:true });
+
+    // 버린 실험도 기록이다 — 무엇이 안 통했는지가 다음 판단의 재료가 된다
+    const rows = await supaSelect(EXP_TABLE, "experiment_id=eq."+encodeURIComponent(id)+"&select=*");
+    const r = rows && rows[0];
+    if (r){
+      const exp = r.exp_n ? (r.exp_score_sum / r.exp_n) : null;
+      pushLearning("creation", "experiment",
+        "단일 변수 실험 — " + String(r.variable||"").slice(0,150),
+        (adopt ? "채택: " : "버림: ") + String(r.variable||"")
+        + " (기준 " + (r.baseline_score!=null?Math.round(r.baseline_score):"?") + "점 → 실험 "
+        + (exp!=null?Math.round(exp):"?") + "점, " + (r.exp_n||0) + "건)"
+        + (req.body?.note ? " / " + String(req.body.note).slice(0,200) : "")).catch(()=>{});
+    }
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* 실험이 도는 동안 만들어진 결과물의 점수를 모은다. 사람이 따로 기록할 필요가 없다. */
+async function feedExperiment(score){
+  try{
+    if (!useSupabase) return;
+    const n = Number(score);
+    if (!Number.isFinite(n) || n <= 0) return;
+    const rows = await supaSelect(EXP_TABLE, "status=eq.running&select=experiment_id,exp_score_sum,exp_n&limit=1");
+    const r = rows && rows[0];
+    if (!r) return;
+    await supaPatch(EXP_TABLE, "experiment_id=eq."+r.experiment_id, {
+      exp_score_sum: (+r.exp_score_sum||0) + n,
+      exp_n: (+r.exp_n||0) + 1
+    });
+  }catch(e){}
+}
 
 // ===================== 외부 서비스 등록 =====================
 // 키를 다루므로 잠금(REQUIRE_AUTH)이 켜져 있을 때만 쓰는 것을 전제로 한다.
@@ -1648,7 +2563,8 @@ const SETTING_KEYS = [
   "oseraGate","oseraMin","viralGate","viralMin","designReviewLoops","lessonInject",
   "deliberate","semanticSearch","researchMode","workEngine","freeLLMFirst",
   "nvidiaModel","allowPaidFallback","collect","safety",
-  "benchmarkPerDay","benchmarkLearnOn","knowledgeReviewOn"
+  "benchmarkPerDay","benchmarkLearnOn","knowledgeReviewOn",
+  "askWaitHours","askAutoResume","claudeFallbackGemini"
 ];
 const SETTING_DEFAULTS = {
   oseraGate:true, oseraMin:80, viralGate:false, viralMin:70,
@@ -1656,7 +2572,8 @@ const SETTING_DEFAULTS = {
   researchMode:"free", workEngine:"claude", freeLLMFirst:false,
   nvidiaModel:"", allowPaidFallback:false,
   collect:{ everyMin:0, prompt:"" }, safety:{ audit:false, dailyLimit:0 },
-  benchmarkPerDay:1, benchmarkLearnOn:true, knowledgeReviewOn:true
+  benchmarkPerDay:1, benchmarkLearnOn:true, knowledgeReviewOn:true,
+  askWaitHours:6, askAutoResume:true, claudeFallbackGemini:true
 };
 const isPlain = o => !!o && typeof o === "object" && !Array.isArray(o);
 
@@ -1841,7 +2758,7 @@ app.post("/api/pipeline/retry", async (req, res)=>{
 
     const rows = await supaSelect(CG_TABLE,
       "generation_id=eq."+encodeURIComponent(id)
-      + "&select=topic,target_channel,human_answers,ref_urls,approval_status");
+      + "&select=topic,target_channel,human_answers,ref_urls,approval_status,spec,ref_summary,ai_raw_output");
     const row = rows && rows[0];
     if (!row) return res.status(404).json({ ok:false, error:"해당 작업을 찾을 수 없습니다" });
     if (row.approval_status === "processing")
@@ -1863,7 +2780,10 @@ app.post("/api/pipeline/retry", async (req, res)=>{
       channels: String(row.target_channel||"").split(",").map(x=>x.trim()).filter(Boolean),
       source: "retry",
       answers: Array.isArray(row.human_answers) ? row.human_answers : [],
-      refUrls: Array.isArray(row.ref_urls) ? row.ref_urls : []
+      refUrls: Array.isArray(row.ref_urls) ? row.ref_urls : [],
+      spec: row.spec || null,
+      refSummary: row.ref_summary || "",
+      draft: row.ai_raw_output || ""
     }).catch(e=>console.error("pipeRun(재시도) 예외:", String(e&&e.message||e)));
 
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
@@ -2009,6 +2929,12 @@ app.post("/api/content/approve", async (req, res)=>{
     // ── 여기서부터는 응답 뒤에 돈다. 사람의 손길이 곧 학습 신호다.
     if (action !== "reject" && patch.edit_distance != null && patch.edit_distance >= 0.05){
       learnFromEdit(row.topic, row.ai_raw_output, final).catch(()=>{});
+    }
+    // 실험이 도는 중이면 이 결과물의 점수를 실험 쪽에 쌓는다.
+    // 사람 손이 적게 간 것일수록 잘 만든 것이므로 수정률을 뒤집어 점수로 쓴다.
+    if (action !== "reject"){
+      const ed = (patch.edit_distance == null) ? 0 : Math.min(1, Math.max(0, +patch.edit_distance));
+      feedExperiment(Math.round((1 - ed) * 100)).catch(()=>{});
     }
     if (action === "reject" && reason){
       pushLearning("creation", "reject",
@@ -2214,10 +3140,10 @@ const AGENTS = {
   analytics:   { no:"디2", kr:"디자인팀·웹 디자이너",    role:"디자인팀 소속 웹 디자이너. 홈페이지·상품 상세페이지·티스토리 스킨 등 웹 화면을 설계·제작한다. 레이아웃·여백·구조·반응형을 담당한다." },
   monetization:{ no:"디1", kr:"디자인팀·아트 디렉터",  role:"디자인팀 팀장(아트 디렉터). 색·무드·컨셉 등 비주얼 방향을 총괄하고 웹·그래픽(배너·카드뉴스·썸네일 이미지) 전반을 지휘한다. 판매 전환 상세페이지 구성·구매 전환 카피(혜택·후기·CTA)에도 강하다." },
   ops:         { no:"총괄", kr:"총괄실·비서", role:"총괄 비서(오케스트레이터). 스케줄·예약 관리, 팀 배정·명령 하달, 플랫폼·계정·발행·카카오 알림, 성과 취합을 담당한다. 저작권·광고법·정책 관점에서 모든 팀의 산출물을 검토하고 직접 수정·보완·재작성할 권한이 있다. 클로드(텍스트·추론)와 제미나이(영상·이미지)를 함께 활용해 전반을 조율한다." },
-  advisory:    { no:"글3", kr:"이야기팀·블로그 작가",      role:"이야기팀 소속 블로그 작가. SEO 최적화 블로그·정보성 장문 콘텐츠를 작성한다. 발행 전 품질 검수(과대·허위광고 표현, 브랜드 톤 이탈, 오탈자, 정책 위반)를 PASS/FAIL로 판정하고 개선 지시를 남기는 게이트키퍼 역할도 겸한다." },
+  advisory:    { no:"고1", kr:"고객팀·CS 매니저",      role:"고객팀 CS 매니저. 카카오톡 채널 친구 관리와 고객 응대를 맡는다. 문의 답변, 배송·교환·환불 안내, 클레임 초기 대응, 자주 묻는 질문 정리, 친구 늘리기와 재구매를 부르는 메시지를 쓴다. 손님에게 직접 말이 나가는 자리라 과장·확답을 가장 조심해야 한다. 모르는 것은 지어내지 않고 '확인해서 알려드리겠다'로 넘긴다." },
   scout:       { no:"필2", kr:"필름팀·대본 작가",      role:"필름팀 소속 대본 작가. 영상 나레이션·자막·스크립트를 쓰고, 트렌드·밈·키워드를 우리 특산물 영상에 바로 쓸 실전 소재(아이디어·후킹 대사·릴스 포맷·시즌 앵글)로 가공한다." },
-  editing:     { no:"필3", kr:"필름팀·편집·썸네일",  role:"필름팀 소속 편집·썸네일 담당. 컷 편집·자막·트랜지션·BGM 리듬을 설계하고, 클릭률(CTR)을 끌어올리는 썸네일(구도·표정·텍스트·대비)을 만든다. 영상 PD의 구성안을 실제 편집 지시서·썸네일 시안으로 변환한다." },
-  graphic:     { no:"디3", kr:"디자인팀·그래픽 디자이너", role:"디자인팀 소속 그래픽 디자이너. 배너·카드뉴스·썸네일 이미지·상세페이지 그래픽을 제작한다. 타이포·색·레이아웃·여백으로 시선을 잡고, 아트 디렉터의 무드를 실제 시안으로 구현한다." }
+  editing:     { no:"디3", kr:"디자인팀·웹 퍼블리셔",  role:"디자인팀 소속 웹 퍼블리셔. 웹 디자이너의 구성안과 생성된 HTML을 실제로 깨지지 않게 만드는 마지막 손이다. 안 닫힌 태그·잘린 섹션·끊긴 링크·빠진 이미지를 잡고, 모바일 폭·글자 크기·대비·터치 영역을 규격에 맞춘다. 예쁘게 바꾸는 사람이 아니라 무너지지 않게 하는 사람이다. 문제를 발견하면 어디를 어떻게 고칠지 구체적으로 지시한다." },
+  graphic:     { no:"디4", kr:"디자인팀·그래픽 디자이너", role:"디자인팀 소속 그래픽 디자이너. 배너·카드뉴스·썸네일 이미지·상세페이지 그래픽을 제작한다. 타이포·색·레이아웃·여백으로 시선을 잡고, 아트 디렉터의 무드를 실제 시안으로 구현한다." }
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
@@ -2250,7 +3176,37 @@ async function _rateGate(est){
   return run;
 }
 
+/* v296: 한 벤더가 죽으면 전부 멈추던 것을 막는다.
+   재시도·한도 대기를 다 하고도 실패했을 때만 Gemini 로 넘긴다.
+   품질이 달라지므로 '조용한 대체'가 아니라 로그와 카톡으로 알린다.
+   이미지가 있는 호출은 넘기지 않는다(형식이 달라 오히려 깨진다). */
 async function anthropic(system, user, maxTokens = 1500, images){
+  try{
+    return await anthropicRaw(system, user, maxTokens, images);
+  }catch(e){
+    const st = DB.state || {};
+    if (st.claudeFallbackGemini === false) throw e;
+    if (images && images.length) throw e;
+    try{ if (!geminiKey()) throw e; }catch(_){ throw e; }
+    const why = String(e && e.message || e).slice(0,140);
+    console.warn("Claude 실패 → Gemini 로 이어감:", why);
+    try{
+      const out = await geminiText(String(system||"") + "\n\n" + String(user||""), maxTokens);
+      if (out && String(out).trim()){
+        DB.fallbackCount = (DB.fallbackCount||0) + 1;
+        DB.lastFallbackAt = Date.now();
+        if (DB.fallbackCount === 1 || DB.fallbackCount % 10 === 0){
+          kakaoNotify("⚠️ Claude 가 응답하지 않아 Gemini 로 이어서 처리했어요 ("
+            + DB.fallbackCount + "회째)\n사유: " + why + "\n결과 품질이 평소와 다를 수 있습니다.").catch(()=>{});
+        }
+        return out;
+      }
+    }catch(e2){ console.error("Gemini 폴백도 실패:", String(e2&&e2.message||e2)); }
+    throw e;
+  }
+}
+
+async function anthropicRaw(system, user, maxTokens = 1500, images){
   await _rateGate(_estTokens(system, user)); // 분당 토큰 예산 안에서만 호출 admit
   let content;
   if (images && images.length){
@@ -2306,6 +3262,9 @@ async function anthropic(system, user, maxTokens = 1500, images){
     const data = await r.json();
     if (data.error) throw new Error(data.error.message || "API 오류");
     if (data.usage) {
+      // ── 어느 단계가 얼마를 썼는지 기록한다.
+      //    총합만 보면 "왜 이렇게 나왔지"에 영원히 답할 수 없다.
+      try{ costTag(system, data.usage.input_tokens||0, data.usage.output_tokens||0); }catch(_){}
       DB.usage = DB.usage || { in:0, out:0, calls:0 };
       DB.usage.in += data.usage.input_tokens || 0;
       DB.usage.out += data.usage.output_tokens || 0;
@@ -2490,7 +3449,7 @@ const PERSONA = {
   analytics:"디자인팀 웹 디자이너 강민서. 홈페이지·상세페이지·티스토리 스킨을 짠다. 말버릇 '여백이 8할이죠', '구조부터 잡아요'. 이모지 🖥️📐. 깔끔하고 정돈되게.",
   monetization:"디자인팀 팀장(아트 디렉터) 윤소희. 색·무드·컨셉을 잡고 웹·그래픽 전반을 총괄한다. 판매 전환 상세페이지에도 강하다. 말버릇 '이건 돈이 되죠', '무드가 반이에요'. 이모지 🎨💰. 똑부러지고 과감하게.",
   ops:"총괄 비서 오세라. 스케줄·예약을 관리하고, 팀에 명령을 하달하며, 플랫폼·계정·발행·알림을 챙기고 전체를 취합한다. 말버릇 '제가 정리할게요', '걱정 마세요, 챙기겠습니다'. 이모지 👑. 침착·단호하되 따뜻하게. 최고 권한·지식으로 팀을 조율·평가한다.",
-  advisory:"이야기팀 블로그 작가 정유진. SEO 블로그·정보글을 공감 있게 쓴다. 발행 전 품질 검수도 겸한다. 말버릇 '그 마음 알죠~', '정리하자면'. 이모지 ✍️💗. 따뜻하고 통찰 있게.",
+  advisory:"고객팀 CS 매니저 정유진. 카톡 채널로 손님을 직접 상대한다. 화난 문의에도 먼저 사실을 확인하고, 모르면 확답 대신 '확인해서 알려드릴게요'로 받는다. 말버릇 '그 마음 알죠~', '바로 확인해 드릴게요'. 이모지 💬💗. 따뜻하되 약속은 신중하게.",
   editing:"필름팀 편집·썸네일 담당 노아라. 컷 리듬·자막·트랜지션과 클릭률 높은 썸네일을 만든다. 말버릇 '이 컷은 0.5초 더', '썸네일이 반이에요'. 이모지 ✂️🔥. 손 빠르고 감각적으로.",
   graphic:"디자인팀 그래픽 디자이너 오하늘. 배너·카드뉴스·썸네일 이미지를 만든다. 말버릇 '색이 말해줘요', '타이포로 끝냅니다'. 이모지 🎨✨. 깔끔하고 감각적으로.",
   scout:"필름팀 대본 작가 서다은. 나레이션·자막·스크립트를 쓰고 트렌드를 소재로 가공한다. 말버릇 '어! 이거 봤어요?', '이 대사로 가요'. 이모지 🎬🔍. 발랄하고 재치 있게."
@@ -2689,13 +3648,17 @@ const DEPT_BENCHMARK = {
     "샤넬 에르메스 명품 브랜드 상품페이지 웹디자인 특징 분석",
     "전환율 높은 프리미엄 상세페이지 구성·레이아웃·카피 공식 2026",
     "고급스러운 이커머스 랜딩페이지 UX·여백·타이포그래피 트렌드" ] },
-  advisory: { what:"콘텐츠 품질 검수·광고법", queries:[
-    "SNS 콘텐츠 광고법·표시광고 규정 체크리스트 2026",
-    "브랜드 콘텐츠 품질 검수 기준·가독성·톤 일관성" ] },
-  editing: { what:"영상 편집 리듬·자막·썸네일 CTR", queries:[
-    "조회수 터지는 유튜브 쇼츠 편집 리듬·컷 전환 공식 2026",
-    "클릭률 높은 유튜브 썸네일 구도·색·텍스트 법칙" ], ytSearch:[
-    "쇼츠 편집 튜토리얼", "유튜브 썸네일 잘 만드는 법" ] },
+  advisory: { what:"고객 응대·카카오톡 채널 운영", queries:[
+    "카카오톡 채널 친구 늘리기 운영 사례 소상공인 2026",
+    "농산물 쇼핑몰 CS 응대 문구 클레임 대응 표준 매뉴얼",
+    "재구매를 부르는 고객 메시지 발송 주기와 문구 사례",
+    "전자상거래법 교환·환불 안내 의무 고지 사항" ] },
+  editing: { what:"웹 퍼블리싱 품질·코드 검토 판단", queries:[
+    "반응형 웹 퍼블리싱 체크리스트 모바일 뷰포트 이미지 최적화 2026",
+    "웹 접근성 대비비 4.5:1 터치 영역 44px 실무 기준",
+    "코드 리뷰 체크리스트 무엇을 보고 반려하나 실무 기준",
+    "AI가 생성한 코드 검증 방법 흔한 실수와 위험 신호",
+    "변경을 되돌릴 수 있게 배포하는 법 롤백 기준" ] },
   graphic: { what:"배너·카드뉴스·썸네일 그래픽 디자인", queries:[
     "전환율 높은 상세페이지 배너·카드뉴스 디자인 사례 2026",
     "타이포그래피·색 조합으로 시선 잡는 SNS 그래픽 법칙" ] },
@@ -6713,7 +7676,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v289";
+const SERVER_VERSION = "v300";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
@@ -7824,7 +8787,7 @@ async function productPagePipeline(body, setStep){
   }
   return { ok:true, html, product, kind, dept:d, appliedFormula: !!formula, visualDirection:j_visualDirection, reviews:designReviews, osera:_osera, oseraPassed:_oseraPassed, check:checkHtmlOutput(html), by:a.kr };
 }
-// v227: 보고서 근거 검수 (정유진·글3 = 부서 내부 QA). 최종 검증은 오세라가 따로 한다.
+// v227: 보고서 근거 검수 (이서연·글1 = 부서 내부 QA). 최종 검증은 오세라가 따로 한다.
 // 디자인 검수(색·레이아웃)와 완전히 다른 축이다. 지어낸 숫자 하나면 보고서 가치가 0이 된다.
 async function reviewReportHtml(html, topic, research){
   const h = String(html||"");
@@ -7838,7 +8801,7 @@ async function reviewReportHtml(html, topic, research){
   if(missing.length) issues.push("빠진 섹션: "+missing.join(", "));
   if(bodyText.replace(/\s+/g," ").trim().length < 600) issues.push("내용이 너무 얇음");
 
-  const sys = "너는 민앤팜의 '글3 이야기팀·블로그 작가' 정유진이자, 보고서 감사관이다. "
+  const sys = "너는 민앤팜의 '글1 이야기팀·콘텐츠 디렉터' 이서연이자, 보고서 감사관이다. "
     + "이 리서치 보고서는 쇼핑몰 사장님에게 '팔 물건'이다. 냉정하게 심사하라.\n"
     + "★심사 기준 (하나라도 걸리면 FAIL):\n"
     + "① 조작 여부 — [조사자료]에 없는 검색량·순위·점유율·퍼센트 숫자를 지어냈는가? (가장 중요. 하나라도 있으면 무조건 FAIL)\n"
@@ -7961,7 +8924,7 @@ async function reportPipeline(body, setStep){
   const _maxLoops = Math.max(0, Math.min(3, (DB.state && DB.state.designReviewLoops!=null) ? (+DB.state.designReviewLoops||0) : 1));
   if(!isRevise && _maxLoops>0 && html.length>300){
     for(let i=0;i<_maxLoops;i++){
-      _step("🔍 정유진(글3) 부서 QA — 지어낸 숫자·일반론이 없는지 점검 ("+(i+1)+"/"+_maxLoops+")");
+      _step("🔍 이서연(글1) 부서 QA — 지어낸 숫자·일반론이 없는지 점검 ("+(i+1)+"/"+_maxLoops+")");
       let rv;
       try{ rv = await reviewReportHtml(html, topic, research); }
       catch(e){ break; }
@@ -8625,7 +9588,27 @@ app.get("/api/sync", (req,res)=>{
   });
 });
 // 동기화 — 앱 상태 올리기(백업)
-app.post("/api/state", (req,res)=>{ DB.state = req.body||null; saveDB(); res.json({ ok:true, updatedAt:DB.updatedAt }); });
+/* v295: 몸통 교체 → 병합.
+   옛 앱(v272)은 자기가 아는 설정만 통째로 보낸다. 그대로 갈아끼우면
+   새 화면에서 정한 것(하루 학습량·질문 대기 시간·총괄 점검 등)이 저장할 때마다 사라졌다.
+   두 화면을 섞어 써도 서로를 지우지 않게, 준 것만 덮는다. */
+app.post("/api/state", (req,res)=>{
+  const b = req.body;
+  if (!b || typeof b !== "object" || Array.isArray(b)){ DB.state = b || null; }
+  else {
+    const cur = (DB.state && typeof DB.state === "object" && !Array.isArray(DB.state)) ? DB.state : {};
+    const next = Object.assign({}, cur);
+    const plain = o => !!o && typeof o === "object" && !Array.isArray(o);
+    Object.keys(b).forEach(k=>{
+      if (b[k] === undefined) return;
+      // 안쪽까지 한 겹 병합 — 옛 앱이 collect.prompt 처럼 모르는 항목을 지우지 않게
+      next[k] = (plain(b[k]) && plain(cur[k])) ? Object.assign({}, cur[k], b[k]) : b[k];
+    });
+    DB.state = next;
+  }
+  saveDB();
+  res.json({ ok:true, updatedAt:DB.updatedAt, merged:true });
+});
 // NVIDIA 무료 LLM — 실제 모델 목록 조회(정확한 model ID 확인용)
 app.get("/api/nvidia/models", async (req,res)=>{
   try{
@@ -11544,6 +12527,67 @@ setInterval(async ()=>{
       }).catch(e=>{ logError("benchmark-learn", e); DB.bmCount = Math.max(0,(DB.bmCount||1)-1); markLearn("benchmark", false, e); });
     }
   } catch(e){ /* 벤치마크 학습 실패 무시 */ }
+  // (0-b4-0) PC가 며칠째 안 켜지면 로컬 큐가 그대로 썩는다. 클라우드가 대신 처리한다.
+  try{
+    if (useSupabase && (Date.now() - (DB.lastLjqSweep||0)) > 30*60*1000){
+      DB.lastLjqSweep = Date.now();
+      const old = new Date(Date.now() - LJQ_FALLBACK_H*3600*1000).toISOString();
+      supaSelect(LJQ_TABLE, "status=eq.queued&created_at.lt."+old
+        + "&order=priority.asc,created_at.asc&limit=2&select=*")
+        .then(async rows=>{
+          for (const j of (rows||[])){
+            await supaPatch(LJQ_TABLE, "job_id=eq."+j.job_id,
+              { status:"running", claimed_by:"cloud", claimed_at:new Date().toISOString() });
+            try{
+              const p = j.payload || {};
+              const out = await genText(
+                String(p.system || "요청받은 것을 정리해서 한국어로 답하라."),
+                String(p.user || p.text || ""), Math.min(2000, +p.maxTok || 1200), "gemini");
+              await supaPatch(LJQ_TABLE, "job_id=eq."+j.job_id, {
+                status:"fellback", finished_at:new Date().toISOString(),
+                result:String(out||"").slice(0,20000) });
+              if (out) applyLocalResult(j.job_id, String(out)).catch(()=>{});
+              console.log("로컬 큐 대신 처리:", j.kind, j.job_id);
+            }catch(e){
+              await supaPatch(LJQ_TABLE, "job_id=eq."+j.job_id,
+                { status:"queued", claimed_by:null, claimed_at:null,
+                  error:String(e&&e.message||e).slice(0,300) });
+            }
+          }
+        }).catch(()=>{});
+    }
+  }catch(e){ /* 무시 */ }
+
+  // (0-b4-1) 오래 막힌 확인 요청은 스스로 푼다.
+  //   사람이 몇 시간째 답을 못 주면 일이 통째로 멎는다. 기다림에도 끝이 있어야 한다.
+  try {
+    const stQ = DB.state || {};
+    const waitH = Math.max(1, Math.min(72, +(stQ.askWaitHours || 6)));
+    if (useSupabase && stQ.askAutoResume !== false
+        && (Date.now() - (DB.lastAskSweepAt||0)) > 10*60*1000){   // 10분에 한 번만 훑는다
+      DB.lastAskSweepAt = Date.now();
+      const cut = new Date(Date.now() - waitH*3600*1000).toISOString();
+      supaSelect(CG_TABLE,
+        "approval_status=eq.needs_input&created_at.lt."+cut
+        + "&select=generation_id,topic,target_channel,human_answers,spec,ref_summary,ai_raw_output&limit=5")
+        .then(async rows=>{
+          for (const r of (rows||[])){
+            const merged = (Array.isArray(r.human_answers)?r.human_answers:[]).concat([SKIP_ANSWER]);
+            await supaPatch(CG_TABLE, "generation_id=eq."+r.generation_id, {
+              human_answers: merged, approval_status:"processing", blocked_reason:null,
+              revision_count:0, ai_raw_output:"⏳ "+waitH+"시간 동안 답이 없어 확인되지 않은 부분을 빼고 진행합니다..." });
+            console.log("확인 요청 자동 진행:", r.generation_id, r.topic||"");
+            pipeRun(r.generation_id, {
+              topic: r.topic||"",
+              channels: String(r.target_channel||"").split(",").map(x=>x.trim()).filter(Boolean),
+              source: "ask-timeout", answers: merged,
+              spec: r.spec || null, refSummary: r.ref_summary || "", draft: r.ai_raw_output || ""
+            }).catch(e=>console.error("pipeRun(질문 시간초과) 예외:", String(e&&e.message||e)));
+          }
+        }).catch(()=>{});
+    }
+  } catch(e){ /* 무시 */ }
+
   // (0-b4-2) 총괄 학습 점검: 하루 1회, 부서들이 쌓은 품질 공식을 총괄이 읽고 채점·과제 지정(무료 엔진)
   try {
     const st7b = DB.state || {};
