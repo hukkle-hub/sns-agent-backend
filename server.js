@@ -470,7 +470,13 @@ const DIRECTOR_SYS = `너는 콘텐츠 디렉터다. 작성자가 쓰기 전에 
 3. 반드시 넣을 것과 절대 넣지 말 것을 구체적으로 적는다.
 4. 성공 기준 3~5개. 판정 불가능한 문장("자연스러울 것") 금지.
    좋은 예: "첫 문장에 숫자나 장면이 있어 스크롤을 멈추게 한다"
-5. 임의로 정하면 결과가 크게 달라질 지점은 open_questions 에 적는다.
+5. open_questions 에는 **바깥에서 알아낼 수 없는 것만** 적는다.
+   물어도 되는 것: 우리 가격·재고·규격·일정, 우리가 가진 사진·영상, 브랜드 결정(타깃·톤·목표),
+                   우리만 아는 경험·후기, 아직 정해지지 않은 선택.
+   절대 묻지 말 것: 검색하면 나오는 사실(지역 기후·재배 환경·공식 기관 자료·공공 URL·
+                   교통 소요시간·시세·경쟁사 정보). 이런 것은 스스로 찾거나, 못 찾으면
+                   그 문장을 빼고 쓴다. 공개된 사실을 되묻는 것은 일을 떠넘기는 것이다.
+   질문은 최대 2개. 없으면 빈 배열로 둔다. 억지로 만들지 마라.
 자료가 부실하면 그 사실을 명시하고 없는 사실을 지어내지 말라고 못박아라.
 반드시 JSON만 출력한다.
 {"goal":"","angle":"","why_angle":"","must_include":[],"must_avoid":[],"success_criteria":[],"open_questions":[]}`;
@@ -495,10 +501,15 @@ const CRITIC_SYS = `원고를 두 축으로 엄격히 평가하고 JSON만 출�
                   표현, 구조, 어조, 길이, 흔한 문장, 논리 비약 등.
                   fix 에 무엇을 어떻게 바꾸라고 적는다.
 
-  owner="human" : 다시 써도 절대 해결되지 않는 것.
-                  없는 정보(가격·규격·일정·링크), 확정되지 않은 선택(타깃·톤·채널),
-                  사실 확인이 필요한 주장.
+  owner="human" : 다시 써도 절대 해결되지 않고, **우리 안에서만 알 수 있는** 것.
+                  우리 가격·규격·재고·일정·링크, 확정되지 않은 브랜드 선택(타깃·톤·채널),
+                  우리가 가진 자료(사진·후기)의 유무.
                   ask 에 운영자에게 물을 질문을 한 문장으로 적는다.
+
+  검색하면 나오는 사실(기후·재배 환경·공식 기관 자료·공공 URL·교통 시간·시세)이
+  근거 없이 쓰였다면 owner="human" 이 아니라 owner="ai" 로 지적하고,
+  fix 에 "출처를 확인해 쓰거나 그 문장을 삭제하라" 고 적는다.
+  확인되지 않는 문장은 빼면 그만이다. 그걸 운영자에게 되묻지 마라.
 
 판단 기준은 하나다: **같은 자료로 다시 써서 고쳐지는가.**
 고쳐지지 않는데 owner="ai" 로 적으면 무한히 되돌아가며 시간만 쓴다.
@@ -1061,6 +1072,10 @@ async function pipeRun(genId, opts){
   const ctx       = await pipeContext();
   const calNote   = await calibrationNote();
 
+  // 이 파이프라인은 사람이 기다리는 백그라운드 작업이다.
+  // 평소 모드면 응답이 조금만 늦어도(90~135초) 통째로 죽는다. 작업 모드에서는
+  // 타임아웃을 넉넉히 잡고(150초→225→337) 분당 한도도 기다렸다 다시 시도한다.
+  beginJobMode();
   try {
     // ── 1. 디렉터
     if (refUrls.length){
@@ -1072,6 +1087,19 @@ async function pipeRun(genId, opts){
         await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
           ref_urls: ref.used, ref_summary: ref.text.slice(0, 4000) });
       }
+    }
+
+    // 사람에게 묻기 전에 먼저 스스로 찾아본다. 공개된 사실을 물어보는 것은 일을 떠넘기는 것이다.
+    if (!String(source||"").trim()){
+      await pipeBeat(genId, "research", "⏳ 자료를 찾아보는 중...");
+      try{
+        const rs = await gatherResearch("", topic, topic);
+        if (rs && rs.brief){
+          source = "=== 스스로 찾은 자료" + (rs.searched ? " (웹 검색)" : " (모델 지식 — 확인 필요)") + " ===\n" + rs.brief;
+          await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
+            ref_summary: String(rs.brief).slice(0, 4000) }).catch(()=>{});
+        }
+      }catch(e){ /* 못 찾으면 없는 대로 진행 */ }
     }
 
     await pipeBeat(genId, "director", "⏳ 기준을 세우는 중...");
@@ -1270,7 +1298,7 @@ async function pipeRun(genId, opts){
     await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
       ai_raw_output: "❌ 생성 오류: "+msg, approval_status: "failed",
       blocked_reason: msg, heartbeat_at: new Date().toISOString() }).catch(()=>{});
-  }
+  } finally { endJobMode(); }
 }
 
 app.post("/api/pipeline/run", async (req, res)=>{
@@ -1342,6 +1370,142 @@ app.post("/api/pipeline/answer", async (req, res)=>{
   } catch(e){
     res.status(500).json({ ok:false, error:String(e&&e.message||e) });
   }
+});
+
+// ===================== 대결 평가 =====================
+// 우리 결과물과 전문가 결과물을 '어느 쪽인지 모르는 채로' 비교한다.
+// 점수가 아니라 승률로 본다. 점수는 우리끼리 후하게 줄 수 있지만 승률은 못 속인다.
+const DUELS_TABLE = "duels";
+
+function duelStats(rows){
+  const n = rows.length;
+  if (!n) return { n:0 };
+  const wins    = rows.filter(r=>r.winner==="ours").length;
+  const payOurs = rows.filter(r=>r.would_pay_ours).length;
+  const payRef  = rows.filter(r=>r.would_pay_ref).length;
+  const recent  = rows.slice(-10);
+  const rWins   = recent.filter(r=>r.winner==="ours").length;
+  // 검수자가 높게 준 쪽을 사람도 골랐는지 (우리끼리 대결에서만 기록된다)
+  const agreed  = rows.filter(r=>r.ai_agreed===true).length;
+  const judged  = rows.filter(r=>r.ai_agreed===true||r.ai_agreed===false).length;
+  return {
+    n, wins, winRate: wins/n,
+    payRateOurs: payOurs/n, payRateRef: payRef/n,
+    recentN: recent.length, recentWinRate: rWins/recent.length,
+    criticN: judged, criticAgreeRate: judged ? agreed/judged : null
+  };
+}
+
+// 판정 대기 + 성적표를 한 번에 — 화면 하나에 요청 하나
+app.get("/api/duels", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const pending = await supaSelect(DUELS_TABLE,
+      "winner=is.null&order=created_at.desc&limit=20&select=*");
+    const decided = await supaSelect(DUELS_TABLE,
+      "winner=not.is.null&order=decided_at.asc&limit=200"
+      + "&select=winner,would_pay_ours,would_pay_ref,ai_agreed,decided_at,topic,note");
+    res.json({ ok:true, pending: pending||[], stats: duelStats(decided||[]),
+               lost: (decided||[]).filter(r=>r.winner==="ref"&&r.note).slice(-5).reverse() });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// 새 대결 — 전문가 결과물은 비교 전용. 생성 프롬프트에는 절대 들어가지 않는다.
+app.post("/api/duel", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const b = req.body||{};
+    const ours = String(b.ours_text||"").trim(), ref = String(b.ref_text||"").trim();
+    if (!ours || !ref) return res.status(400).json({ ok:false, error:"양쪽 결과물이 모두 필요합니다" });
+    const row = await supaInsertReturn(DUELS_TABLE, {
+      topic: String(b.topic||"").slice(0,300),
+      ours_text: ours, ref_text: ref,
+      ref_source: String(b.ref_source||"").slice(0,500),
+      deliverable: String(b.deliverable||"").slice(0,100),
+      price_standard: (b.price_standard!=null && b.price_standard!=="") ? Number(b.price_standard) : null,
+      ours_is_a: Math.random() < 0.5           // 좌우를 섞는다 — 어느 쪽이 우리 것인지 모르게
+    });
+    res.json({ ok:true, duel_id: row && row.duel_id });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// 우리끼리 대결 — 검수자가 높게 준 쪽을 사람도 고르는지 본다. 어긋나면 검수 기준이 틀린 것.
+app.get("/api/duel/candidates", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(CG_TABLE,
+      "approval_status=in.(approved,pending)&order=created_at.desc&limit=20"
+      + "&select=generation_id,topic,ai_raw_output,human_modified_output,creativity_score,created_at");
+    res.json({ ok:true, rows: rows||[] });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/duel/internal", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const ids = [String(req.body?.a||""), String(req.body?.b||"")];
+    if (!ids[0] || !ids[1] || ids[0]===ids[1])
+      return res.status(400).json({ ok:false, error:"서로 다른 결과물 두 개를 골라 주세요" });
+    const rows = await supaSelect(CG_TABLE,
+      "generation_id=in.("+ids.join(",")+")"
+      + "&select=generation_id,topic,ai_raw_output,human_modified_output,creativity_score");
+    if (!rows || rows.length < 2) return res.status(404).json({ ok:false, error:"결과물을 찾지 못했습니다" });
+    const textOf = r => String(r.human_modified_output || r.ai_raw_output || "").trim();
+    const sc = r => Number(r.creativity_score||0);
+    const [hi, lo] = sc(rows[0]) >= sc(rows[1]) ? [rows[0], rows[1]] : [rows[1], rows[0]];
+    if (!textOf(hi) || !textOf(lo))
+      return res.status(400).json({ ok:false, error:"내용이 빈 결과물은 붙일 수 없습니다" });
+    const row = await supaInsertReturn(DUELS_TABLE, {
+      kind: "internal",
+      topic: String(hi.topic||"")+" ↔ "+String(lo.topic||""),
+      ours_text: textOf(hi), ref_text: textOf(lo),        // ours = 검수자가 높게 준 쪽
+      ours_ai_score: sc(hi), ref_ai_score: sc(lo),
+      generation_id: hi.generation_id,
+      deliverable: "검수자 검증",
+      ours_is_a: Math.random() < 0.5
+    });
+    res.json({ ok:true, duel_id: row && row.duel_id });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// 판정. 진 판의 이유는 그냥 두지 않고 학습 검토로 올린다 — 져도 남는 게 있어야 한다.
+app.post("/api/duel/decide", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const b = req.body||{};
+    const id = String(b.duel_id||"");
+    const winner = (b.winner==="ours") ? "ours" : "ref";
+    if (!id) return res.status(400).json({ ok:false, error:"duel_id 가 필요합니다" });
+
+    const cur = (await supaSelect(DUELS_TABLE,
+      "duel_id=eq."+encodeURIComponent(id)+"&select=kind,topic,winner"))[0];
+    if (!cur) return res.status(404).json({ ok:false, error:"대결을 찾을 수 없습니다" });
+    if (cur.winner) return res.status(409).json({ ok:false, error:"이미 판정된 대결입니다" });
+
+    const note = String(b.note||"").trim();
+    const patch = {
+      winner,
+      would_pay_ours: !!b.would_pay_ours,
+      would_pay_ref: !!b.would_pay_ref,
+      note: note.slice(0,1000),
+      decided_at: new Date().toISOString()
+    };
+    // 우리끼리 대결이면 'ours'는 검수자가 높게 준 쪽 — 사람이 그쪽을 골랐는지가 곧 검수 정확도
+    if (cur.kind === "internal") patch.ai_agreed = (winner === "ours");
+    await supaPatch(DUELS_TABLE, "duel_id=eq."+encodeURIComponent(id), patch);
+
+    // 졌고 이유를 적었으면 배울 거리로 올린다 (사람이 설정 화면에서 승인해야 지식이 된다)
+    if (winner === "ref" && note){
+      await supaInsert(LR_TABLE, {
+        dept: "creation",
+        dept_name: (AGENTS.creation ? (AGENTS.creation.no+" "+AGENTS.creation.kr) : "제작"),
+        source: "duel",
+        trigger: "대결에서 짐 — "+String(cur.topic||"").slice(0,200),
+        ai_learned: note.slice(0,2000)
+      }).catch(()=>{});
+    }
+    res.json({ ok:true });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
 // 중단된 일 다시 — 새 건을 만들지 않고 같은 자리에서 처음부터 다시 돌린다.
@@ -6180,7 +6344,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v278";
+const SERVER_VERSION = "v281";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
