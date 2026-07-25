@@ -1583,16 +1583,27 @@ app.post("/api/learning/review", async (req, res)=>{
     const finalText = edited || row.ai_learned;
     const wasEdited = !!edited && edited !== row.ai_learned;
 
+    // 부서 지식은 { text, at, ... } 한 덩어리다(knowledgeText()가 .text 를 읽어 프롬프트에 넣는다).
+    // 예전엔 여기서 배열로 push 해 두 가지가 어긋났고, 그래서 승인해도 부서에 닿지 않았다.
     const d = row.dept;
     DB.deptKnowledge = DB.deptKnowledge || {};
-    DB.deptKnowledge[d] = DB.deptKnowledge[d] || [];
-    DB.deptKnowledge[d].push({
-      at: Date.now(),
-      source: "사람 검토" + (wasEdited ? " (수정됨)" : ""),
-      text: finalText.slice(0, 1200)
-    });
-    if (DB.deptKnowledge[d].length > 60)
-      DB.deptKnowledge[d] = trimArchive(DB.deptKnowledge[d], 60, "deptKnowledge", d);
+    const cur  = DB.deptKnowledge[d];
+    const prev = Array.isArray(cur)
+      ? cur.map(x=>String((x&&x.text)||"")).filter(Boolean).join("\n")   // 옛 배열 형태를 흡수
+      : String((cur && cur.text) || "");
+    const stamp = new Date().toLocaleDateString("ko-KR", { timeZone:"Asia/Seoul" });
+    const line  = "- ["+stamp+" 사람 검토"+(wasEdited?"·수정":"")+"] " + finalText.replace(/\s+/g," ").slice(0, 600);
+
+    const LIMIT = 6000;                       // 통째로 프롬프트에 들어가므로 상한을 둔다
+    let lines = (prev ? prev.split("\n") : []).map(x=>x.replace(/\s+$/,"")).filter(Boolean);
+    lines.push(line);
+    while (lines.join("\n").length > LIMIT && lines.length > 1) lines.shift();   // 오래된 줄부터 덜어낸다
+    let merged = lines.join("\n");
+    if (merged.length > LIMIT) merged = merged.slice(merged.length - LIMIT);      // 한 줄이 통째로 길 때
+    DB.deptKnowledge[d] = Object.assign(
+      {}, (cur && !Array.isArray(cur)) ? cur : {},
+      { text: merged, at: Date.now(),
+        humanReviewed: (((cur && cur.humanReviewed) || 0) + 1) });
     saveDB();
 
     await supaPatch(LR_TABLE, "review_id=eq."+id, {
@@ -6344,7 +6355,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v281";
+const SERVER_VERSION = "v282";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
