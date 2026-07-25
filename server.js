@@ -437,30 +437,219 @@ function pipeJson(text){
 }
 
 // 브랜드 보이스 + 누적 규칙을 프롬프트 블록으로
-async function pipeContext(){
-  let voice = "", rules = [];
-  if (useSupabase){
-    try {
-      const v = await supaSelect("brand_voice", "is_active=eq.true&select=content&limit=1");
-      if (v && v[0]) voice = String(v[0].content||"");
-    } catch(_){}
-    try {
-      const r = await supaSelect("learned_rules",
-        "is_active=eq.true&select=rule_text&order=hit_count.desc&limit=15");
-      rules = (r||[]).map(x=>x.rule_text).filter(Boolean);
-    } catch(_){}
-  }
+/* 파이프라인에 들어가는 배경 지식.
+   v285 이전에는 Supabase의 brand_voice·learned_rules 두 표만 읽었는데
+   설정 화면과 학습 검토는 DB 쪽(brandProfile·projRules·deptKnowledge)에 쌓고 있었다.
+   두 표가 0건이라 파이프라인은 아무것도 배우지 못한 채 매번 백지에서 시작했다. */
+async function pipeContext(topic, channels){
   let block = "";
+
+  // ① 브랜드 보이스 — 설정 화면이 저장하는 곳을 먼저 본다
+  let voice = String((DB.brandProfile && DB.brandProfile.text) || "").trim();
+  if (!voice && useSupabase){
+    try{
+      const v = await supaSelect("brand_voice", "is_active=eq.true&select=content&limit=1");
+      if (v && v[0]) voice = String(v[0].content||"").trim();
+    }catch(_){}
+  }
   if (voice){
-    block += "\n\n=== 브랜드 보이스 ===\n" + voice.trim() +
+    block += "\n\n=== 브랜드 보이스 ===\n" + voice.slice(0,2500) +
              "\n=== 끝 ===\n말투, 금지 표현, 채널별 규칙을 반드시 지켜라.\n";
   }
-  if (rules.length){
-    block += "\n\n=== 과거 수정에서 학습한 규칙 (최우선) ===\n" +
-             rules.map(r=>"- "+r).join("\n") +
-             "\n=== 끝 ===\n실제로 사람이 반복해서 고친 내용이다. 브랜드 보이스와 충돌하면 이쪽을 따른다.\n";
+
+  // ② 사람이 못 박은 규칙 — 이번 주제와 관련된 것만 골라 넣는다(대화 경로와 같은 장부)
+  try{ block += lessonsBlock(String(topic||"")); }catch(_){}
+
+  // ③ 품질 공식 — 웹·유튜브에서 최고 사례를 조사해 쌓은 기준.
+  //    이번 채널을 맡는 부서 것만 넣는다(전 부서를 넣으면 서로를 묻는다).
+  deptsForChannels(channels, topic).forEach(d=>{
+    const f = qualityFormula(d);
+    if (f) block += "\n\n=== " + (AGENTS[d] ? AGENTS[d].kr : d)
+      + " 품질 공식 (벤치마크 학습) ===\n" + f
+      + "\n=== 끝 ===\n이 공식은 실제 고품질 사례를 조사해 뽑은 것이다."
+      + " 여기 적힌 기준을 하나씩 충족시켜라. 충족한 뒤에 우리만의 각도를 얹어라.\n";
+  });
+
+  // ④ 사람이 검토해 통과시킨 배움 — 부서 지식의 검토 줄 + learned_rules
+  const seen = {}, learned = [];
+  const take = (line)=>{
+    const t = String(line||"").trim();
+    if (!t) return;
+    const key = t.replace(/^[-·\s]+/,"").slice(0,40);
+    if (seen[key]) return;
+    seen[key] = 1; learned.push(t.replace(/^[-·\s]+/,"- "));
+  };
+  Object.keys(AGENTS||{}).forEach(d=>{
+    String(knowledgeText(d)||"").split("\n")
+      .filter(x=>/^\s*-\s*\[/.test(x))          // '- [날짜 사람 검토] …' 줄만
+      .slice(-4).forEach(take);
+  });
+  if (useSupabase){
+    try{
+      const r = await supaSelect("learned_rules",
+        "is_active=eq.true&select=rule_text&order=hit_count.desc,created_at.desc&limit="
+        + Math.max(5, lessonInjectMax()));
+      (r||[]).forEach(x=>take(x.rule_text));
+    }catch(_){}
+  }
+  if (learned.length){
+    block += "\n\n=== 사람이 승인한 배움 (최우선) ===\n" + learned.slice(0,24).join("\n") +
+             "\n=== 끝 ===\n사람이 직접 검토해 통과시킨 것이다. 위 규칙과 충돌하면 이쪽을 따른다.\n";
   }
   return block;
+}
+
+/* ═══ 총괄의 학습 점검 ═══
+   부서가 스스로 조사해 쌓은 품질 공식이 '진짜 쓸 수 있는 기준'인지 총괄(오세라)이 읽고 판단한다.
+   그냥 쌓기만 하면 추상적인 말이 늘어날 뿐 지능이 오르지 않는다.
+   판단 결과로 다음 조사 과제를 총괄이 직접 지정한다 — 이것이 학습의 방향키다.
+   채점은 무료 엔진으로 돌린다. 이 고리를 도는 데 돈이 들면 계속 돌 수 없다. */
+async function leaderReviewKnowledge(){
+  const out = [];
+  const depts = Object.keys(AGENTS).filter(d=>d!=="ops" && String(knowledgeText(d)||"").trim());
+  for (const d of depts){
+    const body = qualityFormula(d);
+    if (!body || body.length < 60) continue;
+    let txt = "";
+    try{
+      txt = await genText(
+        "너는 '"+(AGENTS.ops?AGENTS.ops.kr:"총괄")+"'이다. 아래는 "+(AGENTS[d]?AGENTS[d].kr:d)
+        + " 부서가 웹·유튜브에서 최고 사례를 조사해 정리한 품질 공식이다.\n"
+        + "이것이 '결과물을 만들 때 그대로 쓸 수 있는 기준'인지 냉정하게 판단하라.\n"
+        + "판단 잣대(취향 금지):\n"
+        + "- 숫자·구체 행동으로 적혀 있는가(예: '섹션 5개 이하'는 O, '깔끔하게'는 X)\n"
+        + "- 지켰는지 안 지켰는지 나중에 대조할 수 있는가\n"
+        + "- 이 브랜드가 아니어도 통하는 뻔한 말만 있지는 않은가\n"
+        + "아래 형식만, 한국어(설명·서론 금지):\n"
+        + "점수: (0~100 정수 하나. 구체적이고 대조 가능할수록 높다)\n"
+        + "쓸 만한 것: (그대로 쓸 수 있는 기준 1~2줄)\n"
+        + "허술한 것: (모호해서 못 쓰는 항목 1~2줄. 없으면 '없음')\n"
+        + "다음 학습 과제: (이 부서가 다음에 웹에서 조사해 채워야 할 구체적 빈틈 한 줄)",
+        body.slice(0,2200), 500, "gemini");
+    }catch(e){ continue; }
+    const t = String(txt||"").trim();
+    if (!t) continue;
+    const score = (function(){ const m=t.match(/점수\s*[:：]\s*(\d{1,3})/); return m?Math.max(0,Math.min(100,+m[1])):null; })();
+    const gap   = (function(){ const m=t.match(/다음 학습 과제\s*[:：]\s*([^\n]{4,200})/); return m?m[1].trim():""; })();
+
+    DB.knowledgeReview = DB.knowledgeReview || {};
+    DB.knowledgeReview[d] = { at:Date.now(), score, text:t.slice(0,1200), gap };
+
+    // 총괄이 지정한 과제를 부서 지식 끝에 박아 둔다 → 다음 벤치마크 조사 주제가 된다
+    if (gap){
+      const cur = DB.deptKnowledge[d];
+      if (cur && typeof cur === "object" && !Array.isArray(cur)){
+        const base = String(cur.text||"").replace(/\n?다음 학습 과제\s*[:：][^\n]*/g, "").replace(/\s+$/,"");
+        DB.deptKnowledge[d] = Object.assign({}, cur, {
+          text: base + "\n다음 학습 과제: " + gap.slice(0,200),
+          reviewedAt: Date.now(), reviewScore: score });
+      }
+    }
+    out.push({ dept:d, score, gap });
+  }
+  if (out.length){
+    try{ saveDB(); }catch(_){}
+    const avg = Math.round(out.filter(x=>x.score!=null).reduce((a,b)=>a+b.score,0) / Math.max(1,out.filter(x=>x.score!=null).length));
+    const worst = out.filter(x=>x.score!=null).sort((a,b)=>a.score-b.score)[0];
+    kakaoNotify("🧭 총괄 학습 점검 — "+out.length+"개 부서 평균 "+avg+"점"
+      + (worst ? ("\n가장 허술한 곳: "+(AGENTS[worst.dept]?AGENTS[worst.dept].kr:worst.dept)+" "+worst.score+"점"
+                 + (worst.gap?("\n다음 과제로 지정: "+worst.gap.slice(0,60)):"")) : "")).catch(()=>{});
+  }
+  return { ok:true, reviewed: out.length, rows: out };
+}
+app.post("/api/learn/leader-review", async (req,res)=>{
+  try{ res.json(await leaderReviewKnowledge()); }
+  catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* 지능이 어디까지 올라왔는지 한 장으로 — 부서별 학습·점검 상태 */
+app.get("/api/growth", (req,res)=>{
+  const rv = DB.knowledgeReview || {};
+  const rows = Object.keys(AGENTS).filter(d=>d!=="ops").map(d=>{
+    const k = DB.deptKnowledge && DB.deptKnowledge[d];
+    const text = String((k && k.text) || "");
+    const gapM = text.match(/다음 학습 과제\s*[:：]\s*([^\n]{4,200})/);
+    return {
+      dept: d, name: AGENTS[d] ? AGENTS[d].kr : d,
+      has: !!text.trim(),
+      chars: text.length,
+      learnedAt: (k && k.at) || 0,
+      benchmark: (k && k.benchmark) || "",
+      humanReviewed: (k && k.humanReviewed) || 0,
+      exp: (DB.exp && DB.exp[d]) || 0,
+      score: rv[d] ? rv[d].score : null,
+      reviewedAt: rv[d] ? rv[d].at : 0,
+      gap: gapM ? gapM[1].trim() : ""
+    };
+  });
+  const scored = rows.filter(r=>r.score!=null);
+  res.json({ ok:true, rows,
+    avgScore: scored.length ? Math.round(scored.reduce((a,b)=>a+b.score,0)/scored.length) : null,
+    perDay: Math.max(1, Math.min(5, +((DB.state&&DB.state.benchmarkPerDay)||1))),
+    lastBenchmarkDay: DB.lastBenchmarkDay || "", todayDone: (DB.bmDay===kstDay() ? (DB.bmCount||0) : 0) });
+});
+
+/* 이번 작업의 채널을 실제로 맡는 부서. 그 부서가 쌓은 기준만 넣는다. */
+function deptsForChannels(channels, topic){
+  const t = (Array.isArray(channels) ? channels.join(" ") : "") + " " + String(topic||"");
+  const out = [];
+  const add = d => { if (AGENTS[d] && out.indexOf(d) < 0) out.push(d); };
+  if (/홈페이지|랜딩|웹|상세|상품/.test(t))     add("analytics");
+  if (/블로그|카페|네이버|티스토리/.test(t))     add("advisory");
+  if (/유튜브|영상|쇼츠|릴스/.test(t))          add("publishing");
+  if (/인스타|카드뉴스|썸네일|배너/.test(t))     add("monetization");
+  if (/스레드|threads/i.test(t))               add("strategy");
+  add("creation");                             // 콘텐츠 디렉터는 늘 낀다
+  return out.slice(0, 3);
+}
+
+/* 벤치마크 학습이 쌓아 둔 품질 공식.
+   '다음 학습 과제'는 그 부서의 숙제일 뿐 이번 원고의 기준이 아니라 잘라낸다. */
+function qualityFormula(dept){
+  const t = String(knowledgeText(dept)||"").trim();
+  if (!t) return "";
+  const body = t.split(/\n\s*다음 학습 과제\s*[:：]/)[0]
+                .split("\n").filter(x=>!/^\s*-\s*\[/.test(x))   // 사람 검토 줄은 아래에서 따로 넣는다
+                .join("\n").trim();
+  return body.slice(0, 1800);
+}
+
+/* 검토 대기열에 곧장 올린다(표본 추출 없이).
+   사람이 고친 것·진 대결처럼 드물고 값진 신호는 건너뛰면 안 된다. */
+async function pushLearning(dept, source, trigger, learned){
+  if (!useSupabase) return;
+  const t = String(learned||"").trim();
+  if (t.length < 15) return;
+  const d = AGENTS[dept] ? dept : "creation";
+  await supaInsert(LR_TABLE, {
+    dept: d,
+    dept_name: AGENTS[d] ? (AGENTS[d].no+" "+AGENTS[d].kr) : d,
+    source: source,
+    trigger: String(trigger||"").slice(0,300),
+    ai_learned: t.slice(0,2000)
+  }).catch(()=>{});
+}
+
+/* 사람이 무엇을 고쳤는지가 가장 강한 신호다.
+   지금까지는 수정률(숫자)만 남기고 '무엇을 왜 고쳤는지'는 버리고 있었다. */
+async function learnFromEdit(topic, before, after){
+  try{
+    const a = String(before||""), b = String(after||"");
+    if (a.length < 80 || b.length < 80) return;
+    const out = await anthropic(
+      "너는 사람이 AI 원고를 어떻게 고쳤는지 비교해 '다음에 처음부터 그렇게 쓰는 법'을 뽑는 정리자다.\n"
+      + "규칙:\n"
+      + "- 무엇이 달라졌는지 나열하지 마라. 다음 글을 쓸 때 지킬 지침 한두 줄로 적어라.\n"
+      + "- 이번 주제에만 해당하는 내용은 버려라.\n"
+      + "- 단순 오타·띄어쓰기 수정뿐이면 정확히 '없음' 이라고만 답하라.\n"
+      + "- 2문장 이내, 한국어.",
+      "주제: " + String(topic||"").slice(0,120)
+      + "\n\n[AI 원고]\n" + a.slice(0,2500)
+      + "\n\n[사람이 고친 최종본]\n" + b.slice(0,2500), 400);
+    const t = String(out||"").trim();
+    if (!t || /^없음/.test(t)) return;
+    await pushLearning("creation", "edit", "사람이 고친 원고 — "+String(topic||"").slice(0,150), t);
+  }catch(e){}
 }
 
 const DIRECTOR_SYS = `너는 콘텐츠 디렉터다. 작성자가 쓰기 전에 무엇을 쓸지 정한다.
@@ -487,6 +676,10 @@ const CRITIC_SYS = `원고를 두 축으로 엄격히 평가하고 JSON만 출�
   이 축은 '문제가 없는가'만 본다. 문제가 없다고 좋은 글은 아니다.
 
 [축2 creativity 0~100] 수준 평가. 기본값 50이며 근거 없이 올리지 마라.
+  위에 '품질 공식(벤치마크 학습)'이 주어졌다면 그것이 채점 기준이다.
+  네 취향으로 매기지 말고, 공식의 항목을 하나씩 충족했는지 대조해서 매겨라.
+  공식을 다 지켰지만 흔하기만 하면 60점이다 — 기준 충족은 바닥이지 천장이 아니다.
+  공식을 지킨 위에 이 브랜드만의 각도가 얹혔을 때 70점을 넘긴다.
   - 첫 문장이 같은 주제의 흔한 글과 구별되는가
   - 이 브랜드가 아니면 할 수 없는 말이 있는가
   - 구성에 의도가 보이는가(나열이 아니라 설계인가)
@@ -871,8 +1064,13 @@ function dsPush(msgs, role, text){
   return arr;
 }
 
+/* ⚠ v288: 스튜디오를 /api/studio/* 로 옮겼다.
+   /api/design/start 과 /api/design/get 이 두 벌 등록돼 있었고,
+   Express 는 먼저 등록된 것만 태운다 → v272 앱의 '디자인실'(designJobs) 요청이
+   여기 홈페이지 스튜디오로 잘못 들어와 조용히 깨지고 있었다.
+   이제 /api/design/* 는 전부 디자인실 것이고, 스튜디오는 /api/studio/* 다. */
 // 1) 세션 시작 — 참고 사이트 구조부터 뜯는다
-app.post("/api/design/start", async (req, res)=>{
+app.post("/api/studio/start", async (req, res)=>{
   try {
     if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const topic = String(req.body?.topic||"").trim();
@@ -901,7 +1099,7 @@ app.post("/api/design/start", async (req, res)=>{
           structure = pipeJson(await anthropic(REF_STRUCT_SYS, parts.join("\n\n---\n\n"), 2500));
         }
       }
-      const ctx = await pipeContext();
+      const ctx = await pipeContext(topic, ["홈페이지"]);
       const p = pipeJson(await anthropic(
         PROPOSE_SYS,
         "주제: " + topic
@@ -919,8 +1117,9 @@ app.post("/api/design/start", async (req, res)=>{
 });
 
 // 2) 참고 구조 수정 — 분석이 틀렸으면 사람이 고친다
-app.post("/api/design/fix-structure", async (req, res)=>{
+app.post("/api/studio/fix-structure", async (req, res)=>{
   try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const id = String(req.body?.session_id||"");
     const st = req.body?.structure;
     if (!id || !st) return res.status(400).json({ ok:false, error:"session_id 와 structure 가 필요합니다" });
@@ -930,8 +1129,9 @@ app.post("/api/design/fix-structure", async (req, res)=>{
 });
 
 // 3) 대화 — 방향을 고르거나 고쳐달라고 말한다
-app.post("/api/design/reply", async (req, res)=>{
+app.post("/api/studio/reply", async (req, res)=>{
   try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const id  = String(req.body?.session_id||"");
     const msg = String(req.body?.message||"").trim();
     if (!id || !msg) return res.status(400).json({ ok:false, error:"session_id 와 message 가 필요합니다" });
@@ -971,8 +1171,9 @@ JSON만 출력한다.
 });
 
 // 4) 제작 — 합의된 방향으로만 만든다
-app.post("/api/design/build", async (req, res)=>{
+app.post("/api/studio/build", async (req, res)=>{
   try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const id = String(req.body?.session_id||"");
     const row = await dsGet(id);
     if (!row) return res.status(404).json({ ok:false, error:"세션을 찾을 수 없습니다" });
@@ -980,7 +1181,7 @@ app.post("/api/design/build", async (req, res)=>{
     res.json({ ok:true, building:true });
 
     (async ()=>{
-      const ctx = await pipeContext();
+      const ctx = await pipeContext(row.topic, ["홈페이지"]);
       const spec = pipeJson(await anthropic(
         PAGE_SYS,
         "주제: " + row.topic
@@ -1006,8 +1207,9 @@ app.post("/api/design/build", async (req, res)=>{
 });
 
 // 5) 보정 — 만든 뒤 말로 고친다
-app.post("/api/design/revise", async (req, res)=>{
+app.post("/api/studio/revise", async (req, res)=>{
   try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const id  = String(req.body?.session_id||"");
     const msg = String(req.body?.message||"").trim();
     const row = await dsGet(id);
@@ -1033,8 +1235,9 @@ app.post("/api/design/revise", async (req, res)=>{
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
-app.get("/api/design/get", async (req, res)=>{
+app.get("/api/studio/get", async (req, res)=>{
   try {
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const id = String(req.query.id||"");
     if (id){
       const row = await dsGet(id);
@@ -1069,7 +1272,7 @@ async function pipeRun(genId, opts){
   const channels  = Array.isArray(opts.channels) ? opts.channels : [];
   let   source    = String(opts.source||"").slice(0, 6000);
   const refUrls   = Array.isArray(opts.refUrls) ? opts.refUrls : [];
-  const ctx       = await pipeContext();
+  const ctx       = await pipeContext(topic, channels);
   const calNote   = await calibrationNote();
 
   // 이 파이프라인은 사람이 기다리는 백그라운드 작업이다.
@@ -1372,6 +1575,126 @@ app.post("/api/pipeline/answer", async (req, res)=>{
   }
 });
 
+// ===================== 외부 서비스 등록 =====================
+// 키를 다루므로 잠금(REQUIRE_AUTH)이 켜져 있을 때만 쓰는 것을 전제로 한다.
+// 키 값은 절대 되돌려주지 않는다 — 등록 여부와 끝 4자리만 보여준다.
+const SVC_TABLE = "registered_services";
+const maskKey = k => { const t=String(k||""); return t ? ("••••"+t.slice(-4)) : ""; };
+
+app.get("/api/services", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(SVC_TABLE,
+      "select=service_id,service_name,service_type,endpoint_url,api_key,is_active,created_at&order=created_at.desc&limit=50");
+    res.json({ ok:true, locked: !!REQUIRE_AUTH, rows: (rows||[]).map(r=>({
+      service_id:r.service_id, service_name:r.service_name, service_type:r.service_type,
+      endpoint_url:r.endpoint_url||"", is_active:r.is_active!==false,
+      key_tail: maskKey(r.api_key), created_at:r.created_at })) });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/services", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const b = req.body||{};
+    const key = String(b.api_key||"").trim();
+
+    // 수정: 준 것만 덮는다. 이름을 안 보냈다고 이름을 지우면 안 된다.
+    if (b.service_id){
+      const patch = {};
+      if (b.service_name!=null && String(b.service_name).trim() && String(b.service_name)!=="-")
+        patch.service_name = String(b.service_name).trim().slice(0,80);
+      if (b.service_type!=null && String(b.service_type).trim() && String(b.service_type)!=="-")
+        patch.service_type = String(b.service_type).trim().slice(0,40);
+      if (b.endpoint_url!=null) patch.endpoint_url = String(b.endpoint_url).slice(0,500);
+      if (typeof b.is_active === "boolean") patch.is_active = b.is_active;
+      if (key) patch.api_key = key.slice(0,2000);      // 비우면 기존 키를 그대로 둔다
+      if (!Object.keys(patch).length) return res.json({ ok:true, updated:false });
+      await supaPatch(SVC_TABLE, "service_id=eq."+encodeURIComponent(String(b.service_id)), patch);
+      return res.json({ ok:true, updated:true });
+    }
+
+    // 새로 등록
+    const name = String(b.service_name||"").trim();
+    const type = String(b.service_type||"").trim();
+    if (!name || !type) return res.status(400).json({ ok:false, error:"서비스 이름과 종류가 필요합니다" });
+    if (!key) return res.status(400).json({ ok:false, error:"새 서비스는 키가 필요합니다" });
+    await supaInsert(SVC_TABLE, {
+      service_name: name.slice(0,80), service_type: type.slice(0,40),
+      endpoint_url: String(b.endpoint_url||"").slice(0,500),
+      is_active: b.is_active !== false, api_key: key.slice(0,2000)
+    });
+    res.json({ ok:true, created:true });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+app.post("/api/services/delete", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.service_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"service_id 가 필요합니다" });
+    const r = await fetch(SUPA_URL+"/rest/v1/"+SVC_TABLE+"?service_id=eq."+encodeURIComponent(id), {
+      method:"DELETE", headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY } });
+    res.json({ ok: r.ok });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// (잠금 상태 조회는 위쪽 /api/auth-check 가 이미 하고 있다 — 중복 등록하지 않는다)
+
+// ===================== 설정(부분 저장) =====================
+// /api/state 는 몸통을 통째로 갈아끼운다. 설정 화면 하나가 그걸 쓰면
+// 다른 화면이 저장해 둔 값이 통째로 날아간다. 여기서는 준 것만 덮는다.
+const SETTING_KEYS = [
+  "oseraGate","oseraMin","viralGate","viralMin","designReviewLoops","lessonInject",
+  "deliberate","semanticSearch","researchMode","workEngine","freeLLMFirst",
+  "nvidiaModel","allowPaidFallback","collect","safety",
+  "benchmarkPerDay","benchmarkLearnOn","knowledgeReviewOn"
+];
+const SETTING_DEFAULTS = {
+  oseraGate:true, oseraMin:80, viralGate:false, viralMin:70,
+  designReviewLoops:1, lessonInject:14, deliberate:false, semanticSearch:true,
+  researchMode:"free", workEngine:"claude", freeLLMFirst:false,
+  nvidiaModel:"", allowPaidFallback:false,
+  collect:{ everyMin:0, prompt:"" }, safety:{ audit:false, dailyLimit:0 },
+  benchmarkPerDay:1, benchmarkLearnOn:true, knowledgeReviewOn:true
+};
+const isPlain = o => !!o && typeof o === "object" && !Array.isArray(o);
+
+app.get("/api/settings", (req,res)=>{
+  const st = DB.state || {};
+  const out = {};
+  SETTING_KEYS.forEach(k=>{
+    const d = SETTING_DEFAULTS[k];
+    out[k] = (st[k] === undefined) ? d
+           : (isPlain(d) && isPlain(st[k])) ? Object.assign({}, d, st[k])
+           : st[k];
+  });
+  res.json({ ok:true, settings: out, defaults: SETTING_DEFAULTS,
+    env: {
+      nvidia: !!process.env.NVIDIA_API_KEY,
+      geminiPaid: !!process.env.GEMINI_API_KEY_PAID,
+      version: SERVER_VERSION
+    } });
+});
+
+app.post("/api/settings", (req,res)=>{
+  const b = req.body || {};
+  DB.state = DB.state || {};
+  const changed = [];
+  SETTING_KEYS.forEach(k=>{
+    if (b[k] === undefined) return;
+    if (isPlain(b[k])){                                    // 객체는 안쪽만 덮는다
+      DB.state[k] = Object.assign({}, isPlain(DB.state[k]) ? DB.state[k] : {}, b[k]);
+    } else {
+      DB.state[k] = b[k];
+    }
+    changed.push(k);
+  });
+  if (!changed.length) return res.json({ ok:true, changed:[] });
+  try{ saveDB(); }catch(e){}
+  res.json({ ok:true, changed });
+});
+
 // ===================== 대결 평가 =====================
 // 우리 결과물과 전문가 결과물을 '어느 쪽인지 모르는 채로' 비교한다.
 // 점수가 아니라 승률로 본다. 점수는 우리끼리 후하게 줄 수 있지만 승률은 못 속인다.
@@ -1606,6 +1929,17 @@ app.post("/api/learning/review", async (req, res)=>{
         humanReviewed: (((cur && cur.humanReviewed) || 0) + 1) });
     saveDB();
 
+    // 부서 지식과 별개로, 조회·검색이 되는 표에도 남긴다.
+    // DB 몸통이 어떤 이유로 초기화돼도 배운 것은 여기 남는다.
+    await supaInsert("learned_rules", {
+      rule_text: finalText.slice(0,600),
+      category: row.dept || "general",
+      evidence: { from:"learning_review", review_id:id,
+                  trigger:String(row.trigger||"").slice(0,300), edited:wasEdited },
+      hit_count: 1,
+      is_active: true                      // 기본값이 false 라 명시하지 않으면 아무도 안 읽는다
+    }).catch(()=>{});
+
     await supaPatch(LR_TABLE, "review_id=eq."+id, {
       status: wasEdited ? "edited" : "approved",
       human_edited: wasEdited ? finalText : null,
@@ -1639,6 +1973,7 @@ app.post("/api/content/approve", async (req, res)=>{
     const id     = String(req.body?.generation_id||"");
     const action = String(req.body?.action||"approve");   // approve | reject
     const edited = String(req.body?.edited||"");
+    const reason = String(req.body?.reason||"").trim();   // 반려 사유 — 이것도 배움이다
     const score  = req.body?.human_score;
     if (!id) return res.status(400).json({ ok:false, error:"generation_id 가 필요합니다" });
 
@@ -1667,8 +2002,18 @@ app.post("/api/content/approve", async (req, res)=>{
       if (row.creativity_score != null)
         patch.score_gap = Math.round((Number(row.creativity_score) - score)*100)/100;
     }
+    if (reason) patch.blocked_reason = reason.slice(0,500);
     await supaPatch(CG_TABLE, "generation_id=eq."+id, patch);
     res.json({ ok:true, action: patch.approval_status, edit_distance: patch.edit_distance ?? null });
+
+    // ── 여기서부터는 응답 뒤에 돈다. 사람의 손길이 곧 학습 신호다.
+    if (action !== "reject" && patch.edit_distance != null && patch.edit_distance >= 0.05){
+      learnFromEdit(row.topic, row.ai_raw_output, final).catch(()=>{});
+    }
+    if (action === "reject" && reason){
+      pushLearning("creation", "reject",
+        "반려 — " + String(row.topic||"").slice(0,150), reason).catch(()=>{});
+    }
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
@@ -1679,6 +2024,7 @@ app.get("/api/manager/board", async (req, res)=>{
     const sel = "generation_id,topic,approval_status,stage,ai_raw_output,ai_self_score,"
               + "creativity_score,cross_creativity,judgment_gap,revision_count,"
               + "open_questions,blocked_reason,channel_outputs,cards,page_spec,"
+              + "human_modified_output,threads_chain,"
               + "created_at,approved_at,edit_distance,target_channel";
     const [live, doneRows] = await Promise.all([
       supaSelect(CG_TABLE,
@@ -2390,10 +2736,22 @@ async function learnFromBenchmark(dept, setStep){
     if(!a || !bm) return { ok:false, note:"벤치마크 미정의" };
     if(!geminiKey()) return { ok:false, note:"GEMINI_API_KEY 미설정 — 학습에 웹검색이 필요" };
     // (조사는 researchWeb이 grounding→무료웹→모델 순으로 알아서 폴백)
-    // 1) 벤치마크 웹 조사 (여러 쿼리 중 하나 순환 선택 — 매번 다른 각도로 학습)
+    // 1) 무엇을 조사할지 — 스스로 적어 둔 빈틈이 있으면 그걸 먼저 판다.
+    //    지난 학습에서 "아직 확실히 모르겠다"고 남긴 것이 다음 조사 주제가 된다(자기 주도).
     const qi = ((DB.learnIdx||0)) % bm.queries.length;
     DB.learnIdx = (DB.learnIdx||0)+1;
-    const query = bm.queries[qi];
+    let query = bm.queries[qi], gapDriven = false;
+    try{
+      const prior0 = String(knowledgeText(dept)||"");
+      const m = prior0.match(/다음 학습 과제\s*[:：]\s*([^\n]{6,200})/);
+      const gap = m ? m[1].replace(/^\(|\)$/g,"").trim() : "";
+      DB.lastGap = DB.lastGap || {};
+      if (gap && DB.lastGap[dept] !== gap){          // 같은 빈틈을 두 번 연속 파지는 않는다
+        query = bm.what + " — " + gap;
+        DB.lastGap[dept] = gap;
+        gapDriven = true;
+      }
+    }catch(_){}
     _step((a?a.kr:dept)+" 부서 웹 조사 중: "+String(query).slice(0,30));
     let research="", sources=[], ytNote="", searchErr="", ytErr="", researchVia="";
     try{
@@ -2446,8 +2804,8 @@ async function learnFromBenchmark(dept, setStep){
     DB.exp = DB.exp || {}; DB.exp[dept] = (DB.exp[dept]||0) + 3; // 벤치마크 학습은 실무보다 큰 성장(+3)
     saveDB();
     await absorbToLeader([dept], "웹 벤치마크");   // 팀장이 이 부서 학습을 흡수
-    recordLearnLog({ dept, deptKr:a.kr, kind:"benchmark", ok:true, benchmark:bm.what, query, sources:sources.slice(0,3), note:"벤치마크 조사("+(researchVia||"?")+") → 품질 공식 갱신" });
-    return { ok:true, dept, benchmark:bm.what, query, sources: sources.slice(0,4), knowledge: formula };
+    recordLearnLog({ dept, deptKr:a.kr, kind:"benchmark", ok:true, benchmark:bm.what, query, sources:sources.slice(0,3), note:(gapDriven?"스스로 찾은 빈틈 조사":"벤치마크 조사")+"("+(researchVia||"?")+") → 품질 공식 갱신" });
+    return { ok:true, dept, benchmark:bm.what, query, gapDriven, sources: sources.slice(0,4), knowledge: formula };
   }catch(e){ logError("learnFromBenchmark:"+dept, e); return { ok:false, note:String(e.message||e).slice(0,100) }; }
 }
 app.post("/api/learn/benchmark", async (req,res)=>{
@@ -6355,7 +6713,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v282";
+const SERVER_VERSION = "v289";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
@@ -6526,11 +6884,7 @@ function requireAuth(req,res,next){
   if (t === makeToken()) return next();
   return res.status(401).json({ error:"인증 필요" });
 }
-app.post("/api/login", (req,res)=>{
-  if (!APP_PASSWORD) return res.json({ token:"", open:true });
-  if ((req.body && req.body.password) === APP_PASSWORD) return res.json({ token: makeToken() });
-  res.status(401).json({ error:"비밀번호가 올바르지 않습니다" });
-});
+/* 삭제(v288): 옛 /api/login(APP_PASSWORD 방식) — 앞에서 이미 등록돼 실행되지 않던 코드 */
 
 // ===== 웹푸시 (VAPID) =====
 // 환경변수: VAPID_PUBLIC, VAPID_PRIVATE, VAPID_SUBJECT(mailto:you@x.com)
@@ -9040,11 +9394,8 @@ app.get("/api/meeting/:id", (req,res)=>{
 // 예약 회의 목록/등록/삭제: time "HH:MM"(KST), repeat "daily"|"once"
 app.get("/api/meeting-schedules", (req,res)=> res.json(DB.meetingSchedules||[]));
 // ===== 프로젝트 엔드포인트 =====
-app.get("/api/projects", (req,res)=>{ res.json((DB.projects||[]).filter(p=>p.status!=="deleted")); });
-app.post("/api/projects/create", (req,res)=>{
-  try{ const p=createProject(req.body||{}); res.json({ ok:true, project:p }); }
-  catch(e){ res.status(400).json({ error:String(e.message||e) }); }
-});
+/* 삭제(v288): 옛 /api/projects(배열 시절) — 앞에서 이미 등록돼 실행되지 않던 코드 */
+/* 삭제(v288): 옛 /api/projects/create — 같은 경로가 앞에서 이미 등록돼 한 번도 실행되지 않던 코드 */
 app.post("/api/projects/run", async (req,res)=>{
   try{ const p=projectById((req.body||{}).id); if(!p) return res.status(404).json({ error:"프로젝트 없음" });
     if(p.status!=="active") return res.status(400).json({ error:"진행 중인 프로젝트가 아니에요" });
@@ -11168,7 +11519,13 @@ setInterval(async ()=>{
   //   ※ 시간대를 제한하지 않음 — 무료 서버는 새벽에 잠들어 있어(cron 활성시간이 낮이면) 새벽 조건이면 영원히 안 돌기 때문
   try {
     const st7 = DB.state || {};
-    if ((leaderAuto || dailyLearn) && st7.benchmarkLearnOn !== false && DB.lastBenchmarkDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+    // 하루 몇 부서를 학습시킬지. 1이면 한 부서가 다시 배우기까지 열흘이 걸린다.
+    // 한 번에 몰아 돌리지 않고 자율수행이 돌 때마다 한 부서씩 — 요금·한도 부담을 편다.
+    const bmPerDay = Math.max(1, Math.min(5, +(st7.benchmarkPerDay||1)));
+    if (DB.bmDay !== day){ DB.bmDay = day; DB.bmCount = 0; }
+    if ((leaderAuto || dailyLearn) && st7.benchmarkLearnOn !== false
+        && (DB.bmCount||0) < bmPerDay && !(DB.growBurst&&DB.growBurst.active)) {
+      DB.bmCount = (DB.bmCount||0) + 1;
       DB.lastBenchmarkDay = day;
       const order = Object.keys(DEPT_BENCHMARK);
       DB.benchmarkTurn = ((DB.benchmarkTurn||0)) % order.length;
@@ -11179,13 +11536,27 @@ setInterval(async ()=>{
         if(r&&r.ok){ try{
             const learned=String(r.knowledge||"").replace(/\r/g,"").split("\n").map(s=>s.trim()).filter(Boolean).slice(0,4).join("\n").slice(0,300);
             const src=(r.sources&&r.sources.length)?("\n\n출처: "+r.sources.map(s=>s.title||s.uri).slice(0,2).join(" · ")):"";
-            kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 '"+r.benchmark+"'를 학습해 품질 공식을 갱신했어요"+(learned?("\n\n📌 배운 것:\n"+learned):"")+src);
+            kakaoNotify("📚 "+(AGENTS[dept]?AGENTS[dept].kr:dept)+" 부서가 "+(r.gapDriven?"스스로 찾은 빈틈('"+String(r.query||"").split("—").pop().trim().slice(0,40)+"')을":"'"+r.benchmark+"'를")+" 학습해 품질 공식을 갱신했어요"+(learned?("\n\n📌 배운 것:\n"+learned):"")+src);
           }catch(_){}
           markLearn("benchmark", true); console.log("벤치마크 학습 완료: "+dept); }
-        else { console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note)); DB.lastBenchmarkDay=""; markLearn("benchmark", false, (r&&r.note)||"보류"); } // 실패 시 오늘 재시도 허용
-      }).catch(e=>{ logError("benchmark-learn", e); DB.lastBenchmarkDay=""; markLearn("benchmark", false, e); });
+        else { console.log("벤치마크 학습 보류("+dept+"): "+(r&&r.note));
+               DB.bmCount = Math.max(0,(DB.bmCount||1)-1); markLearn("benchmark", false, (r&&r.note)||"보류"); } // 실패는 오늘 몫을 되돌려 재시도
+      }).catch(e=>{ logError("benchmark-learn", e); DB.bmCount = Math.max(0,(DB.bmCount||1)-1); markLearn("benchmark", false, e); });
     }
   } catch(e){ /* 벤치마크 학습 실패 무시 */ }
+  // (0-b4-2) 총괄 학습 점검: 하루 1회, 부서들이 쌓은 품질 공식을 총괄이 읽고 채점·과제 지정(무료 엔진)
+  try {
+    const st7b = DB.state || {};
+    if ((leaderAuto || dailyLearn) && st7b.knowledgeReviewOn !== false
+        && DB.lastKnowReviewDay !== day && !(DB.growBurst&&DB.growBurst.active)) {
+      DB.lastKnowReviewDay = day;
+      saveDB();
+      leaderReviewKnowledge()
+        .then(r=>console.log("총괄 학습 점검 완료: "+((r&&r.reviewed)||0)+"개 부서"))
+        .catch(e=>{ logError("leader-review", e); DB.lastKnowReviewDay=""; });
+    }
+  } catch(e){ /* 총괄 점검 실패 무시 */ }
+
   // (0-b5) 팀장 자가진단: 시키지 않아도 주 1회 스스로 플랫폼을 살펴보고 개선 가이드라인을 제안
   try {
     const st8 = DB.state || {};
