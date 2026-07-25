@@ -1420,11 +1420,19 @@ async function pipeRun(genId, opts){
     //   같은 지적이 두 번 반복되면 되돌려도 안 고쳐지는 것이므로 역시 사람에게 올린다.
     let draft = "", critique = "", rev = 0, score = 0, creativity = 0, wouldPay = false;
 
+    let issues = [], askList = [], blocked = "";
+    const seenIssues = new Map();   // 지적 요지 → 반복 횟수
+    const answers = Array.isArray(opts.answers) ? opts.answers : [];
+    const answerBlock = answers.length
+      ? "\n\n=== 운영자가 답한 정보 (확정 사실) ===\n" + answers.map(a=>"- "+a).join("\n") + "\n"
+      : "";
+
     /* ── 이어서 하기 ──
        답변·재시도·자동재개는 지난번 원고를 이미 갖고 있다.
        그런데 예전에는 그것을 버리고 백지에서 3번을 다시 썼다.
        원고+검수 루프가 한 바퀴 비용의 74%다 — 여기가 진짜 새는 곳이었다.
-       지난 원고가 쓸 만하면 그것을 출발점으로 삼고 한 번만 더 고친다. */
+       지난 원고가 쓸 만하면 그것을 출발점으로 삼고 한 번만 더 고친다.
+       ※ answers 를 읽으므로 반드시 그 선언 '뒤'에 와야 한다. */
     const prevDraft = String(opts.draft||"").trim();
     const usablePrev = prevDraft.length > 200 && !/^[⏳❌]/.test(prevDraft);
     if (usablePrev){
@@ -1435,12 +1443,6 @@ async function pipeRun(genId, opts){
         : "지난 원고를 이어서 다듬어라. 처음부터 다시 쓰지 마라.";
       console.log("이어서 하기:", genId, "지난 원고", prevDraft.length, "자");
     }
-    let issues = [], askList = [], blocked = "";
-    const seenIssues = new Map();   // 지적 요지 → 반복 횟수
-    const answers = Array.isArray(opts.answers) ? opts.answers : [];
-    const answerBlock = answers.length
-      ? "\n\n=== 운영자가 답한 정보 (확정 사실) ===\n" + answers.map(a=>"- "+a).join("\n") + "\n"
-      : "";
 
     while (rev < PIPE_MAX_REVISIONS){
       const wp = (rev === 0 && !usablePrev)
@@ -7676,7 +7678,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v300";
+const SERVER_VERSION = "v301";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
