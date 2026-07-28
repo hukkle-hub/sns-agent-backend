@@ -3091,17 +3091,85 @@ function mainPayload(){
   return out;
 }
 
+/* 저장이 실패하기 시작하면 상태는 계속 커진다 — 커질수록 더 실패한다.
+   실제로 293번 연속 실패하며 반나절치 학습이 통째로 날아갔다.
+   그래서 올리기 전에 크기를 재고, 넘치면 오래된 기록부터 덜어낸다.
+   덜어내는 것들은 전부 '지나간 작업 로그'다. 지금 일에는 쓰이지 않는다. */
+const SAVE_SOFT_LIMIT = 1_400_000;   // 이 이상이면 정리한다
+const SAVE_HARD_LIMIT = 2_600_000;   // 이 이상이면 더 세게 자른다
+const TRIM_TARGETS = [
+  ["designJobs", 12], ["meetings", 20], ["pageJobs", 10], ["jobs", 30],
+  ["learnJobs", 15], ["projectMeetings", 8], ["shortsJobs", 8],
+  ["cycleJobs", 10], ["patchProposals", 12], ["errors", 40], ["briefings", 10]
+];
+
+/* 잘린 이모지 조각(짝 없는 서로게이트)과 NUL 은 JSON 은 통과해도 DB 가 거부한다.
+   글자 수를 세어 자르다 보면 반드시 생긴다. */
+function scrubForJson(v){
+  if (typeof v === "string") return v.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, "")
+                                     .replace(/(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "$1")
+                                     .replace(/\u0000/g, "");
+  if (Array.isArray(v)) return v.map(scrubForJson);
+  if (v && typeof v === "object"){
+    const o = {};
+    for (const k in v) o[k] = scrubForJson(v[k]);
+    return o;
+  }
+  return v;
+}
+
+function shrinkPayload(payload, size){
+  const hard = size > SAVE_HARD_LIMIT;
+  const cut = [];
+  for (const [k, keep] of TRIM_TARGETS){
+    const arr = payload[k];
+    if (!Array.isArray(arr)) continue;
+    const n = hard ? Math.max(3, Math.floor(keep/2)) : keep;
+    if (arr.length > n){
+      const dropped = arr.length - n;
+      payload[k] = arr.slice(-n);
+      if (Array.isArray(DB[k])) DB[k] = DB[k].slice(-n);   // 메모리에서도 덜어낸다
+      cut.push(k+" "+dropped+"건");
+    }
+  }
+  if (cut.length) console.warn("저장 크기 정리:", Math.round(size/1024)+"KB →", cut.join(", "));
+  return cut;
+}
+
 function flushSave(){
   _saveTimer = null; _firstDirtyAt = 0;
   let payload, body;
   try {
-    payload = mainPayload();
+    payload = scrubForJson(mainPayload());
     body = JSON.stringify(payload);
+    if (body.length > SAVE_SOFT_LIMIT){
+      const cut = shrinkPayload(payload, body.length);
+      if (cut.length){
+        body = JSON.stringify(payload);
+        if (body.length > SAVE_HARD_LIMIT){
+          shrinkPayload(payload, body.length);      // 한 번 더 세게
+          body = JSON.stringify(payload);
+        }
+      }
+    }
   } catch(e){ noteSaveFail(e); return; }
   // v251: 내용이 직전 저장과 같으면 올리지 않는다(불필요한 업로드 제거)
   const h = crypto.createHash("sha1").update(body).digest("hex");
   if (h === _lastSavedHash){ _lastSaveOkAt = Date.now(); return; }
-  supaSave(payload).then(()=>{ _lastSavedHash = h; noteSaveOk(); }).catch(noteSaveFail);
+  const kb = Math.round(body.length/1024);
+  supaSave(payload).then(()=>{ _lastSavedHash = h; noteSaveOk(); })
+    .catch(e=>{
+      // "실패했어요"만 반복하면 아무도 원인을 못 찾는다. 크기와 가장 큰 칸을 같이 알린다.
+      let big = "";
+      try{
+        big = Object.keys(payload)
+          .map(k=>({ k, n: JSON.stringify(payload[k]||"").length }))
+          .sort((a,b)=>b.n-a.n).slice(0,3)
+          .map(x=>x.k+" "+Math.round(x.n/1024)+"KB").join(", ");
+      }catch(_){}
+      e.message = String(e.message||e) + " [본문 "+kb+"KB · 큰 칸: "+big+"]";
+      noteSaveFail(e);
+    });
 }
 
 function saveDB(){
@@ -7678,7 +7746,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v301";
+const SERVER_VERSION = "v302";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
