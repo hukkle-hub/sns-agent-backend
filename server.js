@@ -3118,6 +3118,37 @@ function scrubForJson(v){
   return v;
 }
 
+/* 진짜 무거운 것은 건수가 아니라 '한 건 안의 덩어리'다.
+   실제로 디자인 작업 한 건이 354KB였고 그중 189KB가 참고 이미지(base64)였다.
+   참고 이미지는 만들 때 쓰는 재료지 결과물이 아니다 — 저장본에서는 뺀다.
+   메모리에는 그대로 두어 진행 중인 작업은 계속 쓸 수 있게 한다. */
+function slimForSave(payload){
+  const heavy = ["designJobs","pageJobs","cycleJobs","shortsJobs"];
+  let freed = 0;
+  for (const k of heavy){
+    const arr = payload[k];
+    if (!Array.isArray(arr)) continue;
+    payload[k] = arr.map((job, i)=>{
+      if (!job || typeof job !== "object") return job;
+      const done = job.status === "done" || job.status === "error";
+      const recent = i >= arr.length - 2;          // 최근 두 건은 손대지 않는다
+      if (!done && recent) return job;
+      const j = Object.assign({}, job);
+      if (Array.isArray(j.refImages) && j.refImages.length){
+        freed += JSON.stringify(j.refImages).length;
+        j.refImages = [];                          // 재료는 결과가 나오면 필요 없다
+      }
+      if (done && j.baseOutput){
+        freed += String(j.baseOutput).length;
+        delete j.baseOutput;                       // 보정 전 원본 — 완료 뒤엔 output 만 있으면 된다
+      }
+      return j;
+    });
+  }
+  if (freed > 50000) console.warn("저장본에서 재료 제외:", Math.round(freed/1024)+"KB");
+  return freed;
+}
+
 function shrinkPayload(payload, size){
   const hard = size > SAVE_HARD_LIMIT;
   const cut = [];
@@ -3141,6 +3172,7 @@ function flushSave(){
   let payload, body;
   try {
     payload = scrubForJson(mainPayload());
+    slimForSave(payload);                    // 재료(참고 이미지 등)는 올리지 않는다
     body = JSON.stringify(payload);
     if (body.length > SAVE_SOFT_LIMIT){
       const cut = shrinkPayload(payload, body.length);
@@ -7746,7 +7778,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v302";
+const SERVER_VERSION = "v303";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
