@@ -840,9 +840,16 @@ critique 에는 점수의 근거를 두 문장으로 적는다.
 
 async function crossJudge(draft, channel){
   try {
-    const raw = await geminiText(
-      CROSS_JUDGE_SYS + "\n\n작성 대상 채널: " + (channel||"미지정") +
-      "\n\n원고:\n" + String(draft||"").slice(0, 6000), 800);
+    /* v304: 본 검수를 제미나이가 했으면 검증은 제3 벤더(무료 풀)가 맡는다 — 3각 교차.
+       무료 벤더가 없으면 유료 지출 대신 검증 생략(기존에도 실패 시 계속 진행하는 구조). */
+    const userMsg = "작성 대상 채널: " + (channel||"미지정") + "\n\n원고:\n" + String(draft||"").slice(0, 6000);
+    let raw;
+    if (_lastJudgeVia === "gemini"){
+      if (!freeAvailable()) return null;
+      raw = await freeChat(CROSS_JUDGE_SYS, userMsg, 800);
+    } else {
+      raw = await geminiText(CROSS_JUDGE_SYS + "\n\n" + userMsg, 800);
+    }
     const j = pipeJson(raw);
     if (typeof j.creativity === "undefined") return null;
     return {
@@ -1456,7 +1463,7 @@ async function pipeRun(genId, opts){
       await pipeBeat(genId, "critic", "⏳ "+rev+"차 원고 검수 중...");
       await supaPatch(CG_TABLE, "generation_id=eq."+genId, { revision_count: rev });
 
-      const c = pipeJson(await anthropic(
+      const c = pipeJson(await judgeCall(   /* v304: 크로스 벤더 검수 — 기본 제미나이 */
         CRITIC_SYS,
         specBlock(spec)+unknownBlock(spec)+answerBlock+calNote+
         "\n위 성공 기준을 하나씩 따져서 creativity 를 매겨라.\n"
@@ -2566,7 +2573,8 @@ const SETTING_KEYS = [
   "deliberate","semanticSearch","researchMode","workEngine","freeLLMFirst",
   "nvidiaModel","allowPaidFallback","collect","safety",
   "benchmarkPerDay","benchmarkLearnOn","knowledgeReviewOn",
-  "askWaitHours","askAutoResume","claudeFallbackGemini"
+  "askWaitHours","askAutoResume","claudeFallbackGemini",
+  "crossVendorJudge","autoPassOn","freeBenchOn","freeModels"
 ];
 const SETTING_DEFAULTS = {
   oseraGate:true, oseraMin:80, viralGate:false, viralMin:70,
@@ -2575,7 +2583,8 @@ const SETTING_DEFAULTS = {
   nvidiaModel:"", allowPaidFallback:false,
   collect:{ everyMin:0, prompt:"" }, safety:{ audit:false, dailyLimit:0 },
   benchmarkPerDay:1, benchmarkLearnOn:true, knowledgeReviewOn:true,
-  askWaitHours:6, askAutoResume:true, claudeFallbackGemini:true
+  askWaitHours:6, askAutoResume:true, claudeFallbackGemini:true,
+  crossVendorJudge:true, autoPassOn:true, freeBenchOn:true, freeModels:{}
 };
 const isPlain = o => !!o && typeof o === "object" && !Array.isArray(o);
 
@@ -2591,7 +2600,12 @@ app.get("/api/settings", (req,res)=>{
   res.json({ ok:true, settings: out, defaults: SETTING_DEFAULTS,
     env: {
       nvidia: !!process.env.NVIDIA_API_KEY,
+      groq: !!process.env.GROQ_API_KEY,
+      cerebras: !!process.env.CEREBRAS_API_KEY,
+      openrouter: !!process.env.OPENROUTER_API_KEY,
+      openai: !!process.env.OPENAI_API_KEY,
       geminiPaid: !!process.env.GEMINI_API_KEY_PAID,
+      freeBenchOrder: (DB.state && DB.state.freeBenchOrder) || null,
       version: SERVER_VERSION
     } });
 });
@@ -2853,14 +2867,10 @@ app.post("/api/learning/review", async (req, res)=>{
 
     // 부서 지식과 별개로, 조회·검색이 되는 표에도 남긴다.
     // DB 몸통이 어떤 이유로 초기화돼도 배운 것은 여기 남는다.
-    await supaInsert("learned_rules", {
-      rule_text: finalText.slice(0,600),
-      category: row.dept || "general",
-      evidence: { from:"learning_review", review_id:id,
-                  trigger:String(row.trigger||"").slice(0,300), edited:wasEdited },
-      hit_count: 1,
-      is_active: true                      // 기본값이 false 라 명시하지 않으면 아무도 안 읽는다
-    }).catch(()=>{});
+    // v304: 같은 지점 지식은 고도 비교 후 승급/재확인 처리(중복 축적 방지) + 옥타브 기록
+    await insertRuleDedup(row.dept, finalText,
+      { from:"learning_review", review_id:id,
+        trigger:String(row.trigger||"").slice(0,300), edited:wasEdited }).catch(()=>{});
 
     await supaPatch(LR_TABLE, "review_id=eq."+id, {
       status: wasEdited ? "edited" : "approved",
@@ -6176,6 +6186,27 @@ async function queueLearning(dept, source, trigger, resultText){
   learned = String(learned||"").trim();
   if (!learned || /^없음/.test(learned)) return;        // 배울 게 없으면 안 올린다
 
+  // v304: 출처 자동승인 — 사람 지시·외부 자료에서 온 배움은 검토 큐를 거치지 않고 바로 반영
+  if ((!DB.state || DB.state.autoPassOn !== false) && autoPassable(source, learned)){
+    try {
+      applyLearnedToDept(dept, learned, "자동 승인·출처 외부("+source+")");
+      await insertRuleDedup(dept, learned,
+        { from:"auto_pass", source, trigger:String(trigger||"").slice(0,300) });
+      await fetch(SUPA_URL+"/rest/v1/"+LR_TABLE, {
+        method:"POST",
+        headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
+                  "Content-Type":"application/json", Prefer:"return=minimal" },
+        body: JSON.stringify([{
+          dept, dept_name:(AGENTS[dept]?(AGENTS[dept].no+" "+AGENTS[dept].kr):dept),
+          source, trigger:String(trigger||"").slice(0,300),
+          ai_learned: learned.slice(0,2000),
+          status:"auto_approved", applied:true,
+          reviewed_at:new Date().toISOString() }])
+      }).catch(()=>{});
+      return;   // 사람 검토 큐에는 올리지 않는다(기록은 위에 남음)
+    } catch(e){ /* 자동 반영 실패 시 아래 일반 검토 큐로 */ }
+  }
+
   await fetch(SUPA_URL+"/rest/v1/"+LR_TABLE, {
     method:"POST",
     headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY,
@@ -6804,13 +6835,226 @@ async function nvidiaChat(system, user, maxTok, model){
   if(!txt) throw new Error("NVIDIA 빈 응답["+mdl+"]");
   return txt;
 }
+
+// ===== v304: 무료 엔진 풀(OpenAI 호환) — NVIDIA 하나에서 로테이션으로 확장 =====
+/* 왜 풀인가: 무료 제공자는 각자 분당·일일 한도가 있다. 하나만 쓰면 한도에 걸리는 순간
+   유료(Claude)로 새거나 작업이 멈춘다. 여러 무료 제공자를 순서대로 돌리면
+   한도 분산 + 매일 벤치로 품질 순서까지 스스로 조정한다. */
+const FREE_PROVIDERS = {
+  cerebras:   { url:"https://api.cerebras.ai/v1/chat/completions",        key:()=>process.env.CEREBRAS_API_KEY||"",   dft:"llama-3.3-70b" },
+  groq:       { url:"https://api.groq.com/openai/v1/chat/completions",    key:()=>process.env.GROQ_API_KEY||"",       dft:"llama-3.3-70b-versatile" },
+  nvidia:     { url:"https://integrate.api.nvidia.com/v1/chat/completions", key:()=>nvidiaKey(),                      dft:"" /* nvidiaModel() 사용 */ },
+  openrouter: { url:"https://openrouter.ai/api/v1/chat/completions",      key:()=>process.env.OPENROUTER_API_KEY||"", dft:"openai/gpt-oss-120b:free" }
+};
+const _freeCool = {};   // { provider: 쿨다운 해제 시각(ms) }
+function freeModelOf(name){
+  const fm = (DB.state && DB.state.freeModels) || {};
+  if (fm[name]) return fm[name];
+  if (name === "nvidia") return nvidiaModel();
+  return FREE_PROVIDERS[name].dft;
+}
+function freeOrder(){
+  const avail = Object.keys(FREE_PROVIDERS).filter(n=>FREE_PROVIDERS[n].key());
+  const bench = (DB.state && Array.isArray(DB.state.freeBenchOrder)) ? DB.state.freeBenchOrder : [];
+  const ordered = bench.filter(n=>avail.includes(n));
+  avail.forEach(n=>{ if(!ordered.includes(n)) ordered.push(n); });
+  return ordered;
+}
+function freeAvailable(){ return freeOrder().length > 0; }
+async function oaiCompatChat(name, system, user, maxTok){
+  const p = FREE_PROVIDERS[name];
+  if (!p || !p.key()) throw new Error("무료 엔진 키 없음: "+name);
+  if (name === "nvidia") return await nvidiaChat(system, user, maxTok);   // 기존 검증된 경로 재사용
+  const body = {
+    model: freeModelOf(name),
+    messages: [ system?{ role:"system", content:String(system) }:null, { role:"user", content:String(user||"") } ].filter(Boolean),
+    max_tokens: Math.min(maxTok||1400, 4000),
+    temperature: 0.3
+  };
+  const r = await fetchTimeout(p.url,
+    { method:"POST", headers:{ "Content-Type":"application/json", "Authorization":"Bearer "+p.key() }, body: JSON.stringify(body) },
+    (_jobMode>0?180000:90000));
+  let dj; try{ dj = await r.json(); }catch(e){ throw new Error(name+" 응답 파싱 실패(HTTP "+r.status+")"); }
+  if(!r.ok || dj.error){ const em=(dj&&dj.error&&(dj.error.message||dj.error))||("HTTP "+r.status); throw new Error(name+"["+freeModelOf(name)+"]: "+String(em).slice(0,180)); }
+  const txt = String(((dj.choices||[])[0]||{}).message && (dj.choices[0].message.content) || "").trim();
+  if(!txt) throw new Error(name+" 빈 응답");
+  return txt;
+}
+async function freeChat(system, user, maxTok){
+  const order = freeOrder();
+  if (!order.length) throw new Error("무료 엔진 키가 하나도 없음");
+  let lastErr = null;
+  for (const n of order){
+    if ((_freeCool[n]||0) > Date.now()) continue;         // 한도 걸린 제공자는 잠시 건너뜀
+    try { return await oaiCompatChat(n, system, user, maxTok); }
+    catch(e){
+      lastErr = e;
+      const m = String(e && e.message || e);
+      _freeCool[n] = Date.now() + (/429|rate|quota|limit/i.test(m) ? 10*60000 : 3*60000);
+      console.log("무료 풀 폴백:", n, "→ 다음 엔진 (", m.slice(0,90), ")");
+    }
+  }
+  throw (lastErr || new Error("무료 풀 전체 실패"));
+}
+
+// ===== v304: 지식 2축 — 지점(sameSpot)과 고도(altitude) =====
+/* 같은 내용의 지식을 '중복'으로 버리면 더 정교해진 버전까지 버리게 된다.
+   같은 지점인지(sameSpot)와 얼마나 높은 도인지(altitude)를 분리해서,
+   같은 지점의 더 높은 도는 '승급'으로, 낮은 도는 '기존 재확인'으로 처리한다. */
+function altitude(text){
+  const t = String(text||"");
+  if (!t.trim()) return 0;
+  let sc = 20;
+  const nums = (t.match(/\d+(\.\d+)?/g)||[]).length;                       sc += Math.min(20, nums*4);   // 구체 수치
+  const cond = (t.match(/때는|경우|라면|하면|시에는|기준|조건/g)||[]).length; sc += Math.min(15, cond*5);   // 조건 분기
+  const act  = (t.match(/하라|하지 마라|말 것|금지|필수|반드시|피하라|먼저/g)||[]).length; sc += Math.min(15, act*5); // 실행 지침
+  const chan = (t.match(/인스타|릴스|쇼츠|스레드|블로그|유튜브|카카오|네이버/g)||[]).length; sc += Math.min(10, chan*5); // 채널 특정
+  const len = t.replace(/\s+/g,"").length;
+  if (len >= 60 && len <= 500) sc += 10; else if (len > 800) sc -= 10;     // 장황함 감점
+  if (nums===0 && act===0 && /좋다|중요하다|노력|신경/.test(t)) sc -= 10;   // 뜬구름 감점
+  return Math.max(0, Math.min(100, sc));
+}
+function _spotWords(t){
+  return new Set(String(t||"").toLowerCase().replace(/[^\uac00-\ud7a3a-z0-9\s]/g," ").split(/\s+/).filter(w=>w.length>=2));
+}
+function sameSpot(a, b){
+  const A=_spotWords(a), B=_spotWords(b);
+  if (!A.size || !B.size) return false;
+  let inter=0; for (const w of A) if (B.has(w)) inter++;
+  return (inter / (A.size + B.size - inter)) >= 0.45;   // 자카드 유사도
+}
+async function insertRuleDedup(dept, text, evidence){
+  // 옥타브 기록: 넓이(새 지점) vs 깊이(같은 지점 고도 상승)를 분리 측정
+  DB.octave = DB.octave || { spots:0, lifts:0, log:[] };
+  const newAlt = altitude(text);
+  let existing = [];
+  try{
+    existing = await supaSelect("learned_rules",
+      "select=rule_id,rule_text,hit_count&category=eq."+encodeURIComponent(dept||"general")
+      +"&is_active=eq.true&order=created_at.desc&limit=60") || [];
+  }catch(_){ }
+  const hit = existing.find(r=> sameSpot(r.rule_text, text));
+  if (hit){
+    const oldAlt = altitude(hit.rule_text);
+    if (newAlt > oldAlt + 5){
+      // 같은 지점, 더 높은 도 → 승급(기존 비활성 + 새것 저장)
+      await supaPatch("learned_rules","rule_id=eq."+hit.rule_id,{ is_active:false }).catch(()=>{});
+      await supaInsert("learned_rules",{
+        rule_text: String(text).slice(0,600), category: dept||"general",
+        evidence: Object.assign({}, evidence||{}, { supersedes:hit.rule_id, alt_from:oldAlt, alt_to:newAlt }),
+        hit_count: (hit.hit_count||1)+1, is_active:true }).catch(()=>{});
+      DB.octave.lifts++;
+      DB.octave.log.unshift({ kind:"lift", dept, from:oldAlt, to:newAlt, at:Date.now(), text:String(text).slice(0,120) });
+    } else {
+      // 같은 지점, 같거나 낮은 도 → 중복 저장 안 함(기존 지식 재확인 카운트만)
+      await supaPatch("learned_rules","rule_id=eq."+hit.rule_id,{ hit_count:(hit.hit_count||1)+1 }).catch(()=>{});
+      DB.octave.log.unshift({ kind:"dup", dept, alt:newAlt, at:Date.now(), text:String(text).slice(0,120) });
+    }
+  } else {
+    await supaInsert("learned_rules",{
+      rule_text: String(text).slice(0,600), category: dept||"general",
+      evidence: Object.assign({ alt:newAlt }, evidence||{}),
+      hit_count: 1, is_active: true }).catch(()=>{});
+    DB.octave.spots++;
+    DB.octave.log.unshift({ kind:"spot", dept, alt:newAlt, at:Date.now(), text:String(text).slice(0,120) });
+  }
+  if (DB.octave.log.length > 80) DB.octave.log = DB.octave.log.slice(0,80);
+  saveDB();
+  return { alt:newAlt };
+}
+
+// ===== v304: 출처 기반 자동승인 — 바깥에서 온 배움은 검토 없이 반영 =====
+/* 사람 승인이 병목이 된 건 토큰·모바일 제약 때문이지 본질적 필요가 아니다.
+   사람 지시·외부 벤치마크에서 온 배움은 자동 통과, AI 자기성찰과 수치 주장만 사람 검토. */
+function autoPassable(source, text){
+  if (!(source === "instruct" || source === "benchmark")) return false;   // 자기성찰(auto/training/meeting)은 검토
+  if (/\d+(\.\d+)?\s*(%|원|kg|g|톤|명|배|위|일|시간)/.test(String(text||""))) return false;  // 사실 주장은 사람 확인
+  return true;
+}
+function applyLearnedToDept(d, finalText, label){
+  DB.deptKnowledge = DB.deptKnowledge || {};
+  const cur = DB.deptKnowledge[d];
+  const prev = (cur && !Array.isArray(cur) && cur.text) ? String(cur.text) : "";
+  const stamp = new Date(Date.now()+9*3600000).toISOString().slice(5,10);
+  const line = "- ["+stamp+" "+(label||"자동 승인")+"] " + String(finalText).replace(/\s+/g," ").slice(0, 600);
+  const LIMIT = 6000;
+  let lines = (prev ? prev.split("\n") : []).map(x=>x.replace(/\s+$/,"")).filter(Boolean);
+  lines.push(line);
+  while (lines.join("\n").length > LIMIT && lines.length > 1) lines.shift();
+  let merged = lines.join("\n");
+  if (merged.length > LIMIT) merged = merged.slice(merged.length - LIMIT);
+  DB.deptKnowledge[d] = Object.assign({}, (cur && !Array.isArray(cur)) ? cur : {}, { text: merged, at: Date.now() });
+  saveDB();
+}
+
+// ===== v304: 옥타브 — 성장을 넓이/깊이로 분리 측정 =====
+app.get("/api/octave", (req,res)=>{
+  const o = DB.octave || { spots:0, lifts:0, log:[] };
+  res.json({ ok:true, breadth:o.spots||0, depth:o.lifts||0,
+    log:(o.log||[]).slice(0, Math.min(50, Number(req.query.limit||30))),
+    note:"넓이=새 지식 지점 수 · 깊이=같은 지점의 고도 상승(승급) 수" });
+});
+
+// ===== v304: 무료 엔진 일일 벤치 — 고도 자로 채점해 풀 순서를 스스로 조정 =====
+async function runFreeBench(){
+  const cand = Object.keys(FREE_PROVIDERS).filter(n=>FREE_PROVIDERS[n].key());
+  if (!cand.length) return null;
+  const task = "전남 고흥의 제철 특산물 하나를 골라 인스타그램 릴스 캡션으로 소개하라. 과장 없이 구체적으로 5문장, 한국어.";
+  const outs = [];
+  for (const n of cand){
+    try { outs.push({ name:n, text: await oaiCompatChat(n, "너는 한국어 SNS 카피라이터다.", task, 500) }); }
+    catch(e){ outs.push({ name:n, text:"", err:String(e&&e.message||e).slice(0,120) }); }
+  }
+  let scores = {};
+  try {
+    const j = pipeJson(await geminiText(
+      "다음 후보 답변들을 SNS 캡션 품질 기준(구체성·과장 없음·행동 유도)으로 0~100 채점하라.\n"
+      + 'JSON만 출력: {"scores":{"이름":점수}}\n\n'
+      + outs.filter(o=>o.text).map(o=>"["+o.name+"]\n"+o.text.slice(0,800)).join("\n\n"), 400));
+    scores = (j && j.scores) || {};
+  } catch(e){
+    outs.forEach(o=>{ scores[o.name] = altitude(o.text); });   // 제미나이 불가 시 휴리스틱 고도로
+  }
+  const order = outs.filter(o=>o.text)
+    .sort((a,b)=>(Number(scores[b.name])||0)-(Number(scores[a.name])||0))
+    .map(o=>o.name);
+  DB.state = DB.state || {};
+  DB.state.freeBenchOrder = order;
+  DB.state.freeBenchScores = scores;
+  DB.state.freeBenchAt = Date.now();
+  saveDB();
+  console.log("무료 엔진 벤치 완료:", order.join(" > "), JSON.stringify(scores));
+  return { order, scores };
+}
+app.get("/api/bench/free/status", (req,res)=>{
+  const st = DB.state || {};
+  res.json({ ok:true, keys:Object.keys(FREE_PROVIDERS).filter(n=>FREE_PROVIDERS[n].key()),
+    order: st.freeBenchOrder||null, scores: st.freeBenchScores||null, at: st.freeBenchAt||null,
+    models: Object.fromEntries(Object.keys(FREE_PROVIDERS).map(n=>[n, freeModelOf(n)||"(기본)"])) });
+});
+app.post("/api/bench/free/run", async (req,res)=>{
+  try { const r = await runFreeBench(); res.json({ ok:!!r, result:r||"무료 엔진 키 없음" }); }
+  catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+// ===== v304: 크로스 벤더 심사 — 클로드 글을 클로드가 채점하는 자기선호 편향 차단 =====
+var _lastJudgeVia = "claude";
+async function judgeCall(system, user, maxTok){
+  const on = !DB.state || DB.state.crossVendorJudge !== false;   // 기본 ON
+  if (on){
+    try { const t = await geminiText(String(system||"")+"\n\n"+String(user||""), maxTok||1500); _lastJudgeVia = "gemini"; return t; }
+    catch(e){ logError("judgeCall-gemini→claude(폴백)", e); }
+  }
+  _lastJudgeVia = "claude";
+  return await anthropic(system, user, maxTok);
+}
 async function genText(system, user, maxTok, engine){
   const prompt = String(system||"") + "\n\n" + String(user||"");
   // NVIDIA 무료 LLM 우선 엔진: 키 있으면 NVIDIA로, 실패 시 Claude 폴백(끊기지 않게)
   if (engine === "nvidia" || engine === "free") {
-    if (nvidiaAvailable()){
-      try { return await nvidiaChat(system, user, maxTok); }
-      catch(en){ logError("genText-nvidia→claude(폴백)", en); return await anthropic(system, user, maxTok); }
+    if (freeAvailable()){
+      try { return await freeChat(system, user, maxTok); }        // v304: NVIDIA 단독 → 무료 풀 로테이션
+      catch(en){ logError("genText-freePool→claude(폴백)", en); return await anthropic(system, user, maxTok); }
     }
     return await anthropic(system, user, maxTok);   // 키 없으면 Claude
   }
@@ -7778,7 +8022,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v303";
+const SERVER_VERSION = "v304";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
@@ -12702,6 +12946,15 @@ setInterval(async ()=>{
         .catch(e=>{ logError("leader-review", e); DB.lastKnowReviewDay=""; });
     }
   } catch(e){ /* 총괄 점검 실패 무시 */ }
+
+  // (0-b4-3) v304: 무료 엔진 일일 벤치 — 하루 1회, 무료 풀 순서를 품질 기준으로 재조정
+  try {
+    const stB = DB.state || {};
+    if (stB.freeBenchOn !== false && DB.lastFreeBenchDay !== day && freeAvailable()) {
+      DB.lastFreeBenchDay = day; saveDB();   // 선점
+      runFreeBench().catch(e=>{ logError("free-bench", e); DB.lastFreeBenchDay=""; try{saveDB();}catch(_){} });
+    }
+  } catch(e){ /* 벤치 실패 무시 */ }
 
   // (0-b5) 팀장 자가진단: 시키지 않아도 주 1회 스스로 플랫폼을 살펴보고 개선 가이드라인을 제안
   try {
