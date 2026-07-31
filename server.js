@@ -255,7 +255,7 @@ function dutiesOf(dept){ return DUTY[dept] || []; }
 async function dutyCoverage(){
   const rts = useSupabase ? ((await supaSelect(ROUTINE_TABLE, "select=*&limit=50")) || []) : [];
   const byId = {}; for (const r of rts) byId[r.routine_id] = r;
-  const today = kstNow().day;
+  const today = kstParts().day;
   const 빈몫 = [], 밀림 = [], 꺼짐 = [], 주인없음 = [], 대기 = [];
 
   for (const dept of Object.keys(DUTY)){
@@ -329,7 +329,7 @@ async function logReport(o){
       summary: String(o.summary||"").slice(0,600),
       detail:  o.detail || {},
       notified: !!o.notified,
-      day_kst: kstNow().day,
+      day_kst: kstParts().day,
       created_at: new Date().toISOString()
     });
     return id;
@@ -405,7 +405,7 @@ function routineDiagnose(msg){
 }
 const ROUTINE_MIN_HOUR = 6, ROUTINE_MAX_HOUR = 23;
 
-function kstNow(){
+function kstParts(){
   const d = new Date(Date.now() + 9*3600*1000);   // UTC+9
   return {
     day:  d.toISOString().slice(0,10),            // YYYY-MM-DD
@@ -429,7 +429,7 @@ function routineDue(rt, now){
 
 async function runRoutines(){
   if (!useSupabase) return;
-  const now = kstNow();
+  const now = kstParts();
   if (now.hour < ROUTINE_MIN_HOUR) return;   // 새벽엔 아무것도 하지 않는다
   let list = [];
   try { list = await supaSelect(ROUTINE_TABLE, "enabled=eq.true&select=*&limit=50"); }
@@ -503,7 +503,7 @@ const DIGEST_HOUR = 21;
 let _digestDay = "";
 async function runDailyDigest(force){
   if (!useSupabase) return { ok:false, skipped:"supabase" };
-  const now = kstNow();
+  const now = kstParts();
   if (!force){
     if (now.hour < DIGEST_HOUR) return { ok:true, skipped:"이른 시각" };
     if (_digestDay === now.day)  return { ok:true, skipped:"오늘 이미 보냄" };
@@ -553,7 +553,7 @@ let _schedDay = "";
 async function opsReviewSchedule(force){
   if (!useSupabase) return { ok:false, skipped:"supabase" };
   if (!can("ops","schedule.read")) return { ok:false, error:denyNote("ops","schedule.read") };
-  const now = kstNow();
+  const now = kstParts();
   if (!force){
     if (now.dow !== 1 || now.hour !== 7) return { ok:true, skipped:"점검 시간 아님" };  // 월 07시
     if (_schedDay === now.day) return { ok:true, skipped:"이번 주 이미 봄" };
@@ -637,7 +637,7 @@ const DUTY_HOUR = 7;
 let _dutyDay = "";
 async function runDutyCheck(force){
   if (!useSupabase) return { ok:false, skipped:"supabase" };
-  const now = kstNow();
+  const now = kstParts();
   if (!force){
     if (now.hour < DUTY_HOUR) return { ok:true, skipped:"이른 시각" };
     if (_dutyDay === now.day)  return { ok:true, skipped:"오늘 이미 봄" };
@@ -3382,7 +3382,7 @@ app.post("/api/schedule/review", async (req,res)=>{
 app.get("/api/reports", async (req,res)=>{
   try{
     if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
-    const day = String(req.query?.day||"") || kstNow().day;
+    const day = String(req.query?.day||"") || kstParts().day;
     const rows = await supaSelect(REPORT_TABLE,
       "day_kst=eq."+encodeURIComponent(day)+"&select=*&order=created_at.desc&limit=100");
     const list = rows||[];
@@ -3455,7 +3455,7 @@ app.post("/api/cafe/observe", async (req,res)=>{
     const b = req.body||{};
     const boards = Array.isArray(b.boards) ? b.boards.slice(0,20) : [];
     if (!boards.length) return res.status(400).json({ ok:false, error:"boards 가 비어 있습니다" });
-    const day = kstNow().day, ch = String(b.channel||"naver_cafe").slice(0,40);
+    const day = kstParts().day, ch = String(b.channel||"naver_cafe").slice(0,40);
     for (const x of boards){
       await supaInsert(OBS_TABLE, {
         obs_id: "obs_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7),
@@ -3514,7 +3514,7 @@ app.get("/api/routines", async (req,res)=>{
   try{
     if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
     const rows = await supaSelect(ROUTINE_TABLE, "select=*&order=at_hour.asc&limit=50");
-    res.json({ ok:true, now:kstNow(), routines: rows||[] });
+    res.json({ ok:true, now:kstParts(), routines: rows||[] });
   }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 app.post("/api/routines/toggle", async (req,res)=>{
@@ -3568,7 +3568,7 @@ app.post("/api/routines/run", async (req,res)=>{
     const rows = await supaSelect(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(id)+"&select=*");
     const rt = rows && rows[0];
     if (!rt) return res.status(404).json({ ok:false, error:"없는 루틴입니다" });
-    const now = kstNow();
+    const now = kstParts();
     const genId = "gen_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
     const topic = rt.name + " · " + now.day;
     await supaInsert(CG_TABLE, {
@@ -8304,7 +8304,7 @@ async function runBriefing(kind, engine, force){
   kakaoNotify(title+"\n\n"+String(out).slice(0,900)).catch(()=>{});
   return { ok:true, briefing:brief };
 }
-function weekKey(){ const n=kstNow(); const onejan=new Date(Date.UTC(n.getUTCFullYear(),0,1)); const wk=Math.ceil((((n-onejan)/86400000)+onejan.getUTCDay()+1)/7); return n.getUTCFullYear()+"-W"+wk; }
+function weekKey(){ const n=kstParts(); const onejan=new Date(Date.UTC(n.getUTCFullYear(),0,1)); const wk=Math.ceil((((n-onejan)/86400000)+onejan.getUTCDay()+1)/7); return n.getUTCFullYear()+"-W"+wk; }
 async function runDailyBriefing(engine, force){ return runBriefing("evening", engine, force); } // 하위호환
 app.post("/api/ops/briefing", async (req,res)=>{
   try{ const b=req.body||{}; const r=await runBriefing(b.kind||"evening", b.engine, b.force!==false ? true : false); res.json(r); }
