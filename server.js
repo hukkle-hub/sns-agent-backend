@@ -1880,6 +1880,12 @@ async function pipeRun(genId, opts){
   try {
     // ── 0. 사진 (v305) — 운영자가 첨부한 사진을 먼저 읽는다.
     //   원본은 저장하지 않는다(대역폭 사고 재발 방지). 설명만 DB에 남겨 재시작 후에도 쓴다.
+    /* v310: 되돌려받은 원고라면 고칠 점을 맨 앞에 세운다.
+       참고자료에 섞어 넣으면 묻혀서 같은 지적을 또 받는다. */
+    const rejectBlock = opts.rejectNote
+      ? "\n\n=== 사장님이 고치라고 한 것 (최우선) ===\n" + String(opts.rejectNote)
+        + "\n이 지적을 반영하지 않은 원고는 다시 되돌아옵니다. 지적된 부분을 분명히 바꾸세요.\n"
+      : "";
     let photoNotes = Array.isArray(opts.photoNotes) && opts.photoNotes.length ? opts.photoNotes : null;
     if (!photoNotes && Array.isArray(opts.photos) && opts.photos.length){
       await pipeBeat(genId, "photo", "⏳ 첨부 사진을 살펴보는 중...");
@@ -1980,9 +1986,9 @@ async function pipeRun(genId, opts){
 
     while (rev < PIPE_MAX_REVISIONS){
       const wp = (rev === 0 && !usablePrev)
-        ? "주제: "+topic+"\n\n참고 자료:\n"+(source||"(없음)")+specBlock(spec)+answerBlock+photoBlock+ctx+
+        ? "주제: "+topic+"\n\n참고 자료:\n"+(source||"(없음)")+specBlock(spec)+answerBlock+photoBlock+rejectBlock+ctx+
           "\n위 기준에 맞춰 원고를 작성하라. 과장광고 표현과 근거 없는 수치는 쓰지 마라."
-        : "이전 원고:\n"+draft+"\n\n고쳐야 할 것:\n"+critique+specBlock(spec)+answerBlock+photoBlock+ctx+
+        : "이전 원고:\n"+draft+"\n\n고쳐야 할 것:\n"+critique+specBlock(spec)+answerBlock+photoBlock+rejectBlock+ctx+
           "\n지적된 부분만 고쳐라. 지적되지 않은 부분은 그대로 두어라.";
       await pipeBeat(genId, "write", "⏳ "+(rev+1)+"차 원고 작성 중...");
       draft = await anthropic("너는 전문 콘텐츠 작가다. 지시받은 기준을 그대로 지킨다.", wp, 4000);
@@ -3740,16 +3746,21 @@ app.post("/api/content/approve", async (req, res)=>{
     if (!id) return res.status(400).json({ ok:false, error:"generation_id 가 필요합니다" });
 
     const rows = await supaSelect(CG_TABLE,
-      "generation_id=eq."+encodeURIComponent(id)+"&select=ai_raw_output,creativity_score,topic");
+      "generation_id=eq."+encodeURIComponent(id)
+      + "&select=ai_raw_output,creativity_score,topic,assigned_dept,target_channel,spec,ref_summary,photo_notes,revision_count");
     const row = rows && rows[0];
     if (!row) return res.status(404).json({ ok:false, error:"찾을 수 없습니다" });
 
     const final = edited || row.ai_raw_output || "";
+    /* v310: 반려는 끝이 아니라 되돌려보내기다.
+       사유를 들고 그 부서가 다시 쓴다. 반려만 하고 끝나면
+       사람은 매번 같은 이유로 반려하고 부서는 영영 못 배운다. */
     const patch = {
       human_modified_output: final,
-      approval_status: (action === "reject") ? "rejected" : "approved",
+      approval_status: (action === "reject") ? "processing" : "approved",
       approved_at: new Date().toISOString()
     };
+    if (action === "reject"){ patch.stage = "queued"; patch.approved_at = null; }
     // 사람이 얼마나 고쳤는지 — 학습의 핵심 신호
     if (row.ai_raw_output && final){
       const a = String(row.ai_raw_output), b = String(final);
@@ -3781,6 +3792,34 @@ app.post("/api/content/approve", async (req, res)=>{
     if (action === "reject" && reason){
       pushLearning("creation", "reject",
         "반려 — " + String(row.topic||"").slice(0,150), reason).catch(()=>{});
+
+      /* 사유를 지시로 바꿔 그 부서에 되돌려준다.
+         지난 원고를 함께 넘겨 처음부터 다시 쓰지 않게 한다(토큰도 아끼고 방향도 유지된다). */
+      const dept = row.assigned_dept || null;
+      const back = "■ 사장님이 되돌려보낸 원고입니다. 아래를 반드시 반영해 다시 쓰세요.\n\n"
+                 + "[ 고칠 점 ]\n" + String(reason).slice(0,800)
+                 + "\n\n같은 지적을 다시 받지 않도록, 지적된 부분을 눈에 띄게 바꾸세요. "
+                 + "지적과 무관한 부분은 그대로 두세요.";
+      pipeRun(id, {
+        topic: row.topic,
+        channels: row.target_channel ? [row.target_channel] : [],
+        source: back,
+        answers: [],
+        refUrls: [],
+        spec: row.spec || null,
+        refSummary: row.ref_summary || "",
+        draft: row.ai_raw_output || "",       // 지난 원고에서 고쳐 쓴다
+        photoNotes: Array.isArray(row.photo_notes) ? row.photo_notes : null,
+        dept: dept,
+        rejectNote: String(reason).slice(0,800)
+      }).catch(e=>console.error("반려 재작성 예외:", String(e&&e.message||e)));
+
+      logReport({ kind:"job", ref_id:id, dept: dept || "creation",
+        title:"반려 — " + String(row.topic||"").slice(0,60),
+        status:"ok",
+        summary:"사유를 들고 다시 쓰는 중입니다: " + String(reason).slice(0,140),
+        detail:{ 사유:String(reason).slice(0,400), 재작성회차:(Number(row.revision_count)||0)+1 }
+      }).catch(()=>{});
     }
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
@@ -8852,7 +8891,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v309";
+const SERVER_VERSION = "v310";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
