@@ -179,6 +179,138 @@ setTimeout(()=>{ runPublishScheduler().catch(()=>{}); }, 30000);  // 부팅 30�
 // ─────────────────────────────────────────────────────────────
 const ROUTINE_TABLE = "routines";
 
+/* ══ 권한 표 (v308) ══
+   업계에서 자리잡은 방식은 '총괄(supervisor)이 일을 나눠주는' 형태이고,
+   거기서 가장 흔한 사고가 아랫사람이 필요 이상의 권한을 물려받는 것이다.
+   그래서 할 수 있는 일을 부서마다 하나씩 적어 둔다. 여기 없으면 못 한다.
+
+   또 하나 — 총괄에게 다 맡기면 총괄이 병목이 된다.
+   그래서 총괄도 '고칠 수 있는 것'과 '여쭤야 하는 것'을 갈라 놓았다. */
+const CAN = {
+  ops: {
+    // 총괄만 가진 것 — 스케줄은 여기서 관리한다
+    "schedule.read":   true,
+    "schedule.shift":  true,   // 시각을 옮기는 것까지만
+    "schedule.create": false,  // 새로 만들거나 없애는 것은 사람 몫
+    "schedule.delete": false,
+    "schedule.toggle": false,  // 끄는 것도 사람 몫 — 조용히 멈추면 원인을 못 찾는다
+    "routine.retry":   true,
+    "engine.switch":   true,   // 죽은 엔진을 다른 곳으로 우회
+    "ask":             true,
+    "report":          true,
+    "publish":         false   // 발행은 언제나 사람이 한다
+  },
+  analytics: { "schedule.read":true, "observe.write":true, "plan.propose":true, "ask":true, "report":true },
+  scout:     { "web.read":true, "draft.write":true, "ask":true, "report":true },
+  creation:  { "draft.write":true, "plan.propose":true, "ask":true, "report":true },
+  strategy:  { "draft.write":true, "ask":true, "report":true },
+  advisory:  { "draft.write":true, "comment.draft":true, "comment.post":false, "ask":true, "report":true },
+  publishing:{ "draft.write":true, "ask":true, "report":true },
+  graphic:   { "draft.write":true, "ask":true, "report":true },
+  monetization:{ "draft.write":true, "ask":true, "report":true },
+  editing:   { "draft.write":true, "html.build":true, "ask":true, "report":true }
+};
+function can(dept, act){ return !!(CAN[dept] && CAN[dept][act] === true); }
+function denyNote(dept, act){
+  return ((typeof MEMBERS!=="undefined" && MEMBERS[dept]) || dept)
+       + " 은(는) '" + act + "' 권한이 없습니다";
+}
+
+/* ══ 맡은 일 (v309) ══
+   위의 CAN 은 "해도 된다"일 뿐이다. 권한만 있으면 아무도 안 해도 아무 일이 안 일어난다.
+   그래서 "이건 네 몫이다"를 따로 적는다.
+
+   여기 적힌 것은 반드시 누군가 하고 있어야 한다.
+   맡은 사람이 없거나, 있는데 기한이 지났으면 그건 사고다. 조용히 넘어가면 안 된다.
+
+   every  — 몇 일마다 한 번은 있어야 하는가 (0이면 기한 없음)
+   routine— 이 일을 실제로 굴리는 루틴 id (없으면 '아무도 안 하는 일')  */
+const DUTY = {
+  ops: [
+    { id:"duty.schedule", 무엇:"스케줄을 훑어 겹침·몰림·멈춤을 찾는다",  every:7,  routine:null, 자체:true },
+    { id:"duty.digest",   무엇:"하루 마감 보고를 올린다",                every:1,  routine:null, 자체:true },
+    { id:"duty.triage",   무엇:"실패한 일을 먼저 보고 고칠 것은 고친다",   every:0,  routine:null, 자체:true }
+  ],
+  scout:     [ { id:"duty.news",    무엇:"고흥 소식을 취재해 우리 글로 다시 쓴다", every:3, routine:"rt_news" } ],
+  creation:  [ { id:"duty.field",   무엇:"오늘의 밭을 남긴다",                  every:1, routine:"rt_field" } ],
+  strategy:  [ { id:"duty.product", 무엇:"상품 글을 쓴다",                      every:7, routine:"rt_product" } ],
+  advisory:  [ { id:"duty.comment", 무엇:"댓글·문의 답변 초안을 만든다",         every:1, routine:"rt_comment" } ],
+  analytics: [
+    { id:"duty.daily",  무엇:"어제 성과를 세 줄로 보고한다",       every:1,  routine:"rt_report" },
+    { id:"duty.watch",  무엇:"카페를 살펴 숫자를 남긴다",          every:4,  routine:"rt_cafe_watch" },
+    { id:"duty.plan",   무엇:"카페 개편안을 낸다",                every:31, routine:"rt_cafe_plan" }
+  ],
+  // 아래 넷은 아직 채널이 열리지 않아 정기 몫이 없다. 비워 두되 비었다는 것을 드러낸다.
+  publishing:  [ { id:"duty.video",   무엇:"영상 기획",   every:0, routine:null, 대기:"유튜브를 열면 시작" } ],
+  graphic:     [ { id:"duty.visual",  무엇:"썸네일·카드뉴스", every:0, routine:null, 대기:"유튜브를 열면 시작" } ],
+  monetization:[ { id:"duty.concept", 무엇:"비주얼 방향",   every:0, routine:null, 대기:"카페 디자인 때 시작" } ],
+  editing:     [ { id:"duty.build",   무엇:"스킨·페이지 구현", every:0, routine:null, 대기:"카페 디자인 때 시작" } ]
+};
+function dutiesOf(dept){ return DUTY[dept] || []; }
+
+/* 맡은 일이 실제로 굴러가고 있는지 맞춰 본다.
+   — 몫은 있는데 굴릴 루틴이 없다        → 아무도 안 하는 일
+   — 루틴은 도는데 어느 몫인지 모른다     → 주인 없는 일
+   — 굴러는 가는데 기한이 지났다          → 밀린 일 */
+async function dutyCoverage(){
+  const rts = useSupabase ? ((await supaSelect(ROUTINE_TABLE, "select=*&limit=50")) || []) : [];
+  const byId = {}; for (const r of rts) byId[r.routine_id] = r;
+  const today = kstNow().day;
+  const 빈몫 = [], 밀림 = [], 꺼짐 = [], 주인없음 = [], 대기 = [];
+
+  for (const dept of Object.keys(DUTY)){
+    for (const d of dutiesOf(dept)){
+      const who = (typeof MEMBERS!=="undefined" && MEMBERS[dept]) || dept;
+      if (d.자체) continue;                                   // 총괄이 스스로 도는 것
+      if (d.every === 0){ 대기.push({ 부서:dept, 이름:who, 몫:d.무엇, 사유:d.대기||"아직 아님" }); continue; }
+      const rt = d.routine ? byId[d.routine] : null;
+      if (!rt){ 빈몫.push({ 부서:dept, 이름:who, 몫:d.무엇, 왜:"굴릴 루틴이 없습니다" }); continue; }
+      if (!rt.enabled){ 꺼짐.push({ 부서:dept, 이름:who, 몫:d.무엇, 루틴:rt.name }); continue; }
+      if (rt.last_run_day){
+        const gap = Math.round((Date.parse(today) - Date.parse(rt.last_run_day)) / 86400000);
+        if (gap > d.every) 밀림.push({ 부서:dept, 이름:who, 몫:d.무엇, 지남:gap+"일", 기한:d.every+"일마다" });
+      }
+    }
+  }
+  const claimed = new Set();
+  for (const dept of Object.keys(DUTY)) for (const d of dutiesOf(dept)) if (d.routine) claimed.add(d.routine);
+  for (const r of rts) if (!claimed.has(r.routine_id))
+    주인없음.push({ 루틴:r.name||r.routine_id, 부서:r.dept, 왜:"어느 몫인지 적혀 있지 않습니다" });
+
+  const 탈 = 빈몫.length + 밀림.length + 꺼짐.length + 주인없음.length;
+  return { ok:true, 문제:탈, 빈몫, 밀림, 꺼짐, 주인없음, 대기,
+           전체몫: Object.keys(DUTY).reduce((n,d)=>n+dutiesOf(d).length,0) };
+}
+
+/* ══ 수시 질문 (v308) ══
+   부서가 막히면 혼자 짐작하지 말고 물어야 한다. 짐작한 결과물은 매번 크게 고쳐야 하고,
+   그건 학습 신호로도 못 쓴다. 질문은 결재판에 '확인 대기'로 올라간다. */
+async function agentAsk(dept, question, opts){
+  opts = opts || {};
+  if (!can(dept, "ask")) return { ok:false, error:denyNote(dept, "ask") };
+  if (!useSupabase) return { ok:false, error:"Supabase 미설정" };
+  const genId = "ask_" + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+  const who = (typeof MEMBERS!=="undefined" && MEMBERS[dept]) || dept;
+  await supaInsert(CG_TABLE, {
+    generation_id: genId,
+    topic: (opts.title || "여쭐 것") + " — " + who,
+    target_channel: opts.channel || "",
+    approval_status: "needs_input",
+    stage: "ask",
+    assigned_dept: dept,
+    routine_id: opts.routine_id || null,
+    ai_raw_output: String(question).slice(0,4000),
+    blocked_reason: String(question).slice(0,300),
+    created_at: new Date().toISOString(),
+    heartbeat_at: new Date().toISOString()
+  });
+  await logReport({ kind:"ask", ref_id:genId, dept:dept,
+    title:(opts.title||"질문") + " — " + who, status:"ok",
+    summary:String(question).slice(0,200),
+    detail:{ 보기: opts.choices || [], 이유: opts.why || "" } });
+  return { ok:true, generation_id:genId };
+}
+
 /* ══ 보고 대장 (v307) ══
    무엇을 하든 여기에 한 줄이 남는다. 성공도 실패도.
    "했는데 기록이 없다"는 상태를 없애는 것이 이 표의 목적이다. */
@@ -412,6 +544,129 @@ async function runDailyDigest(force){
 
 setInterval(()=>{ runRoutines().catch(e=>console.error("루틴 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
 setInterval(()=>{ runDailyDigest().catch(e=>console.error("마감 보고 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
+
+/* ══ 총괄의 스케줄 점검 (v308) ══
+   오세라가 주 1회 스케줄을 훑는다. 시각을 옮기는 것까지는 스스로 하고,
+   그 밖의 것(만들기·없애기·끄기)은 여쭙기만 한다.
+   — 총괄에게 다 맡기면 총괄이 병목이 되고, 조용히 꺼진 루틴은 원인을 못 찾는다. */
+let _schedDay = "";
+async function opsReviewSchedule(force){
+  if (!useSupabase) return { ok:false, skipped:"supabase" };
+  if (!can("ops","schedule.read")) return { ok:false, error:denyNote("ops","schedule.read") };
+  const now = kstNow();
+  if (!force){
+    if (now.dow !== 1 || now.hour !== 7) return { ok:true, skipped:"점검 시간 아님" };  // 월 07시
+    if (_schedDay === now.day) return { ok:true, skipped:"이번 주 이미 봄" };
+  }
+  const rts = (await supaSelect(ROUTINE_TABLE, "select=*&order=at_hour.asc&limit=50")) || [];
+  const fixed = [], asks = [];
+
+  // (1) 같은 시각에 겹친 것 — 스스로 옮긴다
+  const bySlot = {};
+  for (const r of rts){ if(!r.enabled) continue; (bySlot[r.at_hour] = bySlot[r.at_hour] || []).push(r); }
+  for (const h of Object.keys(bySlot)){
+    const group = bySlot[h];
+    if (group.length < 2) continue;
+    for (let i = 1; i < group.length; i++){
+      const r = group[i];
+      let to = Number(h) + i;
+      while (to <= ROUTINE_MAX_HOUR && bySlot[to] && bySlot[to].length) to++;
+      if (to > ROUTINE_MAX_HOUR) continue;                       // 밀 자리가 없다
+      if (!can("ops","schedule.shift")) continue;
+      await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(r.routine_id), { at_hour: to });
+      fixed.push((r.name||r.routine_id) + " " + h + "시 → " + to + "시 (겹침)");
+      (bySlot[to] = bySlot[to] || []).push(r);
+    }
+  }
+
+  // (2) 한 사람에게 몰린 것 — 옮길 자리를 제가 못 정한다. 여쭌다.
+  const load = {};
+  for (const r of rts){ if(r.enabled) load[r.dept] = (load[r.dept]||0) + 1; }
+  for (const d of Object.keys(load)){
+    if (load[d] >= 3 && d !== "ops")
+      asks.push(((typeof MEMBERS!=="undefined" && MEMBERS[d])||d) + " 한 사람에게 일감이 " + load[d] + "개 몰려 있습니다");
+  }
+
+  // (3) 계속 실패하는 것 — 끄는 것은 제 권한이 아니다
+  for (const r of rts){
+    if (Number(r.fail_count) >= 5)
+      asks.push((r.name||r.routine_id) + " 이(가) " + r.fail_count + "번째 실패 중입니다 (" + String(r.last_error||"").slice(0,60) + ")");
+  }
+
+  // (4) 오래 안 돈 것
+  for (const r of rts){
+    if (!r.enabled || !r.last_run_day) continue;
+    const gap = Math.round((Date.parse(now.day) - Date.parse(r.last_run_day)) / 86400000);
+    if (r.freq === "daily" && gap >= 3)
+      asks.push((r.name||r.routine_id) + " 이(가) " + gap + "일째 돌지 않았습니다");
+  }
+
+  // (5) v309 — 맡은 일이 실제로 굴러가는가.
+  //     겹침·몰림보다 이게 먼저다. 아무도 안 하고 있는 일이 제일 무섭다.
+  let cov = { 문제:0, 빈몫:[], 밀림:[], 꺼짐:[], 주인없음:[] };
+  try { cov = await dutyCoverage(); } catch(e){ /* 못 재도 점검은 계속한다 */ }
+  for (const x of cov.빈몫)     asks.push("⛔ " + x.이름 + " 의 몫 '" + x.몫 + "' — " + x.왜);
+  for (const x of cov.꺼짐)     asks.push("⛔ " + x.이름 + " 의 몫 '" + x.몫 + "' — 루틴이 꺼져 있습니다");
+  for (const x of cov.밀림)     asks.push("⏰ " + x.이름 + " 의 몫 '" + x.몫 + "' — " + x.지남 + "째 안 됐습니다 (" + x.기한 + ")");
+  for (const x of cov.주인없음) asks.push("❓ 루틴 '" + x.루틴 + "' — " + x.왜);
+
+  await logReport({ kind:"audit", dept:"ops", title:"주간 스케줄 점검",
+    status: fixed.length ? "fixed" : "ok",
+    summary: fixed.length ? ("겹친 " + fixed.length + "건을 제가 옮겼습니다") : "고칠 것은 없었습니다",
+    detail:{ 옮김:fixed, 여쭐것:asks, 일감수:rts.length,
+             맡은일:{ 전체:cov.전체몫, 빈몫:cov.빈몫.length, 밀림:cov.밀림.length,
+                     꺼짐:cov.꺼짐.length, 주인없음:cov.주인없음.length } } });
+
+  if (asks.length){
+    await agentAsk("ops",
+      "스케줄을 살펴봤습니다. 제 선에서 정할 수 없는 것들입니다.\n\n"
+      + asks.map((a,i)=>(i+1)+". "+a).join("\n")
+      + (fixed.length ? ("\n\n(겹친 것 " + fixed.length + "건은 제가 옮겨 두었습니다: " + fixed.join(" / ") + ")") : "")
+      + "\n\n어떻게 할까요?",
+      { title:"스케줄 상의", why:"루틴을 만들거나 끄는 것은 제 권한이 아닙니다" });
+  }
+  _schedDay = now.day;
+  return { ok:true, fixed, asks };
+}
+setInterval(()=>{ opsReviewSchedule().catch(e=>console.error("스케줄 점검 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
+
+/* ══ 맡은 일 매일 확인 (v309) ══
+   주 1회로는 늦다. 아무도 안 하는 일은 하루만 지나도 하루치가 빈다.
+   조용히 비는 것이 제일 위험하므로 매일 아침 확인해 대장에 남긴다. */
+const DUTY_HOUR = 7;
+let _dutyDay = "";
+async function runDutyCheck(force){
+  if (!useSupabase) return { ok:false, skipped:"supabase" };
+  const now = kstNow();
+  if (!force){
+    if (now.hour < DUTY_HOUR) return { ok:true, skipped:"이른 시각" };
+    if (_dutyDay === now.day)  return { ok:true, skipped:"오늘 이미 봄" };
+  }
+  const cov = await dutyCoverage();
+  const 급함 = cov.빈몫.length + cov.꺼짐.length;      // 아예 아무도 안 하는 일
+  await logReport({
+    kind:"duty", dept:"ops", title:"맡은 일 점검",
+    status: cov.문제 ? (급함 ? "failed" : "ok") : "ok",
+    summary: cov.문제
+      ? ("몫 " + cov.전체몫 + "개 중 " + cov.문제 + "개에 문제가 있습니다"
+         + (급함 ? " (아무도 안 하는 일 " + 급함 + "개)" : " (밀린 일)"))
+      : ("몫 " + cov.전체몫 + "개 전부 굴러가고 있습니다"),
+    detail: cov
+  });
+  // 아무도 안 하고 있는 일은 즉시 알린다. 밀린 것은 마감 보고에 담긴다.
+  if (급함){
+    const lines = [].concat(
+      cov.빈몫.map(x=>"· " + x.이름 + " — " + x.몫 + " (" + x.왜 + ")"),
+      cov.꺼짐.map(x=>"· " + x.이름 + " — " + x.몫 + " (루틴이 꺼져 있음)")
+    );
+    await kakaoNotify("⛔ 아무도 안 하고 있는 일이 있습니다\n\n" + lines.join("\n")
+      + "\n\n맡은 사람은 정해져 있는데 실제로 굴러가지 않습니다.\n루틴을 켜거나 새로 만들어 주세요.",
+      process.env.APP_URL || "").catch(()=>{});
+  }
+  _dutyDay = now.day;
+  return { ok:true, ...cov };
+}
+setInterval(()=>{ runDutyCheck().catch(e=>console.error("맡은 일 점검 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
 setTimeout(()=>{ runRoutines().catch(()=>{}); }, 45000);
 
 // ─────────────────────────────────────────────────────────────
@@ -3088,6 +3343,41 @@ app.post("/api/pipeline/retry", async (req, res)=>{
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
+/* ── v308: 권한·질문·스케줄 점검 ── */
+app.get("/api/roles", (req,res)=>{
+  const rows = Object.keys(CAN).map(d=>({
+    부서: d,
+    이름: (typeof MEMBERS!=="undefined" && MEMBERS[d]) || d,
+    맡은일:     dutiesOf(d).map(x=>x.무엇),          // 반드시 해야 하는 것
+    할수있는것: Object.keys(CAN[d]).filter(k=>CAN[d][k]===true),
+    막힌것:     Object.keys(CAN[d]).filter(k=>CAN[d][k]===false)
+  }));
+  res.json({ ok:true, roles: rows });
+});
+app.get("/api/duty", async (req,res)=>{
+  try{ res.json(await dutyCoverage()); }
+  catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/duty/check", async (req,res)=>{
+  try{ res.json(await runDutyCheck(true)); }
+  catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/ask", async (req,res)=>{
+  try{
+    const b = req.body||{};
+    const dept = String(b.dept||"");
+    if (!CAN[dept]) return res.status(400).json({ ok:false, error:"없는 부서입니다" });
+    if (!b.question) return res.status(400).json({ ok:false, error:"question 이 필요합니다" });
+    res.json(await agentAsk(dept, String(b.question), {
+      title: b.title, channel: b.channel, choices: b.choices, why: b.why, routine_id: b.routine_id
+    }));
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/schedule/review", async (req,res)=>{
+  try{ res.json(await opsReviewSchedule(true)); }
+  catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
 /* ── v307: 보고 ── */
 app.get("/api/reports", async (req,res)=>{
   try{
@@ -3259,6 +3549,12 @@ app.post("/api/routines/save", async (req,res)=>{
       patch.at_hour = h;
     }
     if (Array.isArray(b.days)) patch.days = b.days.map(Number).filter(n=>!isNaN(n));
+    // v308: 총괄이 부른 경우 시각 말고는 못 바꾼다
+    if (String(req.body?.by||"") === "ops"){
+      const only = Object.keys(patch).every(k => k === "at_hour");
+      if (!only) return res.status(403).json({ ok:false, error:denyNote("ops","schedule.create") + " (시각만 옮길 수 있어요)" });
+      if (!can("ops","schedule.shift")) return res.status(403).json({ ok:false, error:denyNote("ops","schedule.shift") });
+    }
     if (!Object.keys(patch).length) return res.status(400).json({ ok:false, error:"바꿀 내용이 없습니다" });
     await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(id), patch);
     res.json({ ok:true, routine_id:id, patch });
@@ -8556,7 +8852,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v307";
+const SERVER_VERSION = "v309";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
