@@ -762,7 +762,12 @@ const PIPE_STALL_MS  = 8 * 60 * 1000;    // 8분간 신호 없으면 죽은 것�
 const PIPE_WATCH_MS  = 4 * 60 * 1000;    // 감시 주기
 const PIPE_MAX_AUTO_RETRY = 1;           // 스스로 다시 해보는 횟수. 넘으면 사람을 부른다
 
+/* v305: 사람이 중단시킨 건 — 다음 단계 경계에서 즉시 멈춘다 */
+const PIPE_CANCELLED = new Set();
 async function pipeBeat(genId, stage, note){
+  if (PIPE_CANCELLED.has(String(genId))){
+    const e = new Error("운영자가 중단함"); e.__cancelled = true; throw e;
+  }
   const patch = { heartbeat_at: new Date().toISOString(), stage: stage };
   if (note) patch.ai_raw_output = note;
   await supaPatch(CG_TABLE, "generation_id=eq."+genId, patch).catch(()=>{});
@@ -775,7 +780,7 @@ async function pipeWatchdog(){
     const rows = await supaSelect(CG_TABLE,
       "approval_status=eq.processing&or=(heartbeat_at.lt."+cutoff+",heartbeat_at.is.null)"
       + "&created_at.lt."+cutoff
-      + "&select=generation_id,stage,topic,target_channel,human_answers,ref_urls,retry_count,spec,ref_summary,ai_raw_output&limit=20");
+      + "&select=generation_id,stage,topic,target_channel,human_answers,ref_urls,retry_count,spec,ref_summary,ai_raw_output,photo_notes&limit=20");
     for (const r of (rows||[])){
       const tried = Number(r.retry_count||0);
       // 무료 인스턴스는 수시로 재시작된다. 사람을 부르기 전에 한 번은 스스로 다시 해본다.
@@ -797,7 +802,8 @@ async function pipeWatchdog(){
           refUrls: Array.isArray(r.ref_urls) ? r.ref_urls : [],
           spec: r.spec || null,
           refSummary: r.ref_summary || "",
-          draft: r.ai_raw_output || ""
+          draft: r.ai_raw_output || "",
+          photoNotes: Array.isArray(r.photo_notes) ? r.photo_notes : null
         }).catch(e=>console.error("pipeRun(자동재개) 예외:", String(e&&e.message||e)));
         continue;
       }
@@ -1372,6 +1378,27 @@ async function pipeRun(genId, opts){
   // 타임아웃을 넉넉히 잡고(150초→225→337) 분당 한도도 기다렸다 다시 시도한다.
   beginJobMode();
   try {
+    // ── 0. 사진 (v305) — 운영자가 첨부한 사진을 먼저 읽는다.
+    //   원본은 저장하지 않는다(대역폭 사고 재발 방지). 설명만 DB에 남겨 재시작 후에도 쓴다.
+    let photoNotes = Array.isArray(opts.photoNotes) && opts.photoNotes.length ? opts.photoNotes : null;
+    if (!photoNotes && Array.isArray(opts.photos) && opts.photos.length){
+      await pipeBeat(genId, "photo", "⏳ 첨부 사진을 살펴보는 중...");
+      const pj = pipeJson(await anthropic(
+        "너는 콘텐츠 팀의 사진 담당이다. 운영자가 준 사진을 하나씩 보고, 글에 쓸 수 있게 무엇이 어떻게 찍혔는지 구체적으로 묘사하라."
+        + ' 반드시 아래 JSON 하나만 출력한다: {"notes":["사진1: ...","사진2: ..."]}',
+        "주제: "+topic+"\n각 사진을 순서대로 설명하라.", 1500, opts.photos.slice(0,3)));
+      if (pj && Array.isArray(pj.notes) && pj.notes.length){
+        photoNotes = pj.notes.map(x=>String(x||"").slice(0,300)).slice(0,3);
+        await supaPatch(CG_TABLE, "generation_id=eq."+genId, { photo_notes: photoNotes }).catch(()=>{});
+      }
+    }
+    let photoBlock = "";
+    if (photoNotes && photoNotes.length){
+      photoBlock = "\n\n=== 운영자가 준비한 사진 "+photoNotes.length+"장 ===\n"
+        + photoNotes.map((n,i)=>"("+(i+1)+") "+n).join("\n")
+        + "\n규칙: 본문의 알맞은 위치에 (사진1), (사진2) 형식 마커를 반드시 배치하고, 마커 앞뒤 문장이 그 사진과 자연스럽게 이어지게 써라. 없는 사진 번호는 만들지 마라.\n";
+    }
+
     // ── 1. 디렉터
     if (refUrls.length){
       await pipeBeat(genId, "research", "⏳ 참고 자료를 읽는 중...");
@@ -1414,7 +1441,7 @@ async function pipeRun(genId, opts){
       spec = pipeJson(await anthropic(
         DIRECTOR_SYS,
         "주제: "+topic+"\n대상 채널: "+(channels.join(", ")||"미지정")+
-        "\n\n참고 자료:\n"+(source||"(없음)")+ctx, 2000));
+        "\n\n참고 자료:\n"+(source||"(없음)")+photoBlock+ctx, 2000));
       await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
         spec: spec, open_questions: spec.open_questions || null,
         ai_raw_output: "⏳ 기준 수립 완료 — 원고 작성 중..."
@@ -1453,9 +1480,9 @@ async function pipeRun(genId, opts){
 
     while (rev < PIPE_MAX_REVISIONS){
       const wp = (rev === 0 && !usablePrev)
-        ? "주제: "+topic+"\n\n참고 자료:\n"+(source||"(없음)")+specBlock(spec)+answerBlock+ctx+
+        ? "주제: "+topic+"\n\n참고 자료:\n"+(source||"(없음)")+specBlock(spec)+answerBlock+photoBlock+ctx+
           "\n위 기준에 맞춰 원고를 작성하라. 과장광고 표현과 근거 없는 수치는 쓰지 마라."
-        : "이전 원고:\n"+draft+"\n\n고쳐야 할 것:\n"+critique+specBlock(spec)+answerBlock+ctx+
+        : "이전 원고:\n"+draft+"\n\n고쳐야 할 것:\n"+critique+specBlock(spec)+answerBlock+photoBlock+ctx+
           "\n지적된 부분만 고쳐라. 지적되지 않은 부분은 그대로 두어라.";
       await pipeBeat(genId, "write", "⏳ "+(rev+1)+"차 원고 작성 중...");
       draft = await anthropic("너는 전문 콘텐츠 작가다. 지시받은 기준을 그대로 지킨다.", wp, 4000);
@@ -1619,6 +1646,11 @@ async function pipeRun(genId, opts){
     ).catch(()=>{});
 
   } catch(e){
+    if (e && e.__cancelled){
+      PIPE_CANCELLED.delete(String(genId));
+      console.log("파이프라인 중단(사람):", genId);
+      return;   // 상태는 cancel 엔드포인트가 이미 기록했다 — finally 는 그대로 실행된다
+    }
     const msg = String(e && e.message || e).slice(0, 500);
     console.error("파이프라인 실패:", genId, msg);
     notifyNeedsHand("fail", opts.topic || "", msg).catch(()=>{});
@@ -1653,7 +1685,10 @@ app.post("/api/pipeline/run", async (req, res)=>{
       source: req.body?.source || "",
       answers: Array.isArray(req.body?.answers) ? req.body.answers : [],
       refUrls: Array.isArray(req.body?.refUrls) ? req.body.refUrls
-               : (req.body?.refUrl ? [req.body.refUrl] : [])
+               : (req.body?.refUrl ? [req.body.refUrl] : []),
+      photos: Array.isArray(req.body?.photos)
+               ? req.body.photos.filter(p=>p && typeof p.data==="string" && p.data.length>100).slice(0,3)
+               : []
     }).catch(e=>console.error("pipeRun 예외:", String(e&&e.message||e)));
 
   } catch(e){
@@ -1677,7 +1712,7 @@ app.post("/api/pipeline/answer", async (req, res)=>{
     if (!answers.length) answers.push(SKIP_ANSWER);
 
     const rows = await supaSelect(CG_TABLE,
-      "generation_id=eq."+encodeURIComponent(id)+"&select=topic,target_channel,human_answers,spec,ref_summary,ai_raw_output");
+      "generation_id=eq."+encodeURIComponent(id)+"&select=topic,target_channel,human_answers,spec,ref_summary,ai_raw_output,photo_notes");
     const row = rows && rows[0];
     if (!row) return res.status(404).json({ ok:false, error:"해당 작업을 찾을 수 없습니다" });
 
@@ -1700,7 +1735,8 @@ app.post("/api/pipeline/answer", async (req, res)=>{
       answers: merged,
       spec: row.spec || null,              // 기준은 이미 섰다. 다시 세우지 않는다
       refSummary: row.ref_summary || "",   // 자료도 이미 모았다
-      draft: row.ai_raw_output || ""       // 지난 원고에서 이어 쓴다
+      draft: row.ai_raw_output || "",      // 지난 원고에서 이어 쓴다
+      photoNotes: Array.isArray(row.photo_notes) ? row.photo_notes : null
     }).catch(e=>console.error("pipeRun(재개) 예외:", String(e&&e.message||e)));
 
   } catch(e){
@@ -2774,11 +2810,12 @@ app.post("/api/pipeline/retry", async (req, res)=>{
 
     const rows = await supaSelect(CG_TABLE,
       "generation_id=eq."+encodeURIComponent(id)
-      + "&select=topic,target_channel,human_answers,ref_urls,approval_status,spec,ref_summary,ai_raw_output");
+      + "&select=topic,target_channel,human_answers,ref_urls,approval_status,spec,ref_summary,ai_raw_output,photo_notes");
     const row = rows && rows[0];
     if (!row) return res.status(404).json({ ok:false, error:"해당 작업을 찾을 수 없습니다" });
     if (row.approval_status === "processing")
       return res.status(409).json({ ok:false, error:"이미 진행 중입니다" });
+    PIPE_CANCELLED.delete(id);   // v305: 중단됐던 건을 사람이 되살렸다
 
     await supaPatch(CG_TABLE, "generation_id=eq."+id, {
       approval_status: "processing",
@@ -2799,10 +2836,59 @@ app.post("/api/pipeline/retry", async (req, res)=>{
       refUrls: Array.isArray(row.ref_urls) ? row.ref_urls : [],
       spec: row.spec || null,
       refSummary: row.ref_summary || "",
-      draft: row.ai_raw_output || ""
+      draft: row.ai_raw_output || "",
+      photoNotes: Array.isArray(row.photo_notes) ? row.photo_notes : null
     }).catch(e=>console.error("pipeRun(재시도) 예외:", String(e&&e.message||e)));
 
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* ── v305: 중단·삭제 ──
+   멈추라면 멈추고, 지우라면 지운다. 지금까지는 '다시'만 있어서
+   실패한 건이 화면에 영원히 남았다. */
+async function supaDeleteRow(table, query){
+  const r = await fetch(SUPA_URL+"/rest/v1/"+table+"?"+query, {
+    method:"DELETE",
+    headers:{ apikey:SUPA_KEY, Authorization:"Bearer "+SUPA_KEY, Prefer:"return=minimal" }
+  });
+  if (!r.ok) throw new Error("삭제 실패 HTTP "+r.status);
+  return true;
+}
+app.post("/api/pipeline/cancel", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.generation_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"generation_id 가 필요합니다" });
+    const rows = await supaSelect(CG_TABLE, "generation_id=eq."+encodeURIComponent(id)+"&select=approval_status");
+    const row = rows && rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:"해당 작업을 찾을 수 없습니다" });
+    if (row.approval_status !== "processing" && row.approval_status !== "needs_input")
+      return res.status(409).json({ ok:false, error:"진행 중이거나 확인 대기인 작업만 중단할 수 있어요" });
+    PIPE_CANCELLED.add(id);
+    setTimeout(()=>{ try{ PIPE_CANCELLED.delete(id); }catch(_){} }, 30*60*1000);  // 메모리 정리
+    await supaPatch(CG_TABLE, "generation_id=eq."+id, {
+      approval_status: "cancelled",
+      stage: "cancelled",
+      blocked_reason: "운영자가 중단함",
+      ai_raw_output: "■ 운영자가 중단했습니다. '다시' 버튼으로 재개할 수 있어요.",
+      heartbeat_at: new Date().toISOString()
+    });
+    res.json({ ok:true, generation_id:id });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/pipeline/delete", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.generation_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"generation_id 가 필요합니다" });
+    const rows = await supaSelect(CG_TABLE, "generation_id=eq."+encodeURIComponent(id)+"&select=approval_status");
+    const row = rows && rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:"해당 작업을 찾을 수 없습니다" });
+    if (["processing","pending","needs_input"].indexOf(row.approval_status) >= 0)
+      return res.status(409).json({ ok:false, error:"진행·대기 중인 작업은 먼저 중단한 뒤 지울 수 있어요" });
+    await supaDeleteRow(CG_TABLE, "generation_id=eq."+encodeURIComponent(id));
+    res.json({ ok:true, deleted:id });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
 // 보관된 원문 조회 — 화면 로그를 지워도 여기서 다시 볼 수 있다
@@ -2966,7 +3052,7 @@ app.get("/api/manager/board", async (req, res)=>{
               + "created_at,approved_at,edit_distance,target_channel";
     const [live, doneRows] = await Promise.all([
       supaSelect(CG_TABLE,
-        "approval_status=in.(processing,pending,needs_input,failed)&select="+sel
+        "approval_status=in.(processing,pending,needs_input,failed,cancelled)&select="+sel
         + "&order=created_at.asc&limit=40"),
       supaSelect(CG_TABLE,
         "approval_status=eq.approved&select="+sel+"&order=approved_at.desc&limit=20")
@@ -2985,7 +3071,7 @@ app.get("/api/pipeline/status", async (req, res)=>{
               + "issues,blocked_reason,human_answers,last_critique";
     const q = id
       ? "generation_id=eq."+encodeURIComponent(id)+"&select="+sel
-      : "approval_status=in.(processing,pending,failed,needs_input)&select="+sel+"&order=created_at.desc&limit=20";
+      : "approval_status=in.(processing,pending,failed,needs_input,cancelled)&select="+sel+"&order=created_at.desc&limit=20";
     res.json({ ok:true, rows: await supaSelect(CG_TABLE, q) });
   } catch(e){
     res.status(500).json({ ok:false, error:String(e&&e.message||e) });
@@ -8022,7 +8108,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v304";
+const SERVER_VERSION = "v305";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
