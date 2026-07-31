@@ -170,6 +170,251 @@ setInterval(()=>{ runPublishScheduler().catch(e=>console.error("스케줄러 예
 setTimeout(()=>{ runPublishScheduler().catch(()=>{}); }, 30000);  // 부팅 30초 뒤 1회
 
 // ─────────────────────────────────────────────────────────────
+// v306: 정기 일감(루틴)
+//   사람이 매번 시키지 않아도 정해진 시각에 부서로 일이 떨어진다.
+//   결과물은 결재로 올라오고, 사람이 고친 흔적이 그대로 학습 신호가 된다.
+//
+//   주의 — 렌더 무료 인스턴스는 한국시각 새벽에 잠든다.
+//   그 시간에 걸린 루틴은 소리 없이 건너뛰므로 06~23시만 허용한다.
+// ─────────────────────────────────────────────────────────────
+const ROUTINE_TABLE = "routines";
+
+/* ══ 보고 대장 (v307) ══
+   무엇을 하든 여기에 한 줄이 남는다. 성공도 실패도.
+   "했는데 기록이 없다"는 상태를 없애는 것이 이 표의 목적이다. */
+const REPORT_TABLE = "reports";
+async function logReport(o){
+  try{
+    if (!useSupabase) return null;
+    const id = "rp_" + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+    await supaInsert(REPORT_TABLE, {
+      report_id: id,
+      kind:    String(o.kind||"job").slice(0,20),
+      ref_id:  o.ref_id ? String(o.ref_id).slice(0,60) : null,
+      dept:    String(o.dept||"").slice(0,30),
+      title:   String(o.title||"").slice(0,160),
+      status:  ["ok","fixed","failed","skipped"].indexOf(o.status)>=0 ? o.status : "ok",
+      summary: String(o.summary||"").slice(0,600),
+      detail:  o.detail || {},
+      notified: !!o.notified,
+      day_kst: kstNow().day,
+      created_at: new Date().toISOString()
+    });
+    return id;
+  }catch(e){ console.error("보고 기록 실패:", String(e&&e.message||e)); return null; }
+}
+
+/* ══ 총괄 자가복구 (v307) ══
+   사람을 부르기 전에 오세라가 먼저 본다.
+   스스로 고칠 수 있는 것은 고치고, 고쳤더라도 반드시 보고를 남긴다.
+   — 사장님 지시: "해결해도 보고는 해야 된다" */
+async function opsTriage(rt, msg){
+  const d = routineDiagnose(msg);
+  const tried = [];
+  let fixed = false;
+
+  // (1) 한도·과부하·일시적 끊김 — 기다리면 풀린다. 다음 점검(5분 뒤)에 자동 재시도된다.
+  if (/429|rate.?limit|quota|overload|timeout|ETIMEDOUT|ECONNRESET|fetch failed/i.test(String(msg))){
+    tried.push("일시적인 문제로 판단 — 다음 점검에서 자동 재시도되도록 두었습니다");
+    fixed = true;
+  }
+  // (2) 특정 엔진이 죽었으면 무료 풀로 우회할 수 있는지 본다
+  else if (/ANTHROPIC|GEMINI|engine|모델/i.test(String(msg)) && typeof FREE_PROVIDERS !== "undefined"){
+    try{
+      const alive = (FREE_PROVIDERS||[]).filter(p=>p && !p.cooldownUntil || (p.cooldownUntil||0) < Date.now());
+      if (alive.length){ tried.push("무료 엔진 " + alive.length + "곳이 살아 있어 그쪽으로 넘겼습니다"); fixed = true; }
+      else tried.push("무료 엔진도 전부 쉬는 중이라 넘기지 못했습니다");
+    }catch(e){ tried.push("엔진 상태를 확인하지 못했습니다"); }
+  }
+  // (3) 표·권한 문제 — 사람만 고칠 수 있다
+  else if (/PGRST|does not exist|42P01|401|403|JWT|apikey|RLS/i.test(String(msg))){
+    tried.push("설정 문제라 제가 손댈 수 없습니다");
+  }
+  else tried.push("원인을 짚지 못해 그대로 두었습니다");
+
+  const rid = await logReport({
+    kind: "recovery", ref_id: rt.routine_id, dept: "ops",
+    title: (rt.name||rt.routine_id) + " — 총괄 확인",
+    status: fixed ? "fixed" : "failed",
+    summary: (fixed ? "제가 처리했습니다. " : "제 선에서 해결하지 못했습니다. ") + d.why,
+    detail: { 원인:d.why, 할일:d.todo, 시도:tried, 원문:String(msg).slice(0,300), 담당:rt.dept },
+    notified: !fixed
+  });
+
+  // 못 고친 것만 즉시 부른다. 고친 것은 하루 마감 보고에 담긴다.
+  if (!fixed){
+    const t = "⚠️ 총괄이 해결하지 못했습니다\n\n"
+      + "· 일감: " + (rt.name||rt.routine_id) + "\n"
+      + "· 담당: " + ((typeof MEMBERS!=="undefined" && MEMBERS[rt.dept]) || rt.dept) + "\n\n"
+      + "원인 — " + d.why + "\n"
+      + "제가 한 것 — " + tried.join(" / ") + "\n"
+      + "부탁드릴 것 — " + d.todo + "\n\n"
+      + "· 원문: " + String(msg).slice(0,140);
+    await kakaoNotify(t, process.env.APP_URL || "").catch(()=>{});
+  }
+  return { fixed, reportId: rid, why: d.why, tried };
+}
+
+/* 오류 문구를 사람이 읽을 수 있는 원인과 할 일로 바꾼다.
+   "HTTP 500" 만 보내면 받아도 뭘 해야 할지 모른다. */
+function routineDiagnose(msg){
+  const m = String(msg||"");
+  if (/PGRST|relation .* does not exist|42P01/i.test(m))
+    return { why:"작업표에 필요한 칸이 없습니다", todo:"v306 마이그레이션 SQL을 아직 안 돌리셨는지 확인해 주세요" };
+  if (/401|403|JWT|apikey|RLS/i.test(m))
+    return { why:"데이터베이스 접근이 거부됐습니다", todo:"렌더 환경변수의 service_role 키를 확인해 주세요" };
+  if (/429|rate.?limit|quota|overload/i.test(m))
+    return { why:"AI 호출 한도에 걸렸습니다", todo:"잠시 뒤 자동으로 다시 시도합니다. 계속되면 무료 풀 키를 늘려 주세요" };
+  if (/timeout|ETIMEDOUT|ECONNRESET|fetch failed|ENOTFOUND/i.test(m))
+    return { why:"바깥 서버와 연결이 끊겼습니다", todo:"대개 저절로 풀립니다. 30분 넘게 이어지면 알려 주세요" };
+  if (/API key|ANTHROPIC|GEMINI|미설정/i.test(m))
+    return { why:"AI 열쇠가 없거나 잘못됐습니다", todo:"렌더 환경변수에서 키를 확인해 주세요" };
+  return { why:"알 수 없는 문제입니다", todo:"설정 › 진단 화면에서 최근 오류를 확인해 주세요" };
+}
+const ROUTINE_MIN_HOUR = 6, ROUTINE_MAX_HOUR = 23;
+
+function kstNow(){
+  const d = new Date(Date.now() + 9*3600*1000);   // UTC+9
+  return {
+    day:  d.toISOString().slice(0,10),            // YYYY-MM-DD
+    hour: d.getUTCHours(),
+    dow:  d.getUTCDay(),                          // 0=일
+    date: d.getUTCDate()
+  };
+}
+
+/* 오늘 이 루틴을 돌려야 하는가 */
+function routineDue(rt, now){
+  if (!rt.enabled) return false;
+  if (rt.last_run_day === now.day) return false;              // 하루 한 번
+  const h = Math.min(ROUTINE_MAX_HOUR, Math.max(ROUTINE_MIN_HOUR, Number(rt.at_hour)||9));
+  if (now.hour < h) return false;                             // 아직 이르다
+  const days = Array.isArray(rt.days) ? rt.days : null;
+  if (rt.freq === "weekly")  return !days || !days.length || days.indexOf(now.dow) >= 0;
+  if (rt.freq === "monthly") return !days || !days.length || days.indexOf(now.date) >= 0;
+  return true;                                                // daily
+}
+
+async function runRoutines(){
+  if (!useSupabase) return;
+  const now = kstNow();
+  if (now.hour < ROUTINE_MIN_HOUR) return;   // 새벽엔 아무것도 하지 않는다
+  let list = [];
+  try { list = await supaSelect(ROUTINE_TABLE, "enabled=eq.true&select=*&limit=50"); }
+  catch(e){ console.error("루틴 조회 실패:", String(e&&e.message||e)); return; }
+  if (!Array.isArray(list) || !list.length) return;
+
+  for (const rt of list){
+    if (!routineDue(rt, now)) continue;
+    // 먼저 표시하지 않는다 — 실제로 시작된 뒤에 적어야 건너뛴 날이 안 생긴다
+    try {
+      const genId = "gen_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+      const topic = rt.name + " · " + now.day;
+      await supaInsert(CG_TABLE, {
+        generation_id: genId,
+        topic: topic,
+        target_channel: rt.channel || "",
+        approval_status: "processing",
+        stage: "queued",
+        created_at: new Date().toISOString(),
+        heartbeat_at: new Date().toISOString(),
+        routine_id: rt.routine_id,
+        assigned_dept: rt.dept
+      });
+      pipeRun(genId, {
+        topic: topic,
+        channels: rt.channel ? [rt.channel] : [],
+        source: rt.brief || "",
+        answers: [],
+        refUrls: [],
+        dept: rt.dept
+      }).catch(e=>console.error("루틴 파이프 예외:", rt.routine_id, String(e&&e.message||e)));
+
+      await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(rt.routine_id), {
+        last_run_day: now.day,
+        last_run_at: new Date().toISOString(),
+        last_gen_id: genId,
+        fail_count: 0,
+        last_error: ""
+      });
+      console.log("루틴 시작:", rt.routine_id, "→", rt.dept, topic);
+      await logReport({
+        kind:"routine", ref_id:rt.routine_id, dept:rt.dept,
+        title:(rt.name||rt.routine_id) + " 시작",
+        status:"ok",
+        summary:((typeof MEMBERS!=="undefined" && MEMBERS[rt.dept])||rt.dept) + "에게 넘겼습니다 — " + topic,
+        detail:{ 작업번호:genId, 채널:rt.channel||"(없음)", 시각:now.hour+"시" }
+      });
+    } catch(e){
+      const msg = String(e&&e.message||e).slice(0,300);
+      const n = (Number(rt.fail_count)||0) + 1;
+      console.error("루틴 실패:", rt.routine_id, msg);
+      await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(rt.routine_id), {
+        fail_count: n, last_error: msg
+      }).catch(()=>{});
+      // last_run_day 는 건드리지 않는다 — 다음 점검(5분 뒤)에서 다시 시도한다.
+      // 실패는 매번 대장에 남긴다. 조용히 넘어가는 실패가 제일 나쁘다.
+      await logReport({
+        kind:"routine", ref_id:rt.routine_id, dept:rt.dept,
+        title:(rt.name||rt.routine_id) + " 실패",
+        status:"failed", summary:"연속 " + n + "회째 실패", detail:{ 원문:msg }
+      });
+      // 세 번 내리 실패하면 스스로 푸는 문제가 아니다. 그때 총괄이 나선다.
+      if (n === 3) opsTriage(rt, msg).catch(()=>{});
+    }
+  }
+}
+/* ══ 하루 마감 보고 (v307) ══
+   오늘 무엇을 했는지 하루 한 번 통째로 알린다.
+   실패만 알리면 "조용하다 = 잘 돌아간다"인지 "조용하다 = 죽었다"인지 알 수 없다. */
+const DIGEST_HOUR = 21;
+let _digestDay = "";
+async function runDailyDigest(force){
+  if (!useSupabase) return { ok:false, skipped:"supabase" };
+  const now = kstNow();
+  if (!force){
+    if (now.hour < DIGEST_HOUR) return { ok:true, skipped:"이른 시각" };
+    if (_digestDay === now.day)  return { ok:true, skipped:"오늘 이미 보냄" };
+  }
+  let rows = [];
+  try{ rows = await supaSelect(REPORT_TABLE,
+    "day_kst=eq."+encodeURIComponent(now.day)+"&select=kind,dept,title,status,summary&order=created_at.asc&limit=100"); }
+  catch(e){ return { ok:false, error:String(e&&e.message||e) }; }
+  rows = rows || [];
+
+  const done   = rows.filter(r=>r.kind==="routine" && r.status==="ok");
+  const failed = rows.filter(r=>r.status==="failed");
+  const fixed  = rows.filter(r=>r.status==="fixed");
+  const nm = d => (typeof MEMBERS!=="undefined" && MEMBERS[d]) || d || "";
+
+  let t = "📋 오늘 보고 · " + now.day + "\n";
+  t += "\n일감 " + done.length + "건 · 총괄이 처리 " + fixed.length + "건 · 남은 문제 " + failed.length + "건\n";
+  if (done.length){
+    t += "\n[ 넘긴 일 ]\n" + done.slice(0,8).map(r=>"· " + nm(r.dept) + " — " + r.title.replace(/ 시작$/,"")).join("\n") + "\n";
+  }
+  if (fixed.length){
+    t += "\n[ 총괄이 처리한 것 ]\n" + fixed.slice(0,5).map(r=>"· " + r.title.replace(/ — 총괄 확인$/,"") + "\n  " + r.summary).join("\n") + "\n";
+  }
+  if (failed.length){
+    const uniq = [];
+    for (const r of failed){ if (!uniq.some(u=>u.title===r.title)) uniq.push(r); }
+    t += "\n[ 손이 필요한 것 ]\n" + uniq.slice(0,5).map(r=>"· " + r.title + " — " + r.summary).join("\n") + "\n";
+  }
+  if (!rows.length) t += "\n오늘은 아무 일감도 돌지 않았습니다. 루틴이 전부 꺼져 있는지 확인해 주세요.\n";
+
+  await kakaoNotify(t, process.env.APP_URL || "").catch(()=>{});
+  await logReport({ kind:"digest", dept:"ops", title:"하루 마감 보고", status:"ok",
+    summary:"일감 "+done.length+" · 처리 "+fixed.length+" · 남음 "+failed.length,
+    detail:{ 건수: rows.length }, notified:true });
+  _digestDay = now.day;
+  return { ok:true, sent:true, done:done.length, fixed:fixed.length, failed:failed.length };
+}
+
+setInterval(()=>{ runRoutines().catch(e=>console.error("루틴 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
+setInterval(()=>{ runDailyDigest().catch(e=>console.error("마감 보고 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
+setTimeout(()=>{ runRoutines().catch(()=>{}); }, 45000);
+
+// ─────────────────────────────────────────────────────────────
 // v254: 통합 인증
 //   관제탑(Streamlit)과 v249 앱이 각각 따로 로그인하던 것을 백엔드로 일원화한다.
 //   토큰은 상태를 저장하지 않는 서명 방식이라 서버가 재시작해도 유효하다.
@@ -2843,6 +3088,209 @@ app.post("/api/pipeline/retry", async (req, res)=>{
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
+/* ── v307: 보고 ── */
+app.get("/api/reports", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const day = String(req.query?.day||"") || kstNow().day;
+    const rows = await supaSelect(REPORT_TABLE,
+      "day_kst=eq."+encodeURIComponent(day)+"&select=*&order=created_at.desc&limit=100");
+    const list = rows||[];
+    res.json({ ok:true, day, reports:list, count:{
+      전체:list.length,
+      한일:list.filter(r=>r.kind==="routine"&&r.status==="ok").length,
+      처리:list.filter(r=>r.status==="fixed").length,
+      남음:list.filter(r=>r.status==="failed").length
+    }});
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/reports/digest", async (req,res)=>{
+  try{ res.json(await runDailyDigest(true)); }
+  catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* ── v306: 채널 자산(카페 게시판·홈페이지 구성) ── */
+const PLAN_TABLE = "channel_plans";
+app.get("/api/plans", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const ch = String(req.query?.channel||"");
+    const q = (ch ? "channel=eq."+encodeURIComponent(ch)+"&" : "")
+            + "select=*&order=created_at.desc&limit=30";
+    res.json({ ok:true, plans: (await supaSelect(PLAN_TABLE, q))||[] });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/plans/save", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const b = req.body||{};
+    const channel = String(b.channel||"").slice(0,40);
+    if (!channel) return res.status(400).json({ ok:false, error:"channel 이 필요합니다" });
+    const structure = Array.isArray(b.structure) ? b.structure.slice(0,40) : [];
+    if (!structure.length) return res.status(400).json({ ok:false, error:"구성이 비어 있습니다" });
+    // 같은 채널의 이전 판을 세어 판 번호를 올린다 — 덮어쓰지 않고 쌓는다
+    const prev = await supaSelect(PLAN_TABLE, "channel=eq."+encodeURIComponent(channel)+"&select=version&order=version.desc&limit=1");
+    const version = ((prev && prev[0] && Number(prev[0].version)) || 0) + 1;
+    const planId = "plan_" + Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+    await supaInsert(PLAN_TABLE, {
+      plan_id: planId, channel, title: String(b.title||channel).slice(0,120),
+      structure, notes: String(b.notes||"").slice(0,2000),
+      version, status: b.approve ? "approved" : "draft",
+      dept: String(b.dept||"").slice(0,30),
+      generation_id: b.generation_id || null,
+      approved_at: b.approve ? new Date().toISOString() : null
+    });
+    res.json({ ok:true, plan_id: planId, version });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/plans/approve", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.plan_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"plan_id 가 필요합니다" });
+    const rows = await supaSelect(PLAN_TABLE, "plan_id=eq."+encodeURIComponent(id)+"&select=channel");
+    if (!rows || !rows[0]) return res.status(404).json({ ok:false, error:"없는 구성안입니다" });
+    // 한 채널에 승인된 구성은 하나만 — 이전 것은 물러난다
+    await supaPatch(PLAN_TABLE, "channel=eq."+encodeURIComponent(rows[0].channel)+"&status=eq.approved", { status:"retired" }).catch(()=>{});
+    await supaPatch(PLAN_TABLE, "plan_id=eq."+encodeURIComponent(id), { status:"approved", approved_at:new Date().toISOString() });
+    res.json({ ok:true, plan_id:id });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* ── v307: 카페 관찰 ── */
+const OBS_TABLE = "cafe_observations";
+app.post("/api/cafe/observe", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const b = req.body||{};
+    const boards = Array.isArray(b.boards) ? b.boards.slice(0,20) : [];
+    if (!boards.length) return res.status(400).json({ ok:false, error:"boards 가 비어 있습니다" });
+    const day = kstNow().day, ch = String(b.channel||"naver_cafe").slice(0,40);
+    for (const x of boards){
+      await supaInsert(OBS_TABLE, {
+        obs_id: "obs_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7),
+        channel: ch, board: String(x.board||"").slice(0,60),
+        posts: Number(x.posts)||0, comments: Number(x.comments)||0,
+        views: Number(x.views)||0, members: Number(b.members)||0,
+        inflow: x.inflow || b.inflow || {}, note: String(x.note||"").slice(0,400),
+        day_kst: day, created_at: new Date().toISOString()
+      });
+    }
+    await logReport({ kind:"audit", dept:"analytics", title:"카페 관찰 기록", status:"ok",
+      summary: boards.length + "개 게시판을 살펴봤습니다",
+      detail:{ 채널:ch, 게시판:boards.map(x=>x.board) } });
+    res.json({ ok:true, saved: boards.length, day });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* 쌓인 관찰을 흐름으로 돌려준다.
+   한 번 찍은 숫자로는 아무것도 못 판단한다. 죽은 게시판은 흐름에서만 보인다. */
+app.get("/api/cafe/trend", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const ch = String(req.query?.channel||"naver_cafe");
+    const rows = (await supaSelect(OBS_TABLE,
+      "channel=eq."+encodeURIComponent(ch)+"&select=*&order=created_at.desc&limit=200")) || [];
+    const byBoard = {};
+    for (const r of rows){
+      const b = r.board || "(이름없음)";
+      (byBoard[b] = byBoard[b] || []).push(r);
+    }
+    const boards = Object.keys(byBoard).map(b=>{
+      const list = byBoard[b];                       // 최신순
+      const recent = list.slice(0, 4), older = list.slice(4, 8);
+      const sum = (a,k)=>a.reduce((x,r)=>x+(Number(r[k])||0),0);
+      const pr = sum(recent,"posts"), po = sum(older,"posts");
+      const vr = sum(recent,"views"), vo = sum(older,"views");
+      let verdict = "지켜보는 중";
+      if (pr === 0) verdict = "죽었음 — 합치거나 빼는 것을 검토";
+      else if (po > 0 && pr < po * 0.5) verdict = "식는 중";
+      else if (po > 0 && pr > po * 1.5) verdict = "달아오름 — 쪼개는 것을 검토";
+      else if (list.length < 3) verdict = "기록이 모자람 — 판단하기 이름";
+      // 유입경로 합산
+      const inflow = {};
+      for (const r of recent){ const f=r.inflow||{}; for (const k in f) inflow[k]=(inflow[k]||0)+(Number(f[k])||0); }
+      const top = Object.keys(inflow).sort((a,b2)=>inflow[b2]-inflow[a]).slice(0,3)
+                    .map(k=>k+" "+inflow[k]);
+      return { 게시판:b, 관찰수:list.length, 최근글:pr, 이전글:po,
+               최근조회:vr, 이전조회:vo, 주요유입:top, 판정:verdict };
+    }).sort((a,b)=>b.최근글-a.최근글);
+    res.json({ ok:true, channel:ch, 관찰기록:rows.length, boards });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* ── v306: 루틴 ── */
+app.get("/api/routines", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const rows = await supaSelect(ROUTINE_TABLE, "select=*&order=at_hour.asc&limit=50");
+    res.json({ ok:true, now:kstNow(), routines: rows||[] });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/routines/toggle", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.routine_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"routine_id 가 필요합니다" });
+    const rows = await supaSelect(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(id)+"&select=enabled");
+    if (!rows || !rows[0]) return res.status(404).json({ ok:false, error:"없는 루틴입니다" });
+    const next = !rows[0].enabled;
+    await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(id), { enabled: next });
+    res.json({ ok:true, enabled: next });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+app.post("/api/routines/save", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const b = req.body||{};
+    const id = String(b.routine_id||"");
+    if (!id) return res.status(400).json({ ok:false, error:"routine_id 가 필요합니다" });
+    const patch = {};
+    if (b.name   != null) patch.name    = String(b.name).slice(0,80);
+    if (b.dept   != null) patch.dept    = String(b.dept).slice(0,30);
+    if (b.brief  != null) patch.brief   = String(b.brief).slice(0,2000);
+    if (b.channel!= null) patch.channel = String(b.channel).slice(0,40);
+    if (b.freq   != null) patch.freq    = ["daily","weekly","monthly"].indexOf(b.freq)>=0 ? b.freq : "daily";
+    if (b.at_hour!= null){
+      // 새벽에 걸면 렌더가 자느라 소리 없이 건너뛴다. 아예 못 넣게 막는다.
+      const h = Math.round(Number(b.at_hour));
+      if (!(h >= ROUTINE_MIN_HOUR && h <= ROUTINE_MAX_HOUR))
+        return res.status(400).json({ ok:false, error:"시각은 "+ROUTINE_MIN_HOUR+"시~"+ROUTINE_MAX_HOUR+"시 사이여야 해요 (새벽엔 서버가 잠듭니다)" });
+      patch.at_hour = h;
+    }
+    if (Array.isArray(b.days)) patch.days = b.days.map(Number).filter(n=>!isNaN(n));
+    if (!Object.keys(patch).length) return res.status(400).json({ ok:false, error:"바꿀 내용이 없습니다" });
+    await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(id), patch);
+    res.json({ ok:true, routine_id:id, patch });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+/* 기다리지 않고 지금 한 번 돌린다 — 만들어 놓고 확인할 때 쓴다 */
+app.post("/api/routines/run", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id = String(req.body?.routine_id||"");
+    const rows = await supaSelect(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(id)+"&select=*");
+    const rt = rows && rows[0];
+    if (!rt) return res.status(404).json({ ok:false, error:"없는 루틴입니다" });
+    const now = kstNow();
+    const genId = "gen_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
+    const topic = rt.name + " · " + now.day;
+    await supaInsert(CG_TABLE, {
+      generation_id: genId, topic: topic, target_channel: rt.channel||"",
+      approval_status:"processing", stage:"queued",
+      created_at:new Date().toISOString(), heartbeat_at:new Date().toISOString(),
+      routine_id: rt.routine_id, assigned_dept: rt.dept
+    });
+    pipeRun(genId, { topic, channels: rt.channel?[rt.channel]:[], source: rt.brief||"",
+                     answers:[], refUrls:[], dept: rt.dept })
+      .catch(e=>console.error("루틴 수동실행 예외:", String(e&&e.message||e)));
+    await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(id), {
+      last_run_day: now.day, last_run_at: new Date().toISOString(), last_gen_id: genId
+    });
+    res.json({ ok:true, generation_id: genId, topic });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
 /* ── v305: 중단·삭제 ──
    멈추라면 멈추고, 지우라면 지운다. 지금까지는 '다시'만 있어서
    실패한 건이 화면에 영원히 남았다. */
@@ -3335,13 +3783,13 @@ const AGENTS = {
   strategy:    { no:"글2", kr:"이야기팀·카피라이터",  role:"이야기팀 소속 카피라이터. SNS 캡션·후킹 문구·해시태그 전략을 담당한다. 첫 3초 후킹과 저장·공유를 부르는 한 줄을 만든다." },
   creation:    { no:"글1", kr:"이야기팀·콘텐츠 디렉터",    role:"이야기팀 팀장(콘텐츠 디렉터). 글·SNS 콘텐츠의 주제·톤·구성을 총괄하고 팀원(카피라이터·블로그 작가)을 조율하며 최종 검수까지 책임진다. 게시물 카피·본문·구성안을 직접 끝까지 완성한다." },
   publishing:  { no:"필1", kr:"필름팀·영상 PD",      role:"필름팀 팀장(영상 PD). 유튜브·쇼츠 영상의 기획·구성·연출을 총괄한다. 장면·컷·자막·나레이션 구성안과 비주얼 훅을 설계하고 팀원(대본 작가·편집)을 조율한다." },
-  analytics:   { no:"디2", kr:"디자인팀·웹 디자이너",    role:"디자인팀 소속 웹 디자이너. 홈페이지·상품 상세페이지·티스토리 스킨 등 웹 화면을 설계·제작한다. 레이아웃·여백·구조·반응형을 담당한다." },
+  analytics:   { no:"분1", kr:"분석팀·데이터 분석",    role:"분석팀(1인). 채널·게시판별 성과를 집계해 무엇이 살고 무엇이 죽었는지 판정한다. 월 1회 게시판 점검과 카테고리 개편안을 올리고, 사람이 고친 흔적(수정률)을 추적해 학습이 실제로 되고 있는지 검증한다. 숫자 없이 말하지 않는다." },
   monetization:{ no:"디1", kr:"디자인팀·아트 디렉터",  role:"디자인팀 팀장(아트 디렉터). 색·무드·컨셉 등 비주얼 방향을 총괄하고 웹·그래픽(배너·카드뉴스·썸네일 이미지) 전반을 지휘한다. 판매 전환 상세페이지 구성·구매 전환 카피(혜택·후기·CTA)에도 강하다." },
   ops:         { no:"총괄", kr:"총괄실·비서", role:"총괄 비서(오케스트레이터). 스케줄·예약 관리, 팀 배정·명령 하달, 플랫폼·계정·발행·카카오 알림, 성과 취합을 담당한다. 저작권·광고법·정책 관점에서 모든 팀의 산출물을 검토하고 직접 수정·보완·재작성할 권한이 있다. 클로드(텍스트·추론)와 제미나이(영상·이미지)를 함께 활용해 전반을 조율한다." },
-  advisory:    { no:"고1", kr:"고객팀·CS 매니저",      role:"고객팀 CS 매니저. 카카오톡 채널 친구 관리와 고객 응대를 맡는다. 문의 답변, 배송·교환·환불 안내, 클레임 초기 대응, 자주 묻는 질문 정리, 친구 늘리기와 재구매를 부르는 메시지를 쓴다. 손님에게 직접 말이 나가는 자리라 과장·확답을 가장 조심해야 한다. 모르는 것은 지어내지 않고 '확인해서 알려드리겠다'로 넘긴다." },
-  scout:       { no:"필2", kr:"필름팀·대본 작가",      role:"필름팀 소속 대본 작가. 영상 나레이션·자막·스크립트를 쓰고, 트렌드·밈·키워드를 우리 특산물 영상에 바로 쓸 실전 소재(아이디어·후킹 대사·릴스 포맷·시즌 앵글)로 가공한다." },
-  editing:     { no:"디3", kr:"디자인팀·웹 퍼블리셔",  role:"디자인팀 소속 웹 퍼블리셔. 웹 디자이너의 구성안과 생성된 HTML을 실제로 깨지지 않게 만드는 마지막 손이다. 안 닫힌 태그·잘린 섹션·끊긴 링크·빠진 이미지를 잡고, 모바일 폭·글자 크기·대비·터치 영역을 규격에 맞춘다. 예쁘게 바꾸는 사람이 아니라 무너지지 않게 하는 사람이다. 문제를 발견하면 어디를 어떻게 고칠지 구체적으로 지시한다." },
-  graphic:     { no:"디4", kr:"디자인팀·그래픽 디자이너", role:"디자인팀 소속 그래픽 디자이너. 배너·카드뉴스·썸네일 이미지·상세페이지 그래픽을 제작한다. 타이포·색·레이아웃·여백으로 시선을 잡고, 아트 디렉터의 무드를 실제 시안으로 구현한다." }
+  advisory:    { no:"고1", kr:"고객팀·CS 매니저",      role:"고객팀(1인). 카페 댓글·후기·문의와 카톡 채널을 맡는다. 댓글 답은 초안만 만들고 사람이 손대 올린다(자동 응답 금지). 회원 등급·재구매·단골 관리를 담당하고, 발행 전 품질 검수(과대광고·톤 이탈·정책)도 겸한다." },
+  scout:       { no:"취1", kr:"취재팀·취재 기자",      role:"취재팀(1인). 고흥 지역 소식·행사·제철 정보를 웹에서 모아 우리 시선으로 다시 쓴다. 규칙: 사실은 3줄로 줄이고 본문 7할 이상을 직접 관찰·해석으로 채우며, 남의 기사 문장을 옮기지 않고 출처는 반드시 링크로 남긴다. 영상 대본·트렌드 소재 발굴도 겸한다." },
+  editing:     { no:"디2", kr:"디자인팀·웹 퍼블리셔",  role:"디자인팀 웹 퍼블리셔. 카페 스킨·홈페이지·티스토리 스킨을 실제로 구현하고, HTML 품질과 반응형(모바일 767 이하 / 태블릿 768~1023 / PC 1024 이상)을 검수한다." },
+  graphic:     { no:"필2", kr:"필름팀·그래픽 디자이너", role:"필름팀 그래픽 디자이너. 썸네일·자막 디자인·카드뉴스·배너를 만든다. 영상과 붙어 있는 시각물 전반을 맡는다. 타이포·색·레이아웃으로 시선을 잡는다." }
 };
 
 // ===== Anthropic 호출 (서버측 키) =====
@@ -8108,7 +8556,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v305";
+const SERVER_VERSION = "v307";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
