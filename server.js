@@ -9047,7 +9047,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v317";
+const SERVER_VERSION = "v320";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
@@ -13723,6 +13723,69 @@ app.get("/api/design/get", (req,res)=>{
   if(!j) return res.status(404).json({ error:"결과가 없어요" });
   res.json({ ok:true, osera:j.osera||null, oseraPassed:j.oseraPassed!==false, id:j.id, kind:j.kind, kindLabel:(DESIGN_KINDS[j.kind]?DESIGN_KINDS[j.kind].label:j.kind), brief:j.brief||"", isHtml:!!j.isHtml, output:j.output||"", outputDropped:!!j.outputDropped });
 });
+/* ══ 디자인 조각만 다시 (v320) ══
+   디자인은 결재판과 저장하는 곳이 다르다(DB.designJobs).
+   그래서 같은 일을 하는 문을 따로 낸다 — 집어낸 데만 고쳐 받고,
+   되박는 것은 화면이 한다(어느 자리인지는 화면만 안다). */
+app.post("/api/design/redo-part", async (req,res)=>{
+  try{
+    const b = req.body || {};
+    const job = (DB.designJobs||[]).find(x=>x.id===String(b.id||""));
+    if(!job || !job.output) return res.status(404).json({ ok:false, error:"결과를 찾을 수 없어요" });
+    const part = String(b.part||"");
+    const note = String(b.note||"").trim();
+    if(!part) return res.status(400).json({ ok:false, error:"어느 부분인지 알려 주세요" });
+    if(!note) return res.status(400).json({ ok:false, error:"무엇이 마음에 안 드는지 적어 주세요" });
+
+    const ctxAll  = String(b.context||"");
+    const partial = !!ctxAll && ctxAll !== part;
+    const who = (typeof MEMBERS!=="undefined" && MEMBERS.editing) || "노아라";
+
+    const sys = "너는 " + who + "다. " + ((AGENTS.editing&&AGENTS.editing.role) || "웹 퍼블리셔다.")
+      + (partial
+          ? "\n지금은 이미 만든 화면에서 사장님이 '집어낸 부분'만 고쳐 쓰는 일이다."
+            + "\n집어낸 부분을 대신할 것만 출력한다. 앞뒤는 참고만 하고 다시 쓰지 마라."
+            + "\n그 자리에 그대로 끼워 넣을 것이니 모양과 들여쓰기를 맞춰라."
+          : "\n지금은 화면의 '한 칸'만 다시 만드는 일이다.")
+      + "\n규칙: 지적된 것만 고친다. 무관한 부분은 글자 하나 바꾸지 마라."
+      + "\n지금 쓰고 있는 class 이름과 색·여백 규칙을 그대로 지켜라 — 나머지 화면과 어긋나면 안 된다."
+      + "\n코드만 출력한다. 설명·머리말·```울타리를 붙이지 마라.";
+    const usr = "만든 것: " + String(job.brief||"").slice(0,200) + "\n\n"
+      + (partial ? "[ 앞뒤 (고치지 마라) ]\n" + ctxAll.slice(0,4000) + "\n\n"
+                   + "[ 집어낸 부분 — 이것만 ]\n" + part + "\n\n"
+                 : "[ 지금 칸 ]\n" + part + "\n\n")
+      + "[ 사장님 지적 ]\n" + note + "\n\n결과만 낸다.";
+
+    let out = "", via = String(b.by||"claude");
+    try{
+      out = (via === "gemini") ? await geminiText(sys + "\n\n" + usr, 3000)
+                               : await anthropic(sys, usr, 3000);
+    }catch(e){
+      try{ out = (via === "gemini") ? await anthropic(sys, usr, 3000)
+                                    : await geminiText(sys + "\n\n" + usr, 3000);
+           via = (via === "gemini") ? "claude" : "gemini"; }
+      catch(e2){ return res.status(502).json({ ok:false, error:"다시 만들지 못했습니다: " + String(e2&&e2.message||e2).slice(0,120) }); }
+    }
+    out = String(out||"").trim().replace(/^```[A-Za-z0-9+#-]*\s*\n?/,"").replace(/\n?```\s*$/,"").trim();
+    if(!out) return res.status(502).json({ ok:false, error:"빈 결과가 돌아왔습니다" });
+    res.json({ ok:true, text: out, via, who });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+/* 화면이 되박은 결과를 그대로 저장한다 */
+app.post("/api/design/save", (req,res)=>{
+  try{
+    const b = req.body || {};
+    const job = (DB.designJobs||[]).find(x=>x.id===String(b.id||""));
+    if(!job) return res.status(404).json({ ok:false, error:"결과를 찾을 수 없어요" });
+    const txt = String(b.output||"");
+    if(!txt) return res.status(400).json({ ok:false, error:"내용이 비어 있습니다" });
+    if(!job.humanBase) job.humanBase = job.output;      // 처음 손댄 시점을 남긴다
+    job.output = txt; job.humanEditedAt = Date.now();
+    saveDB();
+    res.json({ ok:true, len: txt.length });
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
 app.post("/api/design/feedback", (req,res)=>{
   const b = req.body || {};
   const job = (DB.designJobs||[]).find(x=>x.id===String(b.id||""));
