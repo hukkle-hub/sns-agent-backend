@@ -527,6 +527,9 @@ async function runDailyDigest(force){
   const now = kstParts();
   if (!force){
     if (now.hour < DIGEST_HOUR) return { ok:true, skipped:"이른 시각" };
+    // 서버가 다시 떠도 오늘 보냈는지 안다 — 같은 보고를 두 번 보내지 않는다
+    DB.state = DB.state || {};
+    if (!_digestDay && DB.state.digestDay) _digestDay = DB.state.digestDay;
     if (_digestDay === now.day)  return { ok:true, skipped:"오늘 이미 보냄" };
   }
   let rows = [];
@@ -579,6 +582,8 @@ async function runDailyDigest(force){
     summary:"일감 "+done.length+" · 처리 "+fixed.length+" · 남음 "+failed.length,
     detail:{ 건수: rows.length }, notified:true });
   _digestDay = now.day;
+  DB.state = DB.state || {}; DB.state.digestDay = now.day;
+  try{ saveDB(); }catch(e){}
   return { ok:true, sent:true, done:done.length, fixed:fixed.length, failed:failed.length };
 }
 
@@ -674,16 +679,34 @@ setInterval(()=>{ opsReviewSchedule().catch(e=>console.error("스케줄 점검 �
    주 1회로는 늦다. 아무도 안 하는 일은 하루만 지나도 하루치가 빈다.
    조용히 비는 것이 제일 위험하므로 매일 아침 확인해 대장에 남긴다. */
 const DUTY_HOUR = 7;
-let _dutyDay = "";
+let _dutyDay = "", _dutySig = "";
 async function runDutyCheck(force){
   if (!useSupabase) return { ok:false, skipped:"supabase" };
   const now = kstParts();
+  /* v324: 렌더 무료 서버는 수시로 다시 뜬다. 그때 머릿속 기억이 지워져
+     같은 점검이 하루에 몇 번씩 돌았다(22:04·22:49·23:01…).
+     그래서 표에 적어 둔다 — 다시 떠도 오늘 봤는지 안다. */
+  DB.state = DB.state || {};
+  if (!_dutyDay && DB.state.dutyDay) _dutyDay = DB.state.dutyDay;
+  if (!_dutySig && DB.state.dutySig) _dutySig = DB.state.dutySig;
   if (!force){
     if (now.hour < DUTY_HOUR) return { ok:true, skipped:"이른 시각" };
     if (_dutyDay === now.day)  return { ok:true, skipped:"오늘 이미 봄" };
   }
   const cov = await dutyCoverage();
   const 급함 = cov.빈몫.length + cov.꺼짐.length;      // 아예 아무도 안 하는 일
+
+  /* v324: 결과가 지난번과 같으면 적지 않는다.
+     "전부 굴러가고 있습니다"가 시각만 바뀐 채 쌓이면 정작 볼 것이 묻힌다.
+     달라졌을 때만 남긴다 — 보고는 변화를 알리는 것이지 생존 신고가 아니다. */
+  const sig = [cov.문제, cov.빈몫.length, cov.밀림.length, cov.꺼짐.length, cov.주인없음.length].join("/");
+  if (!force && _dutySig === sig){
+    _dutyDay = now.day;
+    DB.state.dutyDay = now.day; try{ saveDB(); }catch(e){}
+    return { ok:true, skipped:"지난번과 같음", ...cov };
+  }
+  _dutySig = sig;
+
   await logReport({
     kind:"duty", dept:"ops", title:"맡은 일 점검",
     status: cov.문제 ? (급함 ? "failed" : "ok") : "ok",
@@ -703,6 +726,8 @@ async function runDutyCheck(force){
       + "\n\n→ 루틴을 켜 주세요", process.env.APP_URL || "").catch(()=>{});
   }
   _dutyDay = now.day;
+  DB.state.dutyDay = now.day; DB.state.dutySig = sig;
+  try{ saveDB(); }catch(e){}
   return { ok:true, ...cov };
 }
 setInterval(()=>{ runDutyCheck().catch(e=>console.error("맡은 일 점검 예외:", String(e&&e.message||e))); }, SCHED_INTERVAL_MS);
@@ -9047,7 +9072,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v320";
+const SERVER_VERSION = "v324";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
