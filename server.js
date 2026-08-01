@@ -311,6 +311,31 @@ async function agentAsk(dept, question, opts){
   return { ok:true, generation_id:genId };
 }
 
+/* ══ 카톡 말투 (v316) ══
+   길게 쓰면 안 읽는다. 그렇다고 "실패했습니다"만 보내면 뭘 해야 할지 모른다.
+   그래서 한 줄에 반드시 셋을 담는다 — 누가 · 무엇을 · 어디까지.
+
+     서다은 · 고흥 유자축제 · 자료 읽는 중
+     └ 부서       주제(경로)      지금 단계                          */
+const STAGE_KR_S = {
+  queued:"대기", photo:"사진 보는 중", research:"자료 읽는 중", director:"기준 잡는 중",
+  write:"쓰는 중", critic:"검수 중", crossjudge:"교차 검증", adapt:"채널 맞춤",
+  cards:"카드 구성", page:"페이지 구성", design:"디자인", build:"제작",
+  publishing_check:"퍼블리싱 점검", threads:"스레드", ask:"물어봄",
+  cancelled:"멈춤", done:"끝"
+};
+function whoKr(dept){ return (typeof MEMBERS!=="undefined" && MEMBERS[dept]) || dept || "?"; }
+/* 한 건을 한 줄로. 30자 안쪽을 지킨다 — 폰에서 두 줄로 접히면 못 읽는다. */
+function kLine(o){
+  const who   = whoKr(o.dept);
+  const topic = String(o.topic||"").replace(/\s*·\s*\d{4}-\d{2}-\d{2}\s*$/,"").slice(0,20);
+  const stage = o.stage ? (STAGE_KR_S[o.stage] || o.stage) : "";
+  const mark  = o.mark || "";
+  let line = (mark?mark+" ":"") + who + " · " + topic + (stage ? " · " + stage : "");
+  if (line.length > 30) line = line.slice(0,29) + "…";   // 폰에서 두 줄로 접히면 못 읽는다
+  return line;
+}
+
 /* ══ 보고 대장 (v307) ══
    무엇을 하든 여기에 한 줄이 남는다. 성공도 실패도.
    "했는데 기록이 없다"는 상태를 없애는 것이 이 표의 목적이다. */
@@ -375,13 +400,9 @@ async function opsTriage(rt, msg){
 
   // 못 고친 것만 즉시 부른다. 고친 것은 하루 마감 보고에 담긴다.
   if (!fixed){
-    const t = "⚠️ 총괄이 해결하지 못했습니다\n\n"
-      + "· 일감: " + (rt.name||rt.routine_id) + "\n"
-      + "· 담당: " + ((typeof MEMBERS!=="undefined" && MEMBERS[rt.dept]) || rt.dept) + "\n\n"
-      + "원인 — " + d.why + "\n"
-      + "제가 한 것 — " + tried.join(" / ") + "\n"
-      + "부탁드릴 것 — " + d.todo + "\n\n"
-      + "· 원문: " + String(msg).slice(0,140);
+    const t = "⚠️ " + whoKr(rt.dept) + " · " + String(rt.name||rt.routine_id).slice(0,20) + " · 멈춤\n\n"
+      + d.why + "\n"
+      + "→ " + d.todo;
     await kakaoNotify(t, process.env.APP_URL || "").catch(()=>{});
   }
   return { fixed, reportId: rid, why: d.why, tried };
@@ -519,20 +540,39 @@ async function runDailyDigest(force){
   const fixed  = rows.filter(r=>r.status==="fixed");
   const nm = d => (typeof MEMBERS!=="undefined" && MEMBERS[d]) || d || "";
 
-  let t = "📋 오늘 보고 · " + now.day + "\n";
-  t += "\n일감 " + done.length + "건 · 총괄이 처리 " + fixed.length + "건 · 남은 문제 " + failed.length + "건\n";
-  if (done.length){
-    t += "\n[ 넘긴 일 ]\n" + done.slice(0,8).map(r=>"· " + nm(r.dept) + " — " + r.title.replace(/ 시작$/,"")).join("\n") + "\n";
+  /* 지금 일이 어디까지 갔는지 — 이게 제일 궁금한 것이다 */
+  let live = [];
+  try{ live = (await supaSelect(CG_TABLE,
+    "approval_status=in.(processing,pending,needs_input)&select=topic,stage,assigned_dept,approval_status&limit=20")) || []; }
+  catch(e){}
+  const wait = live.filter(r=>r.approval_status==="pending");
+  const askn = live.filter(r=>r.approval_status==="needs_input");
+  const runn = live.filter(r=>r.approval_status==="processing");
+
+  let t = "📋 " + now.day.slice(5) + " 오늘\n";
+  t += "넘긴 일 " + done.length + " · 처리 " + fixed.length + " · 문제 " + failed.length + "\n";
+
+  if (runn.length){
+    t += "\n[ 하는 중 ]\n" + runn.slice(0,6).map(r=>
+      kLine({ dept:r.assigned_dept, topic:r.topic, stage:r.stage })).join("\n") + "\n";
+  }
+  if (wait.length || askn.length){
+    t += "\n[ 내 차례 " + (wait.length+askn.length) + " ]\n"
+      + wait.slice(0,4).map(r=>kLine({ dept:r.assigned_dept, topic:r.topic, stage:"결재 기다림", mark:"●" })).join("\n")
+      + (wait.length&&askn.length ? "\n" : "")
+      + askn.slice(0,3).map(r=>kLine({ dept:r.assigned_dept, topic:r.topic, stage:"물어봄", mark:"?" })).join("\n") + "\n";
   }
   if (fixed.length){
-    t += "\n[ 총괄이 처리한 것 ]\n" + fixed.slice(0,5).map(r=>"· " + r.title.replace(/ — 총괄 확인$/,"") + "\n  " + r.summary).join("\n") + "\n";
+    t += "\n[ 총괄이 처리 ]\n" + fixed.slice(0,3).map(r=>
+      "🔧 " + whoKr(r.dept) + " · " + String(r.title||"").replace(/ — 총괄 확인$/,"").slice(0,20)).join("\n") + "\n";
   }
   if (failed.length){
     const uniq = [];
     for (const r of failed){ if (!uniq.some(u=>u.title===r.title)) uniq.push(r); }
-    t += "\n[ 손이 필요한 것 ]\n" + uniq.slice(0,5).map(r=>"· " + r.title + " — " + r.summary).join("\n") + "\n";
+    t += "\n[ 손이 필요 ]\n" + uniq.slice(0,3).map(r=>
+      "⚠️ " + whoKr(r.dept) + " · " + String(r.title||"").slice(0,22)).join("\n") + "\n";
   }
-  if (!rows.length) t += "\n오늘은 아무 일감도 돌지 않았습니다. 루틴이 전부 꺼져 있는지 확인해 주세요.\n";
+  if (!rows.length && !live.length) t += "\n오늘 아무것도 안 돌았습니다. 정기 일감이 꺼져 있는지 봐 주세요.\n";
 
   await kakaoNotify(t, process.env.APP_URL || "").catch(()=>{});
   await logReport({ kind:"digest", dept:"ops", title:"하루 마감 보고", status:"ok",
@@ -656,12 +696,11 @@ async function runDutyCheck(force){
   // 아무도 안 하고 있는 일은 즉시 알린다. 밀린 것은 마감 보고에 담긴다.
   if (급함){
     const lines = [].concat(
-      cov.빈몫.map(x=>"· " + x.이름 + " — " + x.몫 + " (" + x.왜 + ")"),
-      cov.꺼짐.map(x=>"· " + x.이름 + " — " + x.몫 + " (루틴이 꺼져 있음)")
+      cov.빈몫.map(x=>"⛔ " + x.이름 + " · " + String(x.몫).slice(0,18) + " · 루틴 없음"),
+      cov.꺼짐.map(x=>"⛔ " + x.이름 + " · " + String(x.몫).slice(0,18) + " · 꺼져 있음")
     );
-    await kakaoNotify("⛔ 아무도 안 하고 있는 일이 있습니다\n\n" + lines.join("\n")
-      + "\n\n맡은 사람은 정해져 있는데 실제로 굴러가지 않습니다.\n루틴을 켜거나 새로 만들어 주세요.",
-      process.env.APP_URL || "").catch(()=>{});
+    await kakaoNotify("⛔ 아무도 안 하는 일 " + lines.length + "건\n\n" + lines.join("\n")
+      + "\n\n→ 루틴을 켜 주세요", process.env.APP_URL || "").catch(()=>{});
   }
   _dutyDay = now.day;
   return { ok:true, ...cov };
@@ -1315,7 +1354,7 @@ async function pipeWatchdog(){
       });
       console.log("감시견: 중단 작업 정리", r.generation_id, r.stage||"-");
       notifyNeedsHand("fail", r.topic || "",
-        (r.stage||"시작 전") + " 단계에서 신호가 끊겼습니다").catch(()=>{});
+        (STAGE_KR_S[r.stage]||r.stage||"시작 전") + " 에서 끊김", r.assigned_dept).catch(()=>{});
     }
   } catch(e){ console.error("감시견 예외:", String(e&&e.message||e)); }
 }
@@ -1844,14 +1883,16 @@ app.get("/api/studio/get", async (req, res)=>{
 const NOTIFY_ON = !/^(0|false|off|no)$/i.test(process.env.NOTIFY_APPROVAL || "1");
 const APP_URL = process.env.APP_URL || "https://hukkle-hub.github.io/sns-agent-app/index.html";
 
-async function notifyNeedsHand(kind, topic, detail){
+async function notifyNeedsHand(kind, topic, detail, dept){
   if (!NOTIFY_ON) return;
-  const head = kind === "approve" ? "🔴 결재가 필요합니다"
-             : kind === "ask"     ? "🙋 확인이 필요합니다"
-             : "❌ 작업이 멈췄습니다";
-  const body = head + "\n\n" + String(topic||"").slice(0,60)
-             + (detail ? "\n" + String(detail).slice(0,140) : "")
-             + "\n\n앱에서 처리해 주세요.";
+  /* v316: 짧게 쓰되 누가·무엇을·어디까지는 반드시 담는다.
+     "결재가 필요합니다"만 오면 앱을 열어야 무슨 일인지 안다. */
+  const head = kind === "approve" ? "🔴 결재"
+             : kind === "ask"     ? "🙋 확인"
+             : "❌ 멈춤";
+  const who  = dept ? whoKr(dept) + " · " : "";
+  const body = head + " · " + who + String(topic||"").slice(0,26)
+             + (detail ? "\n\n" + String(detail).slice(0,110) : "");
   try { await kakaoNotify(body, APP_URL); }
   catch(e){ console.error("알림 실패:", String(e&&e.message||e)); }
 }
@@ -2054,7 +2095,7 @@ async function pipeRun(genId, opts){
         blocked_reason: blocked, open_questions: askList,
         target_channel: channels.join(", ") || null });
       console.log("파이프라인 보류:", genId, blocked);
-      notifyNeedsHand("ask", topic, askList[0] || blocked).catch(()=>{});
+      notifyNeedsHand("ask", topic, askList[0] || blocked, opts.dept).catch(()=>{});
       return;
     }
 
@@ -2148,7 +2189,8 @@ async function pipeRun(genId, opts){
     });
     console.log("파이프라인 완료:", genId, "결함"+score, "수준"+creativity, rev+"차");
     notifyNeedsHand("approve", topic,
-      "결함 "+score+" · 수준 "+creativity + (channels.length ? " · "+channels.join(", ") : "")
+      "결함 "+score+" · 수준 "+creativity + (channels.length ? " · "+channels.join(", ") : ""),
+      opts.dept
     ).catch(()=>{});
 
   } catch(e){
@@ -2159,7 +2201,7 @@ async function pipeRun(genId, opts){
     }
     const msg = String(e && e.message || e).slice(0, 500);
     console.error("파이프라인 실패:", genId, msg);
-    notifyNeedsHand("fail", opts.topic || "", msg).catch(()=>{});
+    notifyNeedsHand("fail", opts.topic || "", msg, opts.dept).catch(()=>{});
     await supaPatch(CG_TABLE, "generation_id=eq."+genId, {
       ai_raw_output: "❌ 생성 오류: "+msg, approval_status: "failed",
       blocked_reason: msg, heartbeat_at: new Date().toISOString() }).catch(()=>{});
@@ -3347,6 +3389,120 @@ app.post("/api/pipeline/retry", async (req, res)=>{
     }).catch(e=>console.error("pipeRun(재시도) 예외:", String(e&&e.message||e)));
 
   } catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* ══ 조각만 다시 시키기 (v315) ══
+   사장님은 손으로 뜯어고치지 않는다. 살펴보고 마음에 안 드는 조각만 다시 시킨다.
+   그래서 그 조각과 지시만 담당 부서에 넘겨 다시 쓰게 하고, 자리에 되박는다.
+   — 문서 전체를 다시 돌리면 멀쩡한 조각까지 바뀌고 토큰도 몇 배로 든다. */
+app.post("/api/content/redo-part", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const b = req.body||{};
+    const id   = String(b.generation_id||"");
+    const part = String(b.part||"");
+    const note = String(b.note||"").trim();
+    const lang = String(b.lang||"");
+    const by   = String(b.by||"claude");        // claude | gemini
+    if (!id || !part) return res.status(400).json({ ok:false, error:"어느 조각인지 알려 주세요" });
+    if (!note) return res.status(400).json({ ok:false, error:"무엇이 마음에 안 드는지 적어 주세요" });
+
+    const rows = await supaSelect(CG_TABLE, "generation_id=eq."+encodeURIComponent(id)
+      + "&select=topic,assigned_dept,ai_raw_output,human_modified_output,spec");
+    const row = rows && rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:"찾을 수 없습니다" });
+
+    const dept = row.assigned_dept || "creation";
+    const who  = (typeof MEMBERS!=="undefined" && MEMBERS[dept]) || dept;
+    const isCode = !!lang && lang !== "본문";
+
+    /* v317: 사장님이 밑줄 친 데만 고칠 때가 있다.
+       그럴 땐 앞뒤를 문맥으로 보여 주되, 고친 그 부분만 돌려받는다.
+       조각 전체를 다시 쓰게 하면 멀쩡한 데까지 바뀐다. */
+    const ctxAll = String(b.context||"");
+    const partial = !!ctxAll && ctxAll !== part;
+
+    const sys = "너는 " + who + "다. " + ((AGENTS[dept]&&AGENTS[dept].role) || "")
+      + (partial
+          ? "\n지금은 이미 낸 결과물에서 사장님이 '집어낸 부분'만 고쳐 쓰는 일이다."
+            + "\n반드시 집어낸 부분을 대신할 것만 출력한다. 앞뒤 문맥은 참고만 하고 다시 쓰지 마라."
+            + "\n길이와 모양을 원래와 비슷하게 맞춰라 — 그 자리에 그대로 끼워 넣을 것이다."
+          : "\n지금은 이미 낸 결과물 중 '한 조각'만 다시 쓰는 일이다.")
+      + "\n규칙: 지적된 것만 고친다. 지적과 무관한 부분은 글자 하나 바꾸지 마라."
+      + (isCode ? "\n이것은 " + lang + " 코드다. 코드만 출력한다. 설명·머리말·```울타리를 붙이지 마라."
+                : "\n이것은 본문이다. 본문만 출력한다. 머리말이나 사족을 붙이지 마라.");
+    const usr = "주제: " + String(row.topic||"") + "\n\n"
+      + (partial ? "[ 앞뒤 문맥 (고치지 마라) ]\n" + ctxAll.slice(0,4000) + "\n\n"
+                   + "[ 집어낸 부분 — 이것만 고쳐라 ]\n" + part + "\n\n"
+                 : "[ 지금 조각 ]\n" + part + "\n\n")
+      + "[ 사장님 지적 ]\n" + note + "\n\n"
+      + (partial ? "집어낸 부분을 대신할 것만 내라. 다른 말은 붙이지 않는다."
+                 : "위 지적을 반영해 이 조각을 다시 써라. 다른 말 없이 결과만 낸다.");
+
+    let out = "", via = by;
+    try {
+      out = (by === "gemini") ? await geminiText(sys + "\n\n" + usr, 3000)
+                              : await anthropic(sys, usr, 3000);
+    } catch(e){
+      // 한쪽이 막히면 다른 쪽으로 넘긴다 — 되돌아오는 손이 비면 안 된다
+      try { out = (by === "gemini") ? await anthropic(sys, usr, 3000)
+                                    : await geminiText(sys + "\n\n" + usr, 3000);
+            via = (by === "gemini") ? "claude" : "gemini"; }
+      catch(e2){ return res.status(502).json({ ok:false, error:"다시 쓰지 못했습니다: " + String(e2&&e2.message||e2).slice(0,120) }); }
+    }
+    out = String(out||"").trim().replace(/^```[A-Za-z0-9+#-]*\s*\n?/,"").replace(/\n?```\s*$/,"").trim();
+    if (!out) return res.status(502).json({ ok:false, error:"빈 결과가 돌아왔습니다" });
+
+    // 문서에서 그 조각만 갈아 끼운다
+    // 부분만 고른 경우엔 어느 자리인지 화면이 안다. 서버가 짐작해 바꾸면 엉뚱한 데가 바뀐다.
+    let spliced = false;
+    if (!partial){
+      const full = String(row.human_modified_output || row.ai_raw_output || "");
+      if (full.indexOf(part) >= 0){
+        await supaPatch(CG_TABLE, "generation_id=eq."+id, { human_modified_output: full.replace(part, out) });
+        spliced = true;
+      }
+    }
+    res.json({ ok:true, text: out, via, spliced, partial, dept, who });
+
+    logReport({ kind:"job", ref_id:id, dept:dept,
+      title:"조각 다시 — " + String(row.topic||"").slice(0,45), status:"ok",
+      summary:who + "이(가) " + (isCode?lang+" 코드":"본문") + " 한 조각을 다시 썼습니다 ("+via+")",
+      detail:{ 지적:note.slice(0,300), 되박음:spliced } }).catch(()=>{});
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* v313: 결과물 일부만 고쳐 저장한다.
+   결재(승인)와는 다르다 — 코드 한 덩이를 손보고 저장만 하고 싶을 때 쓴다.
+   승인 상태는 건드리지 않는다. */
+app.post("/api/content/patch", async (req,res)=>{
+  try{
+    if (!useSupabase) return res.status(400).json({ ok:false, error:"Supabase 미설정" });
+    const id  = String(req.body?.generation_id||"");
+    const txt = String(req.body?.text||"");
+    if (!id)  return res.status(400).json({ ok:false, error:"generation_id 가 필요합니다" });
+    if (!txt) return res.status(400).json({ ok:false, error:"내용이 비어 있습니다" });
+    const rows = await supaSelect(CG_TABLE, "generation_id=eq."+encodeURIComponent(id)+"&select=ai_raw_output,topic");
+    const row = rows && rows[0];
+    if (!row) return res.status(404).json({ ok:false, error:"찾을 수 없습니다" });
+
+    const patch = { human_modified_output: txt };
+    // 사람이 얼마나 고쳤는지 — 학습의 핵심 신호라 여기서도 잰다
+    if (row.ai_raw_output){
+      const a = String(row.ai_raw_output), b = txt;
+      let same = 0; const len = Math.min(a.length, b.length);
+      for (let i=0;i<len;i++) if (a[i]===b[i]) same++;
+      patch.edit_distance = Math.round((1 - same/Math.max(a.length,b.length,1))*10000)/10000;
+    }
+    await supaPatch(CG_TABLE, "generation_id=eq."+id, patch);
+    res.json({ ok:true, edit_distance: patch.edit_distance ?? null });
+
+    logReport({ kind:"job", ref_id:id, dept:"ops",
+      title:"손질 — " + String(row.topic||"").slice(0,50), status:"ok",
+      summary:"사장님이 결과물 일부를 고쳤습니다"
+        + (patch.edit_distance!=null ? " (수정률 "+Math.round(patch.edit_distance*100)+"%)" : ""),
+      detail:{ 글자수: txt.length } }).catch(()=>{});
+  }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
 /* ── v308: 권한·질문·스케줄 점검 ── */
@@ -8891,7 +9047,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v310";
+const SERVER_VERSION = "v317";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
