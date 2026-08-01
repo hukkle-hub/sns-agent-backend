@@ -9072,7 +9072,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v324";
+const SERVER_VERSION = "v326";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
@@ -10064,6 +10064,12 @@ async function productPagePipeline(body, setStep){
   const formulaBlock = formula ? ("\n\n[이 부서가 축적한 "+KIND_NM+" 품질 공식 — 반드시 이 기준을 적용해 만들어라]\n"+formula) : "";
   // 📚 v237: 만들기 전 — 경험 전부 훑기
   // v244: 상위(선순환)에서 이미 훑었으면 그걸 재사용한다 — 같은 경험을 두 번 읽지 않는다.
+  /* v326: isRevise 를 만들기도 전에 쓰고 있었다. 고쳐 만들 때마다 여기서 터졌다.
+     쓰는 곳보다 앞에서 만든다. */
+  const baseHtml = String(body.baseHtml||"");
+  const feedback = String(body.feedback||"").slice(0,1500);
+  const isRevise = !!(baseHtml && feedback);
+
   let _expBrief = String(body.expBrief||"");
   if(!isRevise && !_expBrief && expSweepOn()){
     try{ _expBrief = await experienceBriefing(curProjectId(), KIND_NM+" "+product, info, _step); }catch(e){}
@@ -10075,9 +10081,6 @@ async function productPagePipeline(body, setStep){
       + photos.map((p,i)=>"사진"+(i+1)+": "+(p.url||"")+(p.desc?(" ("+p.desc+")"):"")).join("\n");
   }
   photoBlock += "\n\n[사진이 없는 자리는 <div class=\"img-ph\">[AI이미지: 구체적 묘사]</div> 형태의 플레이스홀더로 남겨, 나중에 이미지를 넣을 수 있게 하라.]";
-  const baseHtml = String(body.baseHtml||"");
-  const feedback = String(body.feedback||"").slice(0,1500);
-  const isRevise = !!(baseHtml && feedback);
   // 🖼 v248: 참고 시안 이미지 — 글로 상상하지 말고 '직접 보고' 디렉션을 뽑는다
   const refImgs = prepRefImages(body.refImages);
   let sys, user;
@@ -13249,8 +13252,8 @@ async function runCycleJob(id, appUrl){
     }catch(_){}
     job.results = results;
     job.status = "done";
-    doneJob(job, "✅ 완료 — "+(parts.join(" + ")||"결과 없음")); job.doneAt = Date.now(); job.step = "완료"; trimCycleJobs(); saveDB();
     const parts = []; if(results.sns) parts.push("SNS"); if(results.blog) parts.push("블로그"); if(results.cafe) parts.push("카페글"); if(results.youtube) parts.push("유튜브"); if(results.page) parts.push("상품페이지"); if(results.home) parts.push("홈페이지"); if(results.report) parts.push("리서치 보고서");
+    doneJob(job, "✅ 완료 — "+(parts.join(" + ")||"결과 없음")); job.doneAt = Date.now(); job.step = "완료"; trimCycleJobs(); saveDB();
     const base = String(appUrl||(DB.state&&DB.state.appBase)||"").replace(/\/$/,"");
     let vsum = "";
     if(results.viral){ const vs=Object.keys(results.viral).map(k=>{ const L=(CYCLE_FORMATS[k]?CYCLE_FORMATS[k].label:k); return L+" "+results.viral[k].score+"점"; }); if(vs.length) vsum = "\n🔥 예상 반응: "+vs.join(" · "); }
