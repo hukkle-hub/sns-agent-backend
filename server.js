@@ -3530,6 +3530,20 @@ app.post("/api/content/patch", async (req,res)=>{
   }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
+/* 캐시가 얼마나 먹히고 있나 */
+app.get("/api/cache", (req,res)=>{
+  const c = DB.cache || { read:0, write:0, miss:0 };
+  const total = c.read + c.write + c.miss;
+  // 캐시로 읽으면 값이 1/10, 캐시를 새로 만들 때만 1.25배
+  const saved = Math.round(c.read * 0.9 - c.write * 0.25);
+  res.json({ ok:true,
+    캐시로_읽음: c.read, 캐시_만듦: c.write, 그냥_읽음: c.miss,
+    적중률: total ? Math.round(c.read / total * 100) + "%" : "0%",
+    아낀_토큰: saved,
+    설명: saved > 0 ? "캐시가 이득을 내고 있습니다" : "아직 이득 구간이 아닙니다 — 같은 지시문이 반복돼야 효과가 납니다"
+  });
+});
+
 /* ── v308: 권한·질문·스케줄 점검 ── */
 app.get("/api/roles", (req,res)=>{
   const rows = Object.keys(CAN).map(d=>({
@@ -4368,6 +4382,15 @@ async function anthropic(system, user, maxTokens = 1500, images){
   }
 }
 
+/* 캐시는 최소 길이를 넘겨야 걸린다(모델마다 1024~2048 토큰).
+   한글은 글자당 토큰이 크므로 대략 1,200자를 기준으로 잡는다.
+   짧은 것에 걸면 표시만 붙고 이득이 없다. */
+const CACHE_MIN_CHARS = 1200;
+function cacheableSystem(system){
+  const t = String(system||"");
+  if (t.length < CACHE_MIN_CHARS) return t;              // 짧으면 그냥 보낸다
+  return [{ type:"text", text:t, cache_control:{ type:"ephemeral" } }];
+}
 async function anthropicRaw(system, user, maxTokens = 1500, images){
   await _rateGate(_estTokens(system, user)); // 분당 토큰 예산 안에서만 호출 admit
   let content;
@@ -4397,7 +4420,13 @@ async function anthropicRaw(system, user, maxTokens = 1500, images){
       r = await fetch("https://api.anthropic.com/v1/messages", {
         method:"POST",
         headers:{ "Content-Type":"application/json", "x-api-key":API_KEY, "anthropic-version":"2023-06-01" },
-        body: JSON.stringify({ model:MODEL, max_tokens:maxTokens, system:system||"", messages:messages }),
+        body: JSON.stringify({ model:MODEL, max_tokens:maxTokens,
+          // v327: 같은 지시문을 매번 새로 읽히지 않는다.
+          //   부서 역할·품질 공식·브랜드 톤은 호출마다 거의 그대로인데,
+          //   그때마다 값을 다 치르고 있었다. 캐시해 두면 그 부분이 1/10 값이 된다.
+          //   짧은 지시문은 캐시가 오히려 손해라 일정 길이 이상만 건다.
+          system: cacheableSystem(system),
+          messages: messages }),
         signal: _ctrl.signal
       });
     } catch(e){
@@ -4427,6 +4456,16 @@ async function anthropicRaw(system, user, maxTokens = 1500, images){
       // ── 어느 단계가 얼마를 썼는지 기록한다.
       //    총합만 보면 "왜 이렇게 나왔지"에 영원히 답할 수 없다.
       try{ costTag(system, data.usage.input_tokens||0, data.usage.output_tokens||0); }catch(_){}
+      /* v327: 캐시가 실제로 먹히는지 센다.
+         cache_read 는 값이 1/10, cache_write 는 1.25배다.
+         읽기가 쓰기보다 많아야 이득이다 — 그걸 눈으로 봐야 판단할 수 있다. */
+      DB.cache = DB.cache || { read:0, write:0, miss:0 };
+      const _cr = data.usage.cache_read_input_tokens || 0;
+      const _cw = data.usage.cache_creation_input_tokens || 0;
+      DB.cache.read  += _cr;
+      DB.cache.write += _cw;
+      if (!_cr && !_cw) DB.cache.miss += data.usage.input_tokens || 0;
+
       DB.usage = DB.usage || { in:0, out:0, calls:0 };
       DB.usage.in += data.usage.input_tokens || 0;
       DB.usage.out += data.usage.output_tokens || 0;
@@ -9072,7 +9111,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v326";
+const SERVER_VERSION = "v327";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
