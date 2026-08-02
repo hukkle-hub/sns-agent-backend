@@ -238,7 +238,8 @@ const DUTY = {
   analytics: [
     { id:"duty.daily",  무엇:"어제 성과를 세 줄로 보고한다",       every:1,  routine:"rt_report" },
     { id:"duty.watch",  무엇:"카페를 살펴 숫자를 남긴다",          every:4,  routine:"rt_cafe_watch" },
-    { id:"duty.plan",   무엇:"카페 개편안을 낸다",                every:31, routine:"rt_cafe_plan" }
+    { id:"duty.plan",   무엇:"카페 개편안을 낸다",                every:31, routine:"rt_cafe_plan" },
+    { id:"duty.cost",   무엇:"살림을 점검해 낭비를 찾는다",         every:8,  routine:"rt_cost" }
   ],
   // 아래 넷은 아직 채널이 열리지 않아 정기 몫이 없다. 비워 두되 비었다는 것을 드러낸다.
   publishing:  [ { id:"duty.video",   무엇:"영상 기획",   every:0, routine:null, 대기:"유튜브를 열면 시작" } ],
@@ -459,6 +460,16 @@ async function runRoutines(){
 
   for (const rt of list){
     if (!routineDue(rt, now)) continue;
+    /* 살림 점검은 AI 를 부르지 않는다. 숫자를 세는 일이라 계산으로 끝난다.
+       AI 에게 시키면 돈을 쓰면서 돈 아끼는 법을 묻는 꼴이 된다. */
+    if (rt.routine_id === "rt_cost"){
+      try{
+        await runCostAudit(true);
+        await supaPatch(ROUTINE_TABLE, "routine_id=eq."+encodeURIComponent(rt.routine_id), {
+          last_run_day: now.day, last_run_at: new Date().toISOString(), fail_count:0, last_error:"" });
+      }catch(e){ console.error("살림 점검 실패:", String(e&&e.message||e)); }
+      continue;
+    }
     // 먼저 표시하지 않는다 — 실제로 시작된 뒤에 적어야 건너뛴 날이 안 생긴다
     try {
       const genId = "gen_" + Date.now().toString(36) + Math.random().toString(36).slice(2,7);
@@ -3528,6 +3539,118 @@ app.post("/api/content/patch", async (req,res)=>{
         + (patch.edit_distance!=null ? " (수정률 "+Math.round(patch.edit_distance*100)+"%)" : ""),
       detail:{ 글자수: txt.length } }).catch(()=>{});
   }catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
+});
+
+/* ══ 살림 점검 (v328) ══
+   프롬프트 캐시를 안 쓰고 있다는 걸 우리가 아니라 본사 메일이 먼저 알려줬다.
+   그건 우리 잘못이다 — 안에서 먼저 알아챘어야 한다.
+   그래서 낭비를 스스로 찾아 보고하는 몫을 만든다. 강민서가 맡는다. */
+function costAudit(){
+  const found = [];
+  const c = DB.cache || { read:0, write:0, miss:0 };
+  const cTotal = c.read + c.write + c.miss;
+
+  // ① 캐시가 놀고 있나
+  if (cTotal > 50000){
+    const hit = c.read / cTotal;
+    if (hit < 0.10) found.push({
+      급: "높음", 무엇: "같은 지시문을 매번 새로 읽히고 있습니다",
+      숫자: "캐시 적중 " + Math.round(hit*100) + "%",
+      할일: "지시문이 호출마다 달라지고 있는지 봐야 합니다 (날짜·시각이 섞이면 캐시가 깨집니다)"
+    });
+  }
+
+  // ② 만든 것에 비해 읽힌 것이 지나치게 많나
+  const u = DB.usage || { in:0, out:0, calls:0 };
+  if (u.calls > 30 && u.out > 0){
+    const ratio = u.in / u.out;
+    if (ratio > 25) found.push({
+      급: "보통", 무엇: "읽히는 양이 만드는 양보다 " + Math.round(ratio) + "배입니다",
+      숫자: "읽기 " + Math.round(u.in/1000) + "k / 쓰기 " + Math.round(u.out/1000) + "k",
+      할일: "참고자료를 너무 많이 붙이고 있는지 봐야 합니다"
+    });
+  }
+
+  // ③ 헛도는 루틴 — 결과 없이 물어보기만 하는 것
+  const asks = (DB.reports||[]).filter(r=>r && r.kind==="ask").length;
+
+  // ④ 클로드가 죽어 제미나이로 넘어간 횟수
+  if ((DB.fallbackCount||0) >= 5) found.push({
+    급: "보통", 무엇: "클로드가 " + DB.fallbackCount + "번 응답하지 않아 제미나이로 넘겼습니다",
+    숫자: String(DB.fallbackCount) + "회",
+    할일: "한도에 자주 걸린다면 무료 엔진 키를 늘리는 편이 낫습니다"
+  });
+
+  // ⑤ 저장소가 얼마나 불었나 — 한 덩어리로 저장하므로 커지면 통째로 실패한다
+  try{
+    const size = Buffer.byteLength(JSON.stringify(DB));
+    const mb = size / 1048576;
+    // 어느 칸이 살을 찌우고 있는지도 함께 짚는다 — "크다"만 알면 손을 못 댄다
+    const big = Object.keys(DB)
+      .map(k=>({ k, n: Array.isArray(DB[k]) ? DB[k].length : 0,
+                 b: Buffer.byteLength(JSON.stringify(DB[k]||null)) }))
+      .filter(x=>x.b > 200000)
+      .sort((a,b)=>b.b-a.b).slice(0,3)
+      .map(x=>x.k + " " + Math.round(x.b/1024) + "KB" + (x.n?("("+x.n+"건)"):""));
+    if (mb > 6) found.push({
+      급:"높음", 무엇:"저장소가 " + mb.toFixed(1) + "MB 로 불었습니다",
+      숫자: big.join(" · ") || (mb.toFixed(1)+"MB"),
+      할일:"한 덩어리로 저장하므로 더 커지면 저장 자체가 실패합니다. 오래된 기록을 덜어내야 합니다"
+    });
+    else if (mb > 3) found.push({
+      급:"보통", 무엇:"저장소가 " + mb.toFixed(1) + "MB 입니다",
+      숫자: big.join(" · ") || (mb.toFixed(1)+"MB"),
+      할일:"아직 여유는 있지만 무엇이 쌓이는지 봐 두는 게 좋습니다"
+    });
+  }catch(e){}
+
+  // ⑥ 저장이 조용히 실패하고 있나 — 가장 무서운 것은 실패한 줄도 모르는 것이다
+  try{
+    if (_saveFailStreak > 0) found.push({
+      급:"높음", 무엇:"저장이 " + _saveFailStreak + "번 내리 실패했습니다",
+      숫자:String(_lastSaveErr||"").slice(0,60),
+      할일:"고친 것이 사라질 수 있습니다. 저장소 용량과 키를 확인해 주세요"
+    });
+  }catch(e){}
+
+  // ⑦ 무료 엔진을 쓸 수 있는데 안 쓰고 있나
+  try{
+    if (typeof FREE_PROVIDERS !== "undefined"){
+      const alive = (FREE_PROVIDERS||[]).filter(p=>p && p.key).length;
+      if (alive === 0) found.push({
+        급: "낮음", 무엇: "무료 엔진이 하나도 없습니다",
+        숫자: "0곳",
+        할일: "Groq·Cerebras·OpenRouter 키를 넣으면 가벼운 일은 공짜로 돌릴 수 있습니다"
+      });
+    }
+  }catch(e){}
+
+  return { ok:true, 찾음: found.length, 항목: found,
+           캐시: { 적중: cTotal ? Math.round(c.read/cTotal*100)+"%" : "0%", 읽음:c.read, 만듦:c.write },
+           호출: u.calls || 0 };
+}
+
+async function runCostAudit(force){
+  const a = costAudit();
+  const 급함 = a.항목.filter(x=>x.급==="높음");
+  await logReport({
+    kind:"audit", dept:"analytics", title:"살림 점검",
+    status: 급함.length ? "failed" : "ok",
+    summary: a.찾음 ? (a.찾음 + "가지 낭비를 찾았습니다 — " + a.항목[0].무엇)
+                    : ("낭비 없음 · 캐시 적중 " + a.캐시.적중),
+    detail: a
+  });
+  if (급함.length){
+    await kakaoNotify("💸 강민서 · 살림 점검 · 낭비 발견\n\n"
+      + 급함.map(x=>"· " + x.무엇 + "\n  (" + x.숫자 + ")\n  → " + x.할일).join("\n\n"),
+      process.env.APP_URL || "").catch(()=>{});
+  }
+  return a;
+}
+app.get("/api/cost/audit", (req,res)=>{ res.json(costAudit()); });
+app.post("/api/cost/audit", async (req,res)=>{
+  try{ res.json(await runCostAudit(true)); }
+  catch(e){ res.status(500).json({ ok:false, error:String(e&&e.message||e) }); }
 });
 
 /* 캐시가 얼마나 먹히고 있나 */
@@ -8012,7 +8135,19 @@ function sameSpot(a, b){
   let inter=0; for (const w of A) if (B.has(w)) inter++;
   return (inter / (A.size + B.size - inter)) >= 0.45;   // 자카드 유사도
 }
+/* v330: "**없음**" 같은 답이 규칙으로 저장돼 있었다.
+   AI 가 "배운 게 없다"고 답한 것을 배움으로 적어 둔 셈이다.
+   알맹이 없는 것은 아예 들이지 않는다 — 한 번 들어가면 프롬프트에 계속 실린다. */
+function isEmptyLearning(t){
+  const x = String(t||"").replace(/[*#_`\s]/g,"");
+  if (x.length < 8) return true;
+  return /^(없음|해당없음|없다|특이사항없음|N\/?A|null|undefined|-+|\.+)$/i.test(x);
+}
 async function insertRuleDedup(dept, text, evidence){
+  if (isEmptyLearning(text)){
+    console.log("빈 배움은 넣지 않음:", dept, String(text||"").slice(0,30));
+    return { ok:false, skipped:"빈 배움" };
+  }
   // 옥타브 기록: 넓이(새 지점) vs 깊이(같은 지점 고도 상승)를 분리 측정
   DB.octave = DB.octave || { spots:0, lifts:0, log:[] };
   const newAlt = altitude(text);
@@ -8438,7 +8573,8 @@ async function doActualPublish(c, platforms){
     // 실패 시 재시도 큐에 등록 (어댑터 없음/미디어 누락 등 비일시적 오류는 제외)
     if (!r.ok && !/어댑터 없음|필요|미설정/.test(r.note||"")) {
       DB.retryQueue = DB.retryQueue || [];
-      DB.retryQueue.push({ id:Date.now()+Math.random(), content:c, platform:p, tries:0, nextAt:Date.now()+60000 });
+      DB.retryQueue = trimArchive(DB.retryQueue, 300, "retryQueue", "재시도");   // v329: 기계가 쌓는 곳이라 사람이 못 막는다
+          DB.retryQueue.push({ id:Date.now()+Math.random(), content:c, platform:p, tries:0, nextAt:Date.now()+60000 });
     }
   }
   const okCount = results.filter(r=>r.ok).length;
@@ -8841,7 +8977,10 @@ function recordExperience(e){
     body: String(e.body||"").slice(0,4000)          // 원자료 발췌 (자료·발상 보존용)
   };
   DB.experience.push(item);
-  // ★ 상한 없음 · 만료 없음 — 자료는 많을수록 좋다
+  /* v329: "자료는 많을수록 좋다"는 맞다. 다만 이 표는 통째로 한 번에 저장된다.
+     한 건이 4KB 를 넘으므로 1,000건이면 저장 자체가 깨진다.
+     그래서 버리지 않고 옮긴다 — 최근 것만 손에 두고 나머지는 보관함으로. */
+  try{ DB.experience = trimArchive(DB.experience, 400, "experience", "경험"); }catch(_){}
   try{ saveDB(); }catch(_){}
   return item;
 }
@@ -9111,7 +9250,7 @@ async function handleInstruction(instruction, source, images, history, shell){
 // ========================= 엔드포인트 =========================
 // v246: 서버에 버전 표기가 없어서 '배포가 됐는지' 확인할 방법이 없었다.
 //   프론트(index.html)의 버전과 맞춰, 루트/헬스체크에서 바로 볼 수 있게 한다.
-const SERVER_VERSION = "v327";
+const SERVER_VERSION = "v330";
 const SERVER_BOOTED_AT = Date.now();
 app.get("/", (req,res)=> res.send("SNS 에이전트 백엔드 "+SERVER_VERSION+" 작동 중 (기동 "+new Date(SERVER_BOOTED_AT).toISOString()+")"));
 app.get("/api/version", (req,res)=> res.json({ ok:true, version: SERVER_VERSION, bootedAt: SERVER_BOOTED_AT, uptimeSec: Math.round((Date.now()-SERVER_BOOTED_AT)/1000) }));
@@ -14831,7 +14970,9 @@ app.post("/api/ops/command", async (req,res)=>{
 app.post("/api/schedule", (req,res)=>{
   const { instruction, runAt } = req.body||{};
   if(!instruction) return res.status(400).json({error:"instruction 필요"});
-  DB.scheduled.push({ id:Date.now(), instruction, runAt:runAt||Date.now(), done:false }); saveDB();
+  DB.scheduled.push({ id:Date.now(), instruction, runAt:runAt||Date.now(), done:false });
+  // 끝난 예약은 손에 둘 이유가 없다. 200건만 남기고 보관함으로 옮긴다.
+  try{ DB.scheduled = trimArchive(DB.scheduled, 200, "scheduled", "예약"); }catch(_){} saveDB();
   res.json({ ok:true });
 });
 
