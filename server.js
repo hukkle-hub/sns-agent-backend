@@ -26,6 +26,7 @@ import express from "express";
 import cors from "cors";
 import fs from "fs";
 import path from "path";
+import { installVNextRoutes } from "./vnext-core.js";
 
 // .env 자동 로드 (의존성 없이) — start 스크립트가 만든 .env에서 키를 읽음
 try {
@@ -784,7 +785,7 @@ function tokenFromReq(req){
 }
 
 // 인증 없이도 열려 있어야 하는 경로
-const AUTH_FREE = new Set(["/api/ping", "/api/login", "/api/auth-check", "/api/health"]);
+const AUTH_FREE = new Set(["/api/ping", "/api/login", "/api/auth-check", "/api/health", "/api/vnext/health"]);
 
 app.use((req, res, next)=>{
   if (!REQUIRE_AUTH) return next();
@@ -15003,6 +15004,14 @@ app.post("/api/publish-schedule/toggle", (req,res)=>{
   const id = (req.body||{}).id;
   (DB.pubSchedules||[]).forEach(x=>{ if(x.id===id) x.disabled=!x.disabled; }); saveDB();
   res.json({ ok:true, schedules:DB.pubSchedules });
+});
+
+// vNext stays isolated under /api/vnext and DB.vnext. Registering it here
+// keeps every existing route and the global authentication policy unchanged.
+installVNextRoutes({
+  app,
+  getDB: () => DB,
+  saveDB: () => saveDB()
 });
 
 const PORT = process.env.PORT || 3000;

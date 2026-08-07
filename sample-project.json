@@ -1,0 +1,15 @@
+{
+  "id": "shorts-lab-0-to-500",
+  "name": "생활꿀템 Shorts Lab",
+  "type": "youtube_shorts",
+  "goal": "구독자 0명에서 500명, 30개 영상 안에 반복 가능한 승자 포맷 발견",
+  "stage": "discovery",
+  "audience": "생활 불편을 줄이고 싶은 20~40대",
+  "channels": ["YouTube Shorts"],
+  "primaryKpi": "영상당 구독자 증가",
+  "secondaryKpis": ["조회수", "시청 유지율"],
+  "aiBudgetMonthly": 0,
+  "paidAutoExecution": false,
+  "revenueMonthly": 0,
+  "status": "active"
+}
